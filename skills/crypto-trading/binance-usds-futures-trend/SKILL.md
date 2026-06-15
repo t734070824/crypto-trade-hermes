@@ -151,7 +151,8 @@ scripts/binance_usds_futures_trend.py --symbol BTCUSDT --interval 1h --limit 240
 
 ## References
 
-- `references/binance-skills-hub-usds-futures.md` — concise notes from the local Binance Skills Hub checkout, including USDS-M Futures endpoints/factors useful for v0.2.
+- `references/binance-skills-hub-usds-futures.md` — condensed notes from the fetched Binance Skills Hub repo for USDⓈ-M Futures public/auth endpoints used by this skill.
+- `references/session-v0.2-public-factors-workflow.md` — workflow note for expanding free Binance public factors while preserving the primary trend-following contract.
 
 ## Roadmap
 
