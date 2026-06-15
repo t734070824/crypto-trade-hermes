@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Iterable
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
@@ -520,6 +523,164 @@ def allocate_portfolio_risk(
     }
 
 
+def _round_float(value: Any, digits: int = 8) -> float:
+    return round(float(value or 0.0), digits)
+
+
+def _symbol_allocations(snapshot: dict[str, Any]) -> dict[str, float]:
+    return {str(symbol): float(value) for symbol, value in (snapshot.get("allocations_by_symbol") or {}).items()}
+
+
+def build_paper_state_snapshot(scan: dict[str, Any]) -> dict[str, Any]:
+    """Build a compact paper-only state snapshot safe for local persistence."""
+    allocation = scan.get("portfolio_allocation") or {}
+    allocations = allocation.get("allocations") or []
+    allocations_by_symbol = {
+        str(item.get("symbol")): _round_float(item.get("paper_risk_units"))
+        for item in allocations
+        if item.get("symbol")
+    }
+    results_by_symbol: dict[str, dict[str, Any]] = {}
+    for rank, result in enumerate(scan.get("results") or [], start=1):
+        symbol = result.get("symbol")
+        if not symbol:
+            continue
+        results_by_symbol[str(symbol)] = {
+            "rank": rank,
+            "action": result.get("action"),
+            "ranking_bucket": result.get("ranking_bucket"),
+            "rank_score": result.get("rank_score", 0.0),
+            "position_size": result.get("position_size", 0.0),
+        }
+    return {
+        "mode": "paper",
+        "generated_at_utc": scan.get("generated_at_utc"),
+        "generated_at_beijing": scan.get("generated_at_beijing"),
+        "interval": scan.get("interval"),
+        "intervals": list(scan.get("intervals") or [scan.get("interval")]),
+        "primary_interval": scan.get("primary_interval", scan.get("interval")),
+        "top_trends": [item.get("symbol") for item in scan.get("top_trends") or [] if item.get("symbol")],
+        "portfolio_allocation": allocation,
+        "allocations_by_symbol": allocations_by_symbol,
+        "skipped_details": allocation.get("skipped_details", []),
+        "errors_count": len(scan.get("errors") or []),
+        "results_by_symbol": results_by_symbol,
+    }
+
+
+def compute_paper_state_change(previous: dict[str, Any] | None, current: dict[str, Any]) -> dict[str, Any]:
+    """Compare two paper state snapshots and return allocation/ranking/action changes."""
+    previous_allocations = {} if previous is None else _symbol_allocations(previous)
+    current_allocations = _symbol_allocations(current)
+    previous_results = {} if previous is None else (previous.get("results_by_symbol") or {})
+    current_results = current.get("results_by_symbol") or {}
+
+    added = [
+        {"symbol": symbol, "paper_risk_units": current_allocations[symbol]}
+        for symbol in sorted(current_allocations)
+        if symbol not in previous_allocations
+    ]
+    removed = [
+        {"symbol": symbol, "previous_paper_risk_units": previous_allocations[symbol]}
+        for symbol in sorted(previous_allocations)
+        if symbol not in current_allocations
+    ]
+    changed = []
+    for symbol in sorted(set(previous_allocations).intersection(current_allocations)):
+        previous_units = previous_allocations[symbol]
+        current_units = current_allocations[symbol]
+        delta = round(current_units - previous_units, 8)
+        if abs(delta) > 1e-12:
+            changed.append(
+                {
+                    "symbol": symbol,
+                    "previous_paper_risk_units": previous_units,
+                    "current_paper_risk_units": current_units,
+                    "delta": delta,
+                }
+            )
+
+    ranking_changes = []
+    action_changes = []
+    bucket_changes = []
+    for symbol in sorted(set(previous_results).intersection(current_results)):
+        before = previous_results[symbol]
+        after = current_results[symbol]
+        if before.get("rank") != after.get("rank"):
+            ranking_changes.append({"symbol": symbol, "previous_rank": before.get("rank"), "current_rank": after.get("rank")})
+        if before.get("action") != after.get("action"):
+            action_changes.append({"symbol": symbol, "previous_action": before.get("action"), "current_action": after.get("action")})
+        if before.get("ranking_bucket") != after.get("ranking_bucket"):
+            bucket_changes.append(
+                {"symbol": symbol, "previous_bucket": before.get("ranking_bucket"), "current_bucket": after.get("ranking_bucket")}
+            )
+
+    return {
+        "mode": "paper",
+        **now_stamps(),
+        "first_run": previous is None,
+        "previous_state_loaded": previous is not None,
+        "current_errors_count": current.get("errors_count", 0),
+        "added_allocations": added,
+        "removed_allocations": removed,
+        "changed_allocations": changed,
+        "ranking_changes": ranking_changes,
+        "action_changes": action_changes,
+        "bucket_changes": bucket_changes,
+    }
+
+
+def load_paper_state(path: str | os.PathLike[str]) -> tuple[dict[str, Any] | None, str | None]:
+    state_path = Path(path)
+    if not state_path.exists():
+        return None, None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return None, f"invalid state file JSON: {exc}"
+    except OSError as exc:
+        return None, f"cannot read state file: {exc}"
+    if not isinstance(payload, dict):
+        return None, "invalid state file JSON: top-level value is not an object"
+    return payload, None
+
+
+def save_paper_state(path: str | os.PathLike[str], snapshot: dict[str, Any]) -> None:
+    state_path = Path(path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{state_path.name}.", suffix=".tmp", dir=str(state_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, state_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def apply_paper_state(
+    scan: dict[str, Any],
+    state_file: str | os.PathLike[str],
+    save_state: bool = True,
+) -> dict[str, Any]:
+    """Attach v0.7 paper state snapshot/change to a scan and optionally persist it."""
+    updated = dict(scan)
+    current = build_paper_state_snapshot(updated)
+    previous, state_error = load_paper_state(state_file)
+    change = compute_paper_state_change(previous, current)
+    if state_error:
+        change["state_file_error"] = state_error
+    updated["paper_state"] = current
+    updated["state_change"] = change
+    if save_state:
+        save_paper_state(state_file, current)
+    return updated
+
+
 def build_scan_summary_zh(scan: dict[str, Any]) -> str:
     """Build a compact Chinese report with explicit UTC and Beijing time labels."""
     top_n = scan.get("top_n", 0)
@@ -668,6 +829,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top", type=int, default=5, help="Top N trends to include in v0.3 scan summary")
     parser.add_argument("--portfolio-risk-budget", type=float, help="Optional v0.5 total paper risk-unit budget for scan allocation")
     parser.add_argument("--max-symbol-risk", type=float, help="Optional v0.5 per-symbol paper risk-unit cap for scan allocation")
+    parser.add_argument("--state-file", help="Optional v0.7 paper scan state JSON path; scan mode only")
+    parser.add_argument("--no-save-state", action="store_true", help="Compute v0.7 state_change without writing --state-file")
     return parser
 
 
@@ -691,9 +854,13 @@ def main(argv: list[str] | None = None) -> int:
                 portfolio_risk_budget=args.portfolio_risk_budget,
                 max_symbol_risk=args.max_symbol_risk,
             )
+            if args.state_file:
+                scan = apply_paper_state(scan, args.state_file, save_state=not args.no_save_state)
             print(json.dumps({"ok": not bool(scan["errors"]), "scan": scan}, ensure_ascii=False, indent=2))
             return 0 if not scan["errors"] else 1
 
+        if args.state_file:
+            raise ValueError("--state-file requires scan mode: use --all-symbols or --symbols")
         candles = fetch_klines(args.symbol, args.interval, args.limit, args.base_url)
         market_context = None if args.no_context else fetch_market_context(
             args.symbol,

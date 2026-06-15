@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import pathlib
+import tempfile
 import unittest
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "binance_usds_futures_trend.py"
@@ -335,6 +337,123 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             trend.allocate_portfolio_risk([], total_risk_budget=0, max_symbol_risk=1.0)
         with self.assertRaises(ValueError):
             trend.allocate_portfolio_risk([], total_risk_budget=1.0, max_symbol_risk=0)
+
+    def _paper_scan_fixture(self, allocations=None, results=None, errors=None):
+        allocations = [] if allocations is None else allocations
+        results = [] if results is None else results
+        return {
+            "mode": "paper",
+            "generated_at_utc": "2026-06-15T12:00:00+00:00",
+            "generated_at_beijing": "2026-06-15T20:00:00+08:00",
+            "interval": "1h",
+            "intervals": ["1h", "4h", "1d"],
+            "primary_interval": "1h",
+            "top_trends": results[:2],
+            "portfolio_allocation": {
+                "mode": "paper",
+                "total_risk_budget": 3.0,
+                "max_symbol_risk": 1.0,
+                "total_allocated_risk": round(sum(float(item["paper_risk_units"]) for item in allocations), 8),
+                "unallocated_risk": 0.0,
+                "allocations": allocations,
+                "skipped_details": [{"symbol": "XRPUSDT", "skip_reason": "not_hold_long"}],
+            },
+            "results": results,
+            "errors": [] if errors is None else errors,
+        }
+
+    def test_apply_paper_state_marks_first_run_and_saves_snapshot(self):
+        scan = self._paper_scan_fixture(
+            allocations=[{"symbol": "BTCUSDT", "paper_risk_units": 1.0}],
+            results=[{"symbol": "BTCUSDT", "action": "hold_long", "ranking_bucket": "strong_confirmed_trend", "rank_score": 10.0}],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = pathlib.Path(tmpdir) / "paper-state.json"
+
+            updated = trend.apply_paper_state(scan, state_path)
+
+            self.assertTrue(updated["state_change"]["first_run"])
+            self.assertEqual(updated["state_change"]["added_allocations"], [{"symbol": "BTCUSDT", "paper_risk_units": 1.0}])
+            self.assertEqual(updated["paper_state"]["mode"], "paper")
+            self.assertEqual(updated["paper_state"]["errors_count"], 0)
+            self.assertTrue(state_path.exists())
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["allocations_by_symbol"]["BTCUSDT"], 1.0)
+            self.assertNotIn("secret", json.dumps(saved).lower())
+
+    def test_apply_paper_state_reports_allocation_and_ranking_changes(self):
+        previous = self._paper_scan_fixture(
+            allocations=[
+                {"symbol": "BTCUSDT", "paper_risk_units": 1.0},
+                {"symbol": "SOLUSDT", "paper_risk_units": 0.5},
+            ],
+            results=[
+                {"symbol": "BTCUSDT", "action": "hold_long", "ranking_bucket": "strong_confirmed_trend", "rank_score": 20.0},
+                {"symbol": "SOLUSDT", "action": "hold_long", "ranking_bucket": "early_trend", "rank_score": 10.0},
+                {"symbol": "XRPUSDT", "action": "flat", "ranking_bucket": "watchlist", "rank_score": 0.0},
+            ],
+        )
+        current = self._paper_scan_fixture(
+            allocations=[
+                {"symbol": "ETHUSDT", "paper_risk_units": 0.8},
+                {"symbol": "BTCUSDT", "paper_risk_units": 0.6},
+            ],
+            results=[
+                {"symbol": "ETHUSDT", "action": "hold_long", "ranking_bucket": "strong_confirmed_trend", "rank_score": 30.0},
+                {"symbol": "BTCUSDT", "action": "hold_long", "ranking_bucket": "early_trend", "rank_score": 15.0},
+                {"symbol": "XRPUSDT", "action": "hold_long", "ranking_bucket": "early_trend", "rank_score": 5.0},
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = pathlib.Path(tmpdir) / "paper-state.json"
+            trend.apply_paper_state(previous, state_path)
+
+            updated = trend.apply_paper_state(current, state_path)
+
+            change = updated["state_change"]
+            self.assertFalse(change["first_run"])
+            self.assertEqual(change["added_allocations"], [{"symbol": "ETHUSDT", "paper_risk_units": 0.8}])
+            self.assertEqual(change["removed_allocations"], [{"symbol": "SOLUSDT", "previous_paper_risk_units": 0.5}])
+            self.assertEqual(
+                change["changed_allocations"],
+                [{"symbol": "BTCUSDT", "previous_paper_risk_units": 1.0, "current_paper_risk_units": 0.6, "delta": -0.4}],
+            )
+            self.assertIn({"symbol": "BTCUSDT", "previous_rank": 1, "current_rank": 2}, change["ranking_changes"])
+            self.assertIn({"symbol": "XRPUSDT", "previous_action": "flat", "current_action": "hold_long"}, change["action_changes"])
+            self.assertIn(
+                {"symbol": "BTCUSDT", "previous_bucket": "strong_confirmed_trend", "current_bucket": "early_trend"},
+                change["bucket_changes"],
+            )
+
+    def test_apply_paper_state_handles_corrupted_state_file(self):
+        scan = self._paper_scan_fixture(
+            allocations=[{"symbol": "BTCUSDT", "paper_risk_units": 1.0}],
+            results=[{"symbol": "BTCUSDT", "action": "hold_long", "ranking_bucket": "strong_confirmed_trend", "rank_score": 10.0}],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = pathlib.Path(tmpdir) / "paper-state.json"
+            state_path.write_text("{not valid json", encoding="utf-8")
+
+            updated = trend.apply_paper_state(scan, state_path)
+
+            self.assertTrue(updated["state_change"]["first_run"])
+            self.assertIn("state_file_error", updated["state_change"])
+            self.assertIn("invalid", updated["state_change"]["state_file_error"].lower())
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["mode"], "paper")
+
+    def test_apply_paper_state_can_compute_without_saving(self):
+        scan = self._paper_scan_fixture(
+            allocations=[{"symbol": "BTCUSDT", "paper_risk_units": 1.0}],
+            results=[{"symbol": "BTCUSDT", "action": "hold_long", "ranking_bucket": "strong_confirmed_trend", "rank_score": 10.0}],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = pathlib.Path(tmpdir) / "paper-state.json"
+
+            updated = trend.apply_paper_state(scan, state_path, save_state=False)
+
+            self.assertTrue(updated["state_change"]["first_run"])
+            self.assertFalse(state_path.exists())
 
     def test_fetch_market_context_uses_free_usds_futures_endpoints(self):
         calls = []

@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when generating paper-only Binance USDS-M futures trend-following decisions from free public K-line data with >=1h intervals, ATR harvesting, and no paid APIs.
-version: 0.6.0
+version: 0.7.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -22,7 +22,7 @@ This project Skill supports paper-only Binance USDS-M futures decision generatio
 - never use short intervals below 1h;
 - prefer staying with the main trend, avoiding premature exits, and harvesting in tranches.
 
-The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work. v0.4 adds multi-timeframe confirmation (`1h,4h,1d`) to reduce single-period noise while preserving the primary trend-following contract. v0.5 adds optional portfolio-level paper risk allocation with total-budget and per-symbol caps. v0.6 adds allocation explainability for allocated and skipped symbols and includes compact allocation notes in `summary_zh`.
+The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work. v0.4 adds multi-timeframe confirmation (`1h,4h,1d`) to reduce single-period noise while preserving the primary trend-following contract. v0.5 adds optional portfolio-level paper risk allocation with total-budget and per-symbol caps. v0.6 adds allocation explainability for allocated and skipped symbols and includes compact allocation notes in `summary_zh`. v0.7 adds optional paper state persistence, storing scan snapshots and reporting allocation/ranking/action/bucket changes between consecutive scans.
 
 ## When to Use
 
@@ -70,6 +70,18 @@ Multi-timeframe scan with portfolio paper risk allocation:
 
 ```bash
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1
+```
+
+Multi-timeframe scan with v0.7 paper state persistence:
+
+```bash
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json
+```
+
+State-change dry run without writing:
+
+```bash
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --no-save-state
 ```
 
 Output is JSON:
@@ -120,7 +132,13 @@ In v0.6 allocation explainability mode, `portfolio_allocation` additionally incl
 - `skipped_details[]`: structured skip reasons for symbols that were flat, non-positive, or excluded by exhausted budget;
 - `summary_zh` includes a compact `分配说明` line for the first 3 allocations.
 
-## Decision Logic v0.6
+In v0.7 paper state persistence mode, enabled by `--state-file`, `scan` additionally includes:
+
+- `paper_state`: compact paper-only snapshot with timestamps, intervals, top trends, portfolio allocation, skipped details, `errors_count`, allocations by symbol, and per-symbol rank/action/bucket diagnostics;
+- `state_change`: comparison between the previous state file and the current scan, including `first_run`, `added_allocations`, `removed_allocations`, `changed_allocations`, `ranking_changes`, `action_changes`, `bucket_changes`, and optional `state_file_error` for corrupted/unreadable state files;
+- state files are written atomically when enabled, and `--no-save-state` computes changes without writing.
+
+## Decision Logic v0.7
 
 1. Validate symbol is in the configured trade universe.
 2. Validate interval is >=1h; reject `1m`, `3m`, `5m`, `10m`, `15m`, `30m`.
@@ -171,6 +189,7 @@ https://fapi.binance.com/fapi/v1/klines
 12. Input guardrails: every interval must be `>=1h`, `risk_unit` must be positive, and `top` must be `>= 1`.
 13. In portfolio allocation mode, allocate paper risk units only to positive `hold_long` decisions by rank order, capped by `total_risk_budget`, `max_symbol_risk`, and each decision's existing `position_size`; never place live orders.
 14. In allocation explainability mode, each allocated symbol records applied constraints and a paper-only explanation; skipped symbols retain `skipped_symbols` and add structured `skipped_details` reasons such as `not_hold_long`, `non_positive_rank_score`, `non_positive_position_size`, and `no_remaining_budget`.
+15. In paper state persistence mode, `--state-file` loads the previous paper snapshot if present, computes allocation/ranking/action/bucket changes, attaches `scan.state_change` and `scan.paper_state`, then atomically writes the current snapshot unless `--no-save-state` is set. Missing state files are treated as first run; corrupted JSON records `state_file_error` and is replaced by the current valid paper snapshot.
 
 ## Testing
 
@@ -193,6 +212,7 @@ The test suite verifies:
 - v0.4 multi-timeframe scanning confirms primary trends against higher timeframes and rejects short intervals in interval lists;
 - v0.5 portfolio allocation respects total budget, per-symbol cap, rank order, and invalid-constraint guardrails;
 - v0.6 allocation explainability records applied constraints, allocation explanations, skipped details, and summary display;
+- v0.7 paper state persistence covers first run, consecutive run changes, allocation add/remove/change, ranking/action/bucket changes, corrupted state files, and no-save dry runs;
 - input guardrails reject non-positive `risk_unit` and `top < 1`.
 
 ## Verification Recipe
@@ -210,6 +230,7 @@ scripts/binance_usds_futures_trend.py --symbol BTCUSDT --interval 1h --limit 240
 scripts/binance_usds_futures_trend.py --all-symbols --interval 1h --limit 240 --context-limit 30 --top 5
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json
 ```
 
 3. Confirm:
@@ -220,6 +241,7 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 - interval is not below 1h;
 - portfolio allocation, when enabled, does not exceed total budget or per-symbol cap;
 - allocation explainability includes `constraints_applied`, `allocation_explanation`, and `skipped_details`;
+- if `--state-file` is used, output includes `paper_state` and `state_change`, and true runtime state goes under ignored `state/*.json` rather than tracked files;
 - no API key or paid API is required.
 
 ## Common Pitfalls
@@ -231,6 +253,7 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 5. **Over-exiting trends.** The baseline reduces size when extended but does not flip to flat while the major trend filter remains valid.
 6. **Omitting timezone labels.** Any run output or report must include UTC or Beijing time (UTC+8) labels.
 7. **Breaking portfolio-output compatibility while adding explainability.** When adding richer allocation diagnostics, keep simple legacy fields such as `skipped_symbols` and add structured detail alongside them (for example `skipped_details`) rather than replacing them; update tests to prove both compatibility and the new explanations.
+8. **Accidentally committing runtime state.** v0.7 real state files should live under ignored `state/*.json`; tests should use temporary directories, and only plan/reference/example docs should be tracked.
 
 ## References
 
@@ -240,10 +263,12 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 - `references/session-v0.4-multi-timeframe-workflow.md` — workflow note for adding multi-timeframe confirmation and grouping.
 - `references/session-v0.5-portfolio-risk-workflow.md` — workflow note for adding portfolio-level paper risk allocation.
 - `references/session-v0.6-allocation-explainability-workflow.md` — workflow note for adding allocation and skip explanations.
+- `references/session-v0.7-paper-state-persistence-workflow.md` — workflow note for adding paper state snapshots and state-change reporting.
 - `plans/binance-usds-futures-trend-v0.3.md` — v0.3 batch scan and ranking implementation plan.
 - `plans/binance-usds-futures-trend-v0.4.md` — v0.4 multi-timeframe confirmation implementation plan.
 - `plans/binance-usds-futures-trend-v0.5.md` — v0.5 portfolio paper risk allocation implementation plan.
 - `plans/binance-usds-futures-trend-v0.6.md` — v0.6 allocation explainability implementation plan.
+- `plans/binance-usds-futures-trend-v0.7.md` — v0.7 paper state persistence implementation plan.
 
 ## Roadmap
 
@@ -251,12 +276,11 @@ Canonical tracked roadmap: `plans/binance-usds-futures-roadmap.md`.
 
 Default sequence unless the user explicitly reprioritizes:
 
-1. v0.7 paper state persistence.
-2. v0.8 scheduled scans and Telegram briefings.
-3. v0.9 historical backtest framework.
-4. v1.0 evidence-based strategy refinement, including higher-timeframe scoring and additional free public factors.
-5. v1.1 paper trading lifecycle.
-6. v2.0 separate Binance testnet execution Skill only after long paper validation.
+1. v0.8 scheduled scans and Telegram briefings.
+2. v0.9 historical backtest framework.
+3. v1.0 evidence-based strategy refinement, including higher-timeframe scoring and additional free public factors.
+4. v1.1 paper trading lifecycle.
+5. v2.0 separate Binance testnet execution Skill only after long paper validation.
 
 ## Verification Checklist
 

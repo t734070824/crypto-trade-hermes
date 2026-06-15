@@ -131,3 +131,6 @@
 /skills/software-development/systematic-debugging/
 /skills/software-development/test-driven-development/
 /skills/yuanbao/
+
+# Runtime paper-trading state (real runs are local/ignored).
+/state/*.json
