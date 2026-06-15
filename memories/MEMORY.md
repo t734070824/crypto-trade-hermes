@@ -13,3 +13,5 @@
 在 crypto-trade-hermes profile 中，config.yaml、plan/、plans/ 已纳入仓库提交范围；任何可能修改已跟踪或可提交文件的操作（memory、skill_manage、write_file、patch、cron/home/hooks/plan/plans/config 文件生成或修改等）之后，应先检查 git 状态；若出现符合仓库策略的变更，应提交并 push。
 §
 实时交易策略目标偏好：在主趋势中持续参与、持续持有、持续收割；策略设计应优先避免过早离场，保持趋势跟随与分批收割能力。
+§
+Binance 相关 API 密钥配置在当前 profile 的 .env 中，变量名为 LALA_KEY 和 LALA_SECRET；不要暴露密钥值，后续如需 Binance auth 应读取这两个变量或映射为 Binance 客户端所需变量。
