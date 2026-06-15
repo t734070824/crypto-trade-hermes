@@ -63,6 +63,7 @@ A Hermes profile contains live runtime state, logs, databases, caches, credentia
 /skills/.bundled_manifest
 /skills/.usage.json
 /skills/.usage.json.lock
+/skills/.hub/
 /skills/<existing-category-or-skill>/
 ```
 

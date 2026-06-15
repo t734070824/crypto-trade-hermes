@@ -30,6 +30,7 @@
 /skills/.bundled_manifest
 /skills/.usage.json
 /skills/.usage.json.lock
+/skills/.hub/
 /skills/apple/DESCRIPTION.md
 /skills/autonomous-ai-agents/DESCRIPTION.md
 /skills/creative/DESCRIPTION.md
