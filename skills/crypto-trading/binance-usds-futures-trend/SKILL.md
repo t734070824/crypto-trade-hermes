@@ -332,6 +332,8 @@ scripts/binance_usds_futures_trend_brief.sh
 10. **Committing cron delivery internals.** Hermes cron `jobs.json` may include runtime/delivery metadata after manual runs. Before committing scheduled trading jobs, prefer `deliver: "telegram"` (home channel) over persisted origin-specific chat IDs, scrub `origin.chat_id` / chat names from tracked config when safe, ignore `cron/output/` and swap files, then verify `cronjob list` still reads the job.
 11. **Skipping the user's push gate.** For this repo, any push must be preceded by an independent agent review of the staged diff. Treat non-empty security or logic findings as blocking, revise, rerun verification, and re-review before pushing.
 12. **Overstating backtest/refinement results.** v0.9 backtests and v1.0 refinement comparisons are paper-only historical diagnostics. Report them as framework/evidence output, not live returns or proof that CAGR targets are achieved. Do not auto-promote a candidate into defaults without a separate reviewed change.
+13. **Creating no-op refinement variants.** A candidate that only raises `max_position_size` can be a no-op when `decide()` already returns smaller `position_size`. When adding refinement variants, make at least one tested parameter actually propagate into simulated exposure (for example `risk_unit`) and add a regression test proving candidate metrics/positions can differ from baseline.
+14. **Comparing variants on drifting samples.** Do not let baseline and candidates fetch live klines separately inside each variant loop. Fetch each symbol's candle sample once, reuse the same sample for every variant, and test fetch call counts so differences are strategy-driven rather than data-timing artifacts.
 
 ## References
 
