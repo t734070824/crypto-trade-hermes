@@ -93,6 +93,20 @@ git commit -m "chore: add repository ignore rules"
 git push -u origin main
 ```
 
+7. When updating Hermes persistent memory in this profile, remember that `memories/USER.md` and `memories/MEMORY.md` are tracked by this repository. After any `memory` tool write, immediately run:
+
+```bash
+git status --short --branch
+# if memories/*.md changed:
+git add memories/USER.md memories/MEMORY.md
+git commit -m "chore: update persistent memory"
+git push
+```
+
+Do not stop at “memory saved” when the profile repository has tracked changes. The user's default for git flows is to push after committing.
+
+If Git identity is missing, set repository-local identity, not global, unless the user requests a global identity.
+
 If Git identity is missing, set repository-local identity, not global, unless the user requests a global identity.
 
 ```bash
