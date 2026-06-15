@@ -315,6 +315,7 @@ Historical workflow notes are intentionally kept out of the main operational pat
 - `references/session-v1.1-paper-lifecycle-workflow.md` — paper lifecycle state and intent;
 - `references/session-v1.2-realtime-architecture-correction.md` — correction toward shared real-time trading architecture.
 - `references/session-v1.3-runtime-data-strategy-evolution.md` — runtime data capture requirements for evidence-based strategy evolution.
+- `references/session-v1.3-runtime-recorder-implementation.md` — implementation and verification workflow for the paper runtime JSONL recorder.
 
 Tracked plans:
 
