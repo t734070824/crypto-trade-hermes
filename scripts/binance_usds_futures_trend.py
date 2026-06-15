@@ -417,14 +417,31 @@ def allocate_portfolio_risk(
 
     eligible: list[dict[str, Any]] = []
     skipped_symbols: list[str] = []
+    skipped_details: list[dict[str, Any]] = []
     for decision in decisions:
         symbol = str(decision.get("symbol", ""))
         rank_score = float(decision.get("rank_score") or 0.0)
         position_size = float(decision.get("position_size") or 0.0)
-        if decision.get("action") == "hold_long" and rank_score > 0 and position_size > 0:
+        action = decision.get("action")
+        if action == "hold_long" and rank_score > 0 and position_size > 0:
             eligible.append(decision)
         elif symbol:
+            if action != "hold_long":
+                skip_reason = "not_hold_long"
+            elif rank_score <= 0:
+                skip_reason = "non_positive_rank_score"
+            else:
+                skip_reason = "non_positive_position_size"
             skipped_symbols.append(symbol)
+            skipped_details.append(
+                {
+                    "symbol": symbol,
+                    "skip_reason": skip_reason,
+                    "action": action,
+                    "rank_score": decision.get("rank_score", 0.0),
+                    "position_size": decision.get("position_size", 0.0),
+                }
+            )
 
     ranked = sorted(eligible, key=lambda item: (float(item.get("rank_score") or 0.0), item.get("symbol", "")), reverse=True)
     remaining = float(total_risk_budget)
@@ -434,12 +451,40 @@ def allocate_portfolio_risk(
         if remaining <= 1e-12:
             if symbol:
                 skipped_symbols.append(symbol)
+                skipped_details.append(
+                    {
+                        "symbol": symbol,
+                        "skip_reason": "no_remaining_budget",
+                        "action": decision.get("action"),
+                        "rank_score": decision.get("rank_score", 0.0),
+                        "position_size": decision.get("position_size", 0.0),
+                    }
+                )
             continue
-        desired = min(float(decision.get("position_size") or 0.0), float(max_symbol_risk), remaining)
+        position_size = float(decision.get("position_size") or 0.0)
+        desired = min(position_size, float(max_symbol_risk), remaining)
         if desired <= 0:
             if symbol:
                 skipped_symbols.append(symbol)
+                skipped_details.append(
+                    {
+                        "symbol": symbol,
+                        "skip_reason": "non_positive_allocation",
+                        "action": decision.get("action"),
+                        "rank_score": decision.get("rank_score", 0.0),
+                        "position_size": decision.get("position_size", 0.0),
+                    }
+                )
             continue
+        constraints_applied: list[str] = []
+        if desired < position_size:
+            constraints_applied.append("position_size_reduced")
+        if desired <= float(max_symbol_risk) and position_size > float(max_symbol_risk):
+            constraints_applied.append("max_symbol_risk_cap")
+        if desired <= remaining and min(position_size, float(max_symbol_risk)) > remaining:
+            constraints_applied.append("remaining_budget_cap")
+        if not constraints_applied:
+            constraints_applied.append("full_position_size")
         paper_risk_units = round(desired, 8)
         allocations.append(
             {
@@ -449,6 +494,12 @@ def allocate_portfolio_risk(
                 "position_size": decision.get("position_size", 0.0),
                 "ranking_bucket": decision.get("ranking_bucket"),
                 "timeframe_agreement_score": decision.get("timeframe_agreement_score"),
+                "constraints_applied": constraints_applied,
+                "allocation_explanation": (
+                    f"rank_score={decision.get('rank_score', 0.0)}; "
+                    f"requested_position_size={decision.get('position_size', 0.0)}; "
+                    f"allocated={paper_risk_units}; constraints={','.join(constraints_applied)}; paper only"
+                ),
                 "reason": "rank-order capped paper allocation; no live order is placed",
             }
         )
@@ -465,6 +516,7 @@ def allocate_portfolio_risk(
         "allocation_method": "rank_order_capped_greedy",
         "allocations": allocations,
         "skipped_symbols": skipped_symbols,
+        "skipped_details": skipped_details,
     }
 
 
@@ -501,6 +553,11 @@ def build_scan_summary_zh(scan: dict[str, Any]) -> str:
             f"已分配 {allocation['total_allocated_risk']}/{allocation['total_risk_budget']} risk units；"
             f"单标的上限 {allocation['max_symbol_risk']}；分配: {allocated_symbols}"
         )
+        allocation_notes = "; ".join(
+            f"{item['symbol']}: {item.get('allocation_explanation', item.get('reason', 'paper only'))}"
+            for item in allocation.get("allocations", [])[:3]
+        ) or "无"
+        lines.append(f"分配说明: {allocation_notes}")
     return "\n".join(lines)
 
 

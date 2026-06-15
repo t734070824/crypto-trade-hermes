@@ -267,6 +267,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
     def test_allocate_portfolio_risk_respects_budget_caps_and_rank_order(self):
         decisions = [
             {"symbol": "ETHUSDT", "action": "flat", "rank_score": 0.0, "position_size": 0.0},
+            {"symbol": "DOGEUSDT", "action": "hold_long", "rank_score": 10.0, "position_size": 0.5},
             {"symbol": "SOLUSDT", "action": "hold_long", "rank_score": 50.0, "position_size": 0.8},
             {"symbol": "BTCUSDT", "action": "hold_long", "rank_score": 100.0, "position_size": 1.25},
         ]
@@ -281,7 +282,13 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual([item["symbol"] for item in allocation["allocations"]], ["BTCUSDT", "SOLUSDT"])
         self.assertEqual(allocation["allocations"][0]["paper_risk_units"], 1.0)
         self.assertEqual(allocation["allocations"][1]["paper_risk_units"], 0.2)
-        self.assertEqual(allocation["skipped_symbols"], ["ETHUSDT"])
+        self.assertIn("max_symbol_risk_cap", allocation["allocations"][0]["constraints_applied"])
+        self.assertIn("remaining_budget_cap", allocation["allocations"][1]["constraints_applied"])
+        self.assertIn("rank_score=100.0", allocation["allocations"][0]["allocation_explanation"])
+        self.assertEqual(allocation["skipped_symbols"], ["ETHUSDT", "DOGEUSDT"])
+        skip_reasons = {item["symbol"]: item["skip_reason"] for item in allocation["skipped_details"]}
+        self.assertEqual(skip_reasons["ETHUSDT"], "not_hold_long")
+        self.assertEqual(skip_reasons["DOGEUSDT"], "no_remaining_budget")
 
     def test_scan_symbols_can_include_portfolio_risk_allocation(self):
         def make_candles(start, step):
@@ -320,6 +327,8 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertLessEqual(scan["portfolio_allocation"]["total_allocated_risk"], 1.5)
         self.assertTrue(all(item["paper_risk_units"] <= 1.0 for item in scan["portfolio_allocation"]["allocations"]))
         self.assertIn("组合纸面风险预算", scan["summary_zh"])
+        self.assertIn("分配说明", scan["summary_zh"])
+        self.assertIn("paper only", scan["summary_zh"])
 
     def test_rejects_invalid_portfolio_risk_constraints(self):
         with self.assertRaises(ValueError):
