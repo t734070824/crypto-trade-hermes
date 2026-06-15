@@ -193,6 +193,77 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertIn("北京时间（UTC+8）", scan["summary_zh"])
         self.assertIn("最强趋势 Top 2", scan["summary_zh"])
 
+    def test_scan_symbols_multi_timeframe_confirms_and_groups_trends(self):
+        def make_candles(start, step):
+            candles = []
+            price = float(start)
+            for _ in range(240):
+                open_price = price
+                close_price = price + step
+                high = max(open_price, close_price) + 0.7
+                low = min(open_price, close_price) - 0.5
+                candles.append({"open": open_price, "high": high, "low": low, "close": close_price})
+                price = close_price
+            return candles
+
+        candle_map = {
+            ("BTCUSDT", "1h"): make_candles(100, 1.0),
+            ("BTCUSDT", "4h"): make_candles(100, 1.1),
+            ("BTCUSDT", "1d"): make_candles(100, 1.2),
+            ("SOLUSDT", "1h"): make_candles(50, 0.8),
+            ("SOLUSDT", "4h"): make_candles(200, -0.4),
+            ("SOLUSDT", "1d"): make_candles(200, -0.5),
+            ("ETHUSDT", "1h"): make_candles(300, -0.7),
+            ("ETHUSDT", "4h"): make_candles(100, 0.7),
+            ("ETHUSDT", "1d"): make_candles(100, 0.8),
+        }
+
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: candle_map[(symbol, interval)])
+        try:
+            scan = trend.scan_symbols(
+                ["SOLUSDT", "ETHUSDT", "BTCUSDT"],
+                intervals=["1h", "4h", "1d"],
+                limit=240,
+                include_context=False,
+                top=3,
+            )
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
+        self.assertEqual(scan["intervals"], ["1h", "4h", "1d"])
+        self.assertEqual(scan["primary_interval"], "1h")
+        btc = next(item for item in scan["results"] if item["symbol"] == "BTCUSDT")
+        sol = next(item for item in scan["results"] if item["symbol"] == "SOLUSDT")
+        eth = next(item for item in scan["results"] if item["symbol"] == "ETHUSDT")
+
+        self.assertEqual(btc["primary_trend"], "hold_long")
+        self.assertTrue(btc["higher_timeframe_confirmed"])
+        self.assertEqual(btc["timeframe_agreement_score"], 1.0)
+        self.assertEqual(set(btc["timeframe_signals"]), {"1h", "4h", "1d"})
+        self.assertEqual(btc["ranking_bucket"], "strong_confirmed_trend")
+        self.assertGreater(btc["rank_score"], sol["rank_score"])
+
+        self.assertEqual(sol["primary_trend"], "hold_long")
+        self.assertFalse(sol["higher_timeframe_confirmed"])
+        self.assertEqual(sol["timeframe_agreement_score"], 1 / 3)
+        self.assertEqual(sol["ranking_bucket"], "early_trend")
+
+        self.assertEqual(eth["primary_trend"], "flat")
+        self.assertEqual(eth["ranking_bucket"], "conflicting_trend")
+        self.assertEqual([item["symbol"] for item in scan["strong_confirmed_trends"]], ["BTCUSDT"])
+        self.assertEqual([item["symbol"] for item in scan["early_trends"]], ["SOLUSDT"])
+        self.assertEqual([item["symbol"] for item in scan["conflicting_trends"]], ["ETHUSDT"])
+        self.assertIn("多周期", scan["summary_zh"])
+        self.assertIn("1h,4h,1d", scan["summary_zh"])
+
+    def test_rejects_short_intervals_in_multi_timeframe_scan(self):
+        with self.assertRaises(ValueError):
+            trend.scan_symbols(["BTCUSDT"], intervals=["1h", "30m", "4h"], include_context=False)
+
+        with self.assertRaises(ValueError):
+            trend.scan_symbols(["BTCUSDT"], intervals=["1h", "4h", "4h"], include_context=False)
+
     def test_fetch_market_context_uses_free_usds_futures_endpoints(self):
         calls = []
 

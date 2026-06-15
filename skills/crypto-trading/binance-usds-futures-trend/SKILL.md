@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when generating paper-only Binance USDS-M futures trend-following decisions from free public K-line data with >=1h intervals, ATR harvesting, and no paid APIs.
-version: 0.3.0
+version: 0.4.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -22,7 +22,7 @@ This project Skill supports paper-only Binance USDS-M futures decision generatio
 - never use short intervals below 1h;
 - prefer staying with the main trend, avoiding premature exits, and harvesting in tranches.
 
-The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work.
+The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work. v0.4 adds multi-timeframe confirmation (`1h,4h,1d`) to reduce single-period noise while preserving the primary trend-following contract.
 
 ## When to Use
 
@@ -60,6 +60,12 @@ Batch scan selected symbols:
 scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --top 3
 ```
 
+Multi-timeframe batch scan:
+
+```bash
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5
+```
+
 Output is JSON:
 
 - `ok`: whether the run succeeded;
@@ -83,7 +89,16 @@ In v0.3 batch mode, output is `scan` JSON:
 - `scan.watchlist`: flat/error symbols to observe but not allocate to;
 - `scan.summary_zh`: concise Chinese report with UTC and 北京时间（UTC+8） labels.
 
-## Decision Logic v0.3
+In v0.4 multi-timeframe mode, `scan` additionally includes:
+
+- `scan.intervals`: interval list for batch scans, e.g. `1h,4h,1d`;
+- `scan.primary_interval`: first interval in the list;
+- `timeframe_signals`: per-interval decision summaries on each result;
+- `timeframe_agreement_score`: how many intervals agree with the primary trend;
+- `higher_timeframe_confirmed`: whether all higher intervals support the primary hold-long trend;
+- `strong_confirmed_trends`, `early_trends`, and `conflicting_trends` groups.
+
+## Decision Logic v0.4
 
 1. Validate symbol is in the configured trade universe.
 2. Validate interval is >=1h; reject `1m`, `3m`, `5m`, `10m`, `15m`, `30m`.
@@ -124,9 +139,14 @@ https://fapi.binance.com/fapi/v1/klines
 10. In batch mode, scan all selected symbols and add ranking fields:
    - `trend_strength`: ATR-normalized major-trend strength;
    - `extension_atr`: ATR-normalized distance above EMA50;
-   - `rank_score`: `trend_strength * confidence_score * position_size`;
+   - `rank_score`: `trend_strength * confidence_score * position_size` (and multiplied by `timeframe_agreement_score` in multi-timeframe mode);
    - `ranking_bucket`: `top_trend`, `risk_high_trend`, `watchlist`, or `error`.
-11. Input guardrails: `risk_unit` must be positive and `top` must be `>= 1`.
+11. In multi-timeframe mode, evaluate each interval independently, use the first interval as primary, and add:
+   - `timeframe_signals`;
+   - `timeframe_agreement_score`;
+   - `higher_timeframe_confirmed`;
+   - `ranking_bucket`: `strong_confirmed_trend`, `early_trend`, `conflicting_trend`, `watchlist`, or `error`.
+12. Input guardrails: every interval must be `>=1h`, `risk_unit` must be positive, and `top` must be `>= 1`.
 
 ## Testing
 
@@ -146,6 +166,7 @@ The test suite verifies:
 - v0.2 public context factors adjust confidence/size without forcing premature trend exits;
 - v0.2 context fetch uses free Binance USDS-M endpoints;
 - v0.3 batch scanning ranks multi-symbol trend candidates and builds a Chinese summary;
+- v0.4 multi-timeframe scanning confirms primary trends against higher timeframes and rejects short intervals in interval lists;
 - input guardrails reject non-positive `risk_unit` and `top < 1`.
 
 ## Verification Recipe
@@ -161,6 +182,7 @@ python3 -m unittest tests/test_binance_usds_futures_trend.py -v
 ```bash
 scripts/binance_usds_futures_trend.py --symbol BTCUSDT --interval 1h --limit 240
 scripts/binance_usds_futures_trend.py --all-symbols --interval 1h --limit 240 --context-limit 30 --top 5
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5
 ```
 
 3. Confirm:
@@ -183,11 +205,14 @@ scripts/binance_usds_futures_trend.py --all-symbols --interval 1h --limit 240 --
 
 - `references/binance-skills-hub-usds-futures.md` — condensed notes from the fetched Binance Skills Hub repo for USDⓈ-M Futures public/auth endpoints used by this skill.
 - `references/session-v0.2-public-factors-workflow.md` — workflow note for expanding free Binance public factors while preserving the primary trend-following contract.
+- `references/session-v0.3-batch-scanner-workflow.md` — workflow note for adding multi-symbol batch scanning, ranking, guardrails, and verification.
+- `references/session-v0.4-multi-timeframe-workflow.md` — workflow note for adding multi-timeframe confirmation and grouping.
 - `plans/binance-usds-futures-trend-v0.3.md` — v0.3 batch scan and ranking implementation plan.
+- `plans/binance-usds-futures-trend-v0.4.md` — v0.4 multi-timeframe confirmation implementation plan.
 
 ## Roadmap
 
-- Add higher-timeframe agreement, e.g. 4h + 1d trend filter.
+- Refine higher-timeframe agreement scoring and explainability.
 - Add free Binance USDS-M factors from the local Binance Skills Hub reference: mark-price Kline, funding, open interest, long/short ratios, taker buy/sell volume, and premium index Kline.
 - Add volatility targeting and max portfolio risk constraints.
 - Add paper state persistence under a tracked or intentionally ignored path after policy review.

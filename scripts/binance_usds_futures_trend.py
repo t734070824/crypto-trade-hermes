@@ -313,8 +313,8 @@ def decide(
     }
 
 
-def enrich_for_ranking(decision: dict[str, Any]) -> dict[str, Any]:
-    """Add v0.3 portfolio-ranking fields to one paper decision."""
+def enrich_for_ranking(decision: dict[str, Any], timeframe_agreement_score: float = 1.0) -> dict[str, Any]:
+    """Add portfolio-ranking fields to one paper decision."""
     enriched = dict(decision)
     action = enriched.get("action")
     atr14 = float(enriched.get("atr14") or 0.0)
@@ -323,6 +323,8 @@ def enrich_for_ranking(decision: dict[str, Any]) -> dict[str, Any]:
     ema200_value = float(enriched.get("ema200") or 0.0)
     confidence = float(enriched.get("confidence_score") or 0.0)
     position_size = float(enriched.get("position_size") or 0.0)
+    agreement = max(0.0, min(1.0, timeframe_agreement_score))
+    enriched["timeframe_agreement_score"] = agreement
 
     if action != "hold_long" or atr14 <= 0:
         enriched.update({"trend_strength": 0.0, "rank_score": 0.0, "ranking_bucket": "watchlist"})
@@ -332,7 +334,7 @@ def enrich_for_ranking(decision: dict[str, Any]) -> dict[str, Any]:
     ema_gap_atr = max(0.0, (ema50_value - ema200_value) / atr14)
     extension_atr = max(0.0, (entry - ema50_value) / atr14)
     trend_strength = round(price_gap_atr + ema_gap_atr, 4)
-    rank_score = round(trend_strength * confidence * max(position_size, 0.01), 4)
+    rank_score = round(trend_strength * confidence * max(position_size, 0.01) * agreement, 4)
     flags = set(enriched.get("factor_flags") or [])
     risk_flags = {"funding_extreme", "oi_contracting", "long_side_crowded", "taker_sell_pressure", "mark_trend_divergence"}
     bucket = "risk_high_trend" if extension_atr > 4.0 or confidence < 0.75 or flags.intersection(risk_flags) else "top_trend"
@@ -347,16 +349,80 @@ def enrich_for_ranking(decision: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
+def validate_intervals(interval: str | None = "1h", intervals: list[str] | tuple[str, ...] | None = None) -> list[str]:
+    """Validate one or more K-line intervals while preserving order."""
+    raw_intervals = [interval or "1h"] if intervals is None else list(intervals)
+    if not raw_intervals:
+        raise ValueError("at least one interval is required")
+    validated = [validate_interval(item) for item in raw_intervals]
+    if len(set(validated)) != len(validated):
+        raise ValueError("duplicate intervals are not allowed")
+    return validated
+
+
+def _timeframe_signal(decision: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action": decision.get("action"),
+        "entry_reference": decision.get("entry_reference"),
+        "ema50": decision.get("ema50"),
+        "ema200": decision.get("ema200"),
+        "atr14": decision.get("atr14"),
+        "reason": decision.get("reason"),
+    }
+
+
+def enrich_with_timeframes(primary: dict[str, Any], timeframe_decisions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Add v0.4 multi-timeframe agreement fields to a primary decision."""
+    primary_interval = primary["interval"]
+    primary_action = primary.get("action")
+    total = max(len(timeframe_decisions), 1)
+    matching = sum(1 for decision in timeframe_decisions.values() if decision.get("action") == primary_action)
+    agreement = matching / total
+    higher_intervals = [item for item in timeframe_decisions if item != primary_interval]
+    higher_confirmed = bool(
+        primary_action == "hold_long"
+        and higher_intervals
+        and all(timeframe_decisions[item].get("action") == "hold_long" for item in higher_intervals)
+    )
+    enriched = enrich_for_ranking(primary, agreement)
+    enriched.update(
+        {
+            "timeframe_signals": {interval: _timeframe_signal(decision) for interval, decision in timeframe_decisions.items()},
+            "primary_interval": primary_interval,
+            "primary_trend": primary_action,
+            "higher_timeframe_confirmed": higher_confirmed,
+            "timeframe_agreement_score": agreement,
+        }
+    )
+    if primary_action == "hold_long":
+        if higher_confirmed:
+            enriched["ranking_bucket"] = "strong_confirmed_trend"
+        else:
+            enriched["ranking_bucket"] = "early_trend"
+    elif any(timeframe_decisions[item].get("action") == "hold_long" for item in higher_intervals):
+        enriched["ranking_bucket"] = "conflicting_trend"
+    return enriched
+
+
 def build_scan_summary_zh(scan: dict[str, Any]) -> str:
     """Build a compact Chinese report with explicit UTC and Beijing time labels."""
     top_n = scan.get("top_n", 0)
+    intervals_text = ",".join(scan.get("intervals", [scan.get("interval", "")]))
+    mode_label = "多周期" if len(scan.get("intervals", [])) > 1 else "单周期"
     lines = [
-        "Binance USDS-M 多币种趋势扫描（paper only）",
+        f"Binance USDS-M {mode_label}趋势扫描（paper only）",
         f"UTC: {scan['generated_at_utc']}",
         f"北京时间（UTC+8）: {scan['generated_at_beijing']}",
-        f"周期: {scan['interval']}；扫描数量: {scan['universe_count']}",
+        f"周期: {intervals_text}；扫描数量: {scan['universe_count']}",
         f"最强趋势 Top {top_n}: " + (", ".join(item["symbol"] for item in scan.get("top_trends", [])) or "无"),
     ]
+    if len(scan.get("intervals", [])) > 1:
+        strong_symbols = ", ".join(item["symbol"] for item in scan.get("strong_confirmed_trends", [])) or "无"
+        early_symbols = ", ".join(item["symbol"] for item in scan.get("early_trends", [])) or "无"
+        conflicting_symbols = ", ".join(item["symbol"] for item in scan.get("conflicting_trends", [])) or "无"
+        lines.append(f"强确认趋势: {strong_symbols}")
+        lines.append(f"早期趋势: {early_symbols}")
+        lines.append(f"周期冲突: {conflicting_symbols}")
     risk_symbols = ", ".join(item["symbol"] for item in scan.get("risk_high_trends", [])) or "无"
     watch_symbols = ", ".join(item["symbol"] for item in scan.get("watchlist", [])[:10]) or "无"
     lines.append(f"趋势内但风险偏高: {risk_symbols}")
@@ -367,6 +433,7 @@ def build_scan_summary_zh(scan: dict[str, Any]) -> str:
 def scan_symbols(
     symbols: list[str] | tuple[str, ...] | None = None,
     interval: str = "1h",
+    intervals: list[str] | tuple[str, ...] | None = None,
     limit: int = 240,
     context_limit: int = 30,
     risk_unit: float = 1.0,
@@ -375,7 +442,8 @@ def scan_symbols(
     top: int = 5,
 ) -> dict[str, Any]:
     """Scan multiple configured symbols and rank paper trend opportunities."""
-    interval = validate_interval(interval)
+    scan_intervals = validate_intervals(interval, intervals)
+    primary_interval = scan_intervals[0]
     if top < 1:
         raise ValueError("top must be >= 1")
     selected_symbols = list(DEFAULT_SYMBOLS if symbols is None else symbols)
@@ -386,21 +454,32 @@ def scan_symbols(
 
     for symbol in selected_symbols:
         try:
-            candles = fetch_klines(symbol, interval, limit, base_url)
-            market_context = None if not include_context else fetch_market_context(symbol, interval, context_limit, base_url)
-            decision = decide(candles, symbol, interval, risk_unit, market_context)
-            results.append(enrich_for_ranking(decision))
+            timeframe_decisions: dict[str, dict[str, Any]] = {}
+            for current_interval in scan_intervals:
+                candles = fetch_klines(symbol, current_interval, limit, base_url)
+                market_context = None
+                if include_context and current_interval == primary_interval:
+                    market_context = fetch_market_context(symbol, current_interval, context_limit, base_url)
+                timeframe_decisions[current_interval] = decide(candles, symbol, current_interval, risk_unit, market_context)
+            primary_decision = timeframe_decisions[primary_interval]
+            if len(scan_intervals) == 1:
+                results.append(enrich_for_ranking(primary_decision))
+            else:
+                results.append(enrich_with_timeframes(primary_decision, timeframe_decisions))
         except Exception as exc:
             errors.append({"symbol": symbol, "error": str(exc)})
             results.append(
                 {
                     "symbol": symbol,
-                    "interval": interval,
+                    "interval": primary_interval,
+                    "intervals": scan_intervals,
                     "mode": "paper",
                     "action": "error",
+                    "primary_trend": "error",
                     "position_size": 0,
                     "confidence_score": 0,
                     "trend_strength": 0.0,
+                    "timeframe_agreement_score": 0.0,
                     "rank_score": -1.0,
                     "ranking_bucket": "error",
                     "reason": str(exc),
@@ -410,15 +489,23 @@ def scan_symbols(
     ranked = sorted(results, key=lambda item: (float(item.get("rank_score", -1.0)), item.get("symbol", "")), reverse=True)
     top_trends = [item for item in ranked if item.get("action") == "hold_long"][:top]
     risk_high = [item for item in ranked if item.get("ranking_bucket") == "risk_high_trend"]
+    strong_confirmed = [item for item in ranked if item.get("ranking_bucket") == "strong_confirmed_trend"]
+    early_trends = [item for item in ranked if item.get("ranking_bucket") == "early_trend"]
+    conflicting_trends = [item for item in ranked if item.get("ranking_bucket") == "conflicting_trend"]
     watchlist = [item for item in ranked if item.get("action") in {"flat", "error"}]
     scan: dict[str, Any] = {
         "mode": "paper",
-        "interval": interval,
+        "interval": primary_interval,
+        "intervals": scan_intervals,
+        "primary_interval": primary_interval,
         **stamps,
         "universe_count": len(selected_symbols),
         "top_n": top,
         "results": ranked,
         "top_trends": top_trends,
+        "strong_confirmed_trends": strong_confirmed,
+        "early_trends": early_trends,
+        "conflicting_trends": conflicting_trends,
         "risk_high_trends": risk_high,
         "watchlist": watchlist,
         "errors": errors,
@@ -431,6 +518,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Binance USDS futures paper trend decision")
     parser.add_argument("--symbol", default="BTCUSDT", help="USDS futures symbol in configured universe")
     parser.add_argument("--interval", default="1h", help="K-line interval; must be >= 1h")
+    parser.add_argument("--intervals", help="Comma-separated K-line intervals for v0.4 batch scan only, e.g. 1h,4h,1d")
     parser.add_argument("--limit", type=int, default=240, help="K-line count, 200-1500")
     parser.add_argument("--context-limit", type=int, default=30, help="Public factor sample count, 2-500")
     parser.add_argument("--risk-unit", type=float, default=1.0, help="Paper position sizing unit")
@@ -448,9 +536,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.all_symbols or args.symbols:
             symbols = None if args.all_symbols else [part.strip().upper() for part in args.symbols.split(",") if part.strip()]
+            intervals = None if not args.intervals else [part.strip() for part in args.intervals.split(",") if part.strip()]
             scan = scan_symbols(
                 symbols=symbols,
                 interval=args.interval,
+                intervals=intervals,
                 limit=args.limit,
                 context_limit=args.context_limit,
                 risk_unit=args.risk_unit,
