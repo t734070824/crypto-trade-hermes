@@ -264,6 +264,69 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             trend.scan_symbols(["BTCUSDT"], intervals=["1h", "4h", "4h"], include_context=False)
 
+    def test_allocate_portfolio_risk_respects_budget_caps_and_rank_order(self):
+        decisions = [
+            {"symbol": "ETHUSDT", "action": "flat", "rank_score": 0.0, "position_size": 0.0},
+            {"symbol": "SOLUSDT", "action": "hold_long", "rank_score": 50.0, "position_size": 0.8},
+            {"symbol": "BTCUSDT", "action": "hold_long", "rank_score": 100.0, "position_size": 1.25},
+        ]
+
+        allocation = trend.allocate_portfolio_risk(decisions, total_risk_budget=1.2, max_symbol_risk=1.0)
+
+        self.assertEqual(allocation["mode"], "paper")
+        self.assertEqual(allocation["total_risk_budget"], 1.2)
+        self.assertEqual(allocation["max_symbol_risk"], 1.0)
+        self.assertEqual(allocation["total_allocated_risk"], 1.2)
+        self.assertEqual(allocation["unallocated_risk"], 0.0)
+        self.assertEqual([item["symbol"] for item in allocation["allocations"]], ["BTCUSDT", "SOLUSDT"])
+        self.assertEqual(allocation["allocations"][0]["paper_risk_units"], 1.0)
+        self.assertEqual(allocation["allocations"][1]["paper_risk_units"], 0.2)
+        self.assertEqual(allocation["skipped_symbols"], ["ETHUSDT"])
+
+    def test_scan_symbols_can_include_portfolio_risk_allocation(self):
+        def make_candles(start, step):
+            candles = []
+            price = float(start)
+            for _ in range(240):
+                open_price = price
+                close_price = price + step
+                high = max(open_price, close_price) + 2.0
+                low = min(open_price, close_price) - 2.0
+                candles.append({"open": open_price, "high": high, "low": low, "close": close_price})
+                price = close_price
+            return candles
+
+        candle_map = {
+            "BTCUSDT": make_candles(100, 0.1),
+            "SOLUSDT": make_candles(50, 0.08),
+            "ETHUSDT": make_candles(300, -0.1),
+        }
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: candle_map[symbol])
+        try:
+            scan = trend.scan_symbols(
+                ["ETHUSDT", "SOLUSDT", "BTCUSDT"],
+                interval="1h",
+                limit=240,
+                include_context=False,
+                portfolio_risk_budget=1.5,
+                max_symbol_risk=1.0,
+            )
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
+        self.assertIn("portfolio_allocation", scan)
+        self.assertEqual(scan["portfolio_allocation"]["total_allocated_risk"], 1.5)
+        self.assertLessEqual(scan["portfolio_allocation"]["total_allocated_risk"], 1.5)
+        self.assertTrue(all(item["paper_risk_units"] <= 1.0 for item in scan["portfolio_allocation"]["allocations"]))
+        self.assertIn("组合纸面风险预算", scan["summary_zh"])
+
+    def test_rejects_invalid_portfolio_risk_constraints(self):
+        with self.assertRaises(ValueError):
+            trend.allocate_portfolio_risk([], total_risk_budget=0, max_symbol_risk=1.0)
+        with self.assertRaises(ValueError):
+            trend.allocate_portfolio_risk([], total_risk_budget=1.0, max_symbol_risk=0)
+
     def test_fetch_market_context_uses_free_usds_futures_endpoints(self):
         calls = []
 

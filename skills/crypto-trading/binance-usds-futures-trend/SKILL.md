@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when generating paper-only Binance USDS-M futures trend-following decisions from free public K-line data with >=1h intervals, ATR harvesting, and no paid APIs.
-version: 0.4.0
+version: 0.5.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -22,7 +22,7 @@ This project Skill supports paper-only Binance USDS-M futures decision generatio
 - never use short intervals below 1h;
 - prefer staying with the main trend, avoiding premature exits, and harvesting in tranches.
 
-The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work. v0.4 adds multi-timeframe confirmation (`1h,4h,1d`) to reduce single-period noise while preserving the primary trend-following contract.
+The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work. v0.4 adds multi-timeframe confirmation (`1h,4h,1d`) to reduce single-period noise while preserving the primary trend-following contract. v0.5 adds optional portfolio-level paper risk allocation with total-budget and per-symbol caps.
 
 ## When to Use
 
@@ -66,6 +66,12 @@ Multi-timeframe batch scan:
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5
 ```
 
+Multi-timeframe scan with portfolio paper risk allocation:
+
+```bash
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1
+```
+
 Output is JSON:
 
 - `ok`: whether the run succeeded;
@@ -98,7 +104,16 @@ In v0.4 multi-timeframe mode, `scan` additionally includes:
 - `higher_timeframe_confirmed`: whether all higher intervals support the primary hold-long trend;
 - `strong_confirmed_trends`, `early_trends`, and `conflicting_trends` groups.
 
-## Decision Logic v0.4
+In v0.5 portfolio allocation mode, `scan` additionally includes:
+
+- `portfolio_allocation.mode`: always `paper`;
+- `portfolio_allocation.total_risk_budget`: total paper risk-unit budget;
+- `portfolio_allocation.max_symbol_risk`: per-symbol paper risk-unit cap;
+- `portfolio_allocation.allocations`: ranked paper allocations by symbol;
+- `portfolio_allocation.total_allocated_risk` and `unallocated_risk`;
+- `portfolio_allocation.skipped_symbols`: symbols not eligible or not reached by remaining budget.
+
+## Decision Logic v0.5
 
 1. Validate symbol is in the configured trade universe.
 2. Validate interval is >=1h; reject `1m`, `3m`, `5m`, `10m`, `15m`, `30m`.
@@ -147,6 +162,7 @@ https://fapi.binance.com/fapi/v1/klines
    - `higher_timeframe_confirmed`;
    - `ranking_bucket`: `strong_confirmed_trend`, `early_trend`, `conflicting_trend`, `watchlist`, or `error`.
 12. Input guardrails: every interval must be `>=1h`, `risk_unit` must be positive, and `top` must be `>= 1`.
+13. In portfolio allocation mode, allocate paper risk units only to positive `hold_long` decisions by rank order, capped by `total_risk_budget`, `max_symbol_risk`, and each decision's existing `position_size`; never place live orders.
 
 ## Testing
 
@@ -167,6 +183,7 @@ The test suite verifies:
 - v0.2 context fetch uses free Binance USDS-M endpoints;
 - v0.3 batch scanning ranks multi-symbol trend candidates and builds a Chinese summary;
 - v0.4 multi-timeframe scanning confirms primary trends against higher timeframes and rejects short intervals in interval lists;
+- v0.5 portfolio allocation respects total budget, per-symbol cap, rank order, and invalid-constraint guardrails;
 - input guardrails reject non-positive `risk_unit` and `top < 1`.
 
 ## Verification Recipe
@@ -183,6 +200,7 @@ python3 -m unittest tests/test_binance_usds_futures_trend.py -v
 scripts/binance_usds_futures_trend.py --symbol BTCUSDT --interval 1h --limit 240
 scripts/binance_usds_futures_trend.py --all-symbols --interval 1h --limit 240 --context-limit 30 --top 5
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1
 ```
 
 3. Confirm:
@@ -191,15 +209,17 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 - `mode` is `paper`;
 - timestamps include both UTC and Beijing time (UTC+8);
 - interval is not below 1h;
+- portfolio allocation, when enabled, does not exceed total budget or per-symbol cap;
 - no API key or paid API is required.
 
 ## Common Pitfalls
 
 1. **Installing unrelated Binance skills blindly.** Some public Binance skills are spot-only or on-chain/web3 focused. For this project, prefer USDS-M futures and free K-line data.
-2. **Using short intervals.** The user explicitly disallows short periods below 1h; reject them in code and tests.
-3. **Confusing paper decisions with execution.** This Skill does not place orders. Live trading needs a separate signed-execution workflow, risk cap, kill switch, and testnet-first validation.
-4. **Over-exiting trends.** The baseline reduces size when extended but does not flip to flat while the major trend filter remains valid.
-5. **Omitting timezone labels.** Any run output or report must include UTC or Beijing time (UTC+8) labels.
+2. **Using short intervals or duplicate intervals.** The user explicitly disallows short periods below 1h; reject them in code and tests. Also reject duplicate `--intervals` entries because `timeframe_signals` is keyed by interval and duplicates would silently collapse.
+3. **Ambiguous primary interval ordering.** In `--intervals`, the first interval is the primary interval. Document or enforce this when extending the scanner; if future logic relies on "higher timeframe" semantics, consider validating that later intervals are not lower than the primary interval.
+4. **Confusing paper decisions with execution.** This Skill does not place orders. Live trading needs a separate signed-execution workflow, risk cap, kill switch, and testnet-first validation.
+5. **Over-exiting trends.** The baseline reduces size when extended but does not flip to flat while the major trend filter remains valid.
+6. **Omitting timezone labels.** Any run output or report must include UTC or Beijing time (UTC+8) labels.
 
 ## References
 
@@ -207,15 +227,17 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 - `references/session-v0.2-public-factors-workflow.md` — workflow note for expanding free Binance public factors while preserving the primary trend-following contract.
 - `references/session-v0.3-batch-scanner-workflow.md` — workflow note for adding multi-symbol batch scanning, ranking, guardrails, and verification.
 - `references/session-v0.4-multi-timeframe-workflow.md` — workflow note for adding multi-timeframe confirmation and grouping.
+- `references/session-v0.5-portfolio-risk-workflow.md` — workflow note for adding portfolio-level paper risk allocation.
 - `plans/binance-usds-futures-trend-v0.3.md` — v0.3 batch scan and ranking implementation plan.
 - `plans/binance-usds-futures-trend-v0.4.md` — v0.4 multi-timeframe confirmation implementation plan.
+- `plans/binance-usds-futures-trend-v0.5.md` — v0.5 portfolio paper risk allocation implementation plan.
 
 ## Roadmap
 
 - Refine higher-timeframe agreement scoring and explainability.
-- Add free Binance USDS-M factors from the local Binance Skills Hub reference: mark-price Kline, funding, open interest, long/short ratios, taker buy/sell volume, and premium index Kline.
-- Add volatility targeting and max portfolio risk constraints.
-- Add paper state persistence under a tracked or intentionally ignored path after policy review.
+- Add allocation explainability and paper state persistence under a tracked or intentionally ignored path after policy review.
+- Add free Binance USDS-M factors from the local Binance Skills Hub reference: premium index Kline and any missing context factors that remain free/public.
+- Add scheduled scans and Telegram briefings.
 - Only after long paper validation: design a separate live execution Skill with Binance testnet-first signed requests.
 
 ## Verification Checklist

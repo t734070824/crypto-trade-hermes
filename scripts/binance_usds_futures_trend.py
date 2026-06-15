@@ -404,6 +404,70 @@ def enrich_with_timeframes(primary: dict[str, Any], timeframe_decisions: dict[st
     return enriched
 
 
+def allocate_portfolio_risk(
+    decisions: list[dict[str, Any]],
+    total_risk_budget: float,
+    max_symbol_risk: float,
+) -> dict[str, Any]:
+    """Allocate paper risk units across ranked hold-long decisions with portfolio caps."""
+    if total_risk_budget <= 0:
+        raise ValueError("total_risk_budget must be positive")
+    if max_symbol_risk <= 0:
+        raise ValueError("max_symbol_risk must be positive")
+
+    eligible: list[dict[str, Any]] = []
+    skipped_symbols: list[str] = []
+    for decision in decisions:
+        symbol = str(decision.get("symbol", ""))
+        rank_score = float(decision.get("rank_score") or 0.0)
+        position_size = float(decision.get("position_size") or 0.0)
+        if decision.get("action") == "hold_long" and rank_score > 0 and position_size > 0:
+            eligible.append(decision)
+        elif symbol:
+            skipped_symbols.append(symbol)
+
+    ranked = sorted(eligible, key=lambda item: (float(item.get("rank_score") or 0.0), item.get("symbol", "")), reverse=True)
+    remaining = float(total_risk_budget)
+    allocations: list[dict[str, Any]] = []
+    for decision in ranked:
+        symbol = str(decision.get("symbol", ""))
+        if remaining <= 1e-12:
+            if symbol:
+                skipped_symbols.append(symbol)
+            continue
+        desired = min(float(decision.get("position_size") or 0.0), float(max_symbol_risk), remaining)
+        if desired <= 0:
+            if symbol:
+                skipped_symbols.append(symbol)
+            continue
+        paper_risk_units = round(desired, 8)
+        allocations.append(
+            {
+                "symbol": symbol,
+                "paper_risk_units": paper_risk_units,
+                "rank_score": decision.get("rank_score", 0.0),
+                "position_size": decision.get("position_size", 0.0),
+                "ranking_bucket": decision.get("ranking_bucket"),
+                "timeframe_agreement_score": decision.get("timeframe_agreement_score"),
+                "reason": "rank-order capped paper allocation; no live order is placed",
+            }
+        )
+        remaining -= paper_risk_units
+
+    total_allocated = round(sum(float(item["paper_risk_units"]) for item in allocations), 8)
+    return {
+        "mode": "paper",
+        **now_stamps(),
+        "total_risk_budget": round(float(total_risk_budget), 8),
+        "max_symbol_risk": round(float(max_symbol_risk), 8),
+        "total_allocated_risk": total_allocated,
+        "unallocated_risk": round(max(0.0, float(total_risk_budget) - total_allocated), 8),
+        "allocation_method": "rank_order_capped_greedy",
+        "allocations": allocations,
+        "skipped_symbols": skipped_symbols,
+    }
+
+
 def build_scan_summary_zh(scan: dict[str, Any]) -> str:
     """Build a compact Chinese report with explicit UTC and Beijing time labels."""
     top_n = scan.get("top_n", 0)
@@ -427,6 +491,16 @@ def build_scan_summary_zh(scan: dict[str, Any]) -> str:
     watch_symbols = ", ".join(item["symbol"] for item in scan.get("watchlist", [])[:10]) or "无"
     lines.append(f"趋势内但风险偏高: {risk_symbols}")
     lines.append(f"观望/空仓: {watch_symbols}")
+    allocation = scan.get("portfolio_allocation")
+    if allocation:
+        allocated_symbols = ", ".join(
+            f"{item['symbol']}={item['paper_risk_units']}" for item in allocation.get("allocations", [])
+        ) or "无"
+        lines.append(
+            "组合纸面风险预算: "
+            f"已分配 {allocation['total_allocated_risk']}/{allocation['total_risk_budget']} risk units；"
+            f"单标的上限 {allocation['max_symbol_risk']}；分配: {allocated_symbols}"
+        )
     return "\n".join(lines)
 
 
@@ -440,6 +514,8 @@ def scan_symbols(
     base_url: str = BINANCE_FAPI_BASE,
     include_context: bool = True,
     top: int = 5,
+    portfolio_risk_budget: float | None = None,
+    max_symbol_risk: float | None = None,
 ) -> dict[str, Any]:
     """Scan multiple configured symbols and rank paper trend opportunities."""
     scan_intervals = validate_intervals(interval, intervals)
@@ -510,6 +586,12 @@ def scan_symbols(
         "watchlist": watchlist,
         "errors": errors,
     }
+    if portfolio_risk_budget is not None or max_symbol_risk is not None:
+        scan["portfolio_allocation"] = allocate_portfolio_risk(
+            ranked,
+            total_risk_budget=3.0 if portfolio_risk_budget is None else portfolio_risk_budget,
+            max_symbol_risk=1.0 if max_symbol_risk is None else max_symbol_risk,
+        )
     scan["summary_zh"] = build_scan_summary_zh(scan)
     return scan
 
@@ -527,6 +609,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbols", help="Comma-separated symbols for v0.3 batch scan; omit for single-symbol mode")
     parser.add_argument("--all-symbols", action="store_true", help="Scan the full configured universe")
     parser.add_argument("--top", type=int, default=5, help="Top N trends to include in v0.3 scan summary")
+    parser.add_argument("--portfolio-risk-budget", type=float, help="Optional v0.5 total paper risk-unit budget for scan allocation")
+    parser.add_argument("--max-symbol-risk", type=float, help="Optional v0.5 per-symbol paper risk-unit cap for scan allocation")
     return parser
 
 
@@ -547,6 +631,8 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 include_context=not args.no_context,
                 top=args.top,
+                portfolio_risk_budget=args.portfolio_risk_budget,
+                max_symbol_risk=args.max_symbol_risk,
             )
             print(json.dumps({"ok": not bool(scan["errors"]), "scan": scan}, ensure_ascii=False, indent=2))
             return 0 if not scan["errors"] else 1
