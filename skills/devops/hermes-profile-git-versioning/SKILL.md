@@ -54,6 +54,14 @@ A Hermes profile contains live runtime state, logs, databases, caches, credentia
 !/plan/**
 !/plans/
 !/plans/**
+!/scripts/
+!/scripts/**
+!/tests/
+!/tests/**
+
+# Generated Python caches under allowed script/test directories.
+**/__pycache__/
+*.py[cod]
 
 # Allow skills/ as a container so newly-created skill folders can be committed
 !/skills/
