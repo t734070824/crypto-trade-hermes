@@ -93,19 +93,27 @@ git commit -m "chore: add repository ignore rules"
 git push -u origin main
 ```
 
-7. When updating Hermes persistent memory in this profile, remember that `memories/USER.md` and `memories/MEMORY.md` are tracked by this repository. After any `memory` tool write, immediately run:
+7. After any tool action that may change files in this profile, run a repository status check before replying.
+
+This includes `memory`, `skill_manage`, `write_file`, `patch`, generated cron/home/hooks files, or commands that create/update files. Do not assume only `memories/` changed.
 
 ```bash
 git status --short --branch
-# if memories/*.md changed:
-git add memories/USER.md memories/MEMORY.md
-git commit -m "chore: update persistent memory"
+```
+
+If there are changes allowed by the repository policy, commit and push them before the final reply:
+
+```bash
+git add -A
+git status --short
+# verify the staged list contains only intended allowlisted paths:
+#   .gitignore, SOUL.md/soul.md, home/**, hooks/**, memories/**, cron/**,
+#   and newly-created skills/** folders that are not ignored.
+git commit -m "chore: update profile state"
 git push
 ```
 
-Do not stop at “memory saved” when the profile repository has tracked changes. The user's default for git flows is to push after committing.
-
-If Git identity is missing, set repository-local identity, not global, unless the user requests a global identity.
+If unexpected files appear, inspect with `git status --short --ignored` and `git check-ignore -v <path>`; fix `.gitignore` or ask before committing. The user's default for git flows is to push after committing.
 
 If Git identity is missing, set repository-local identity, not global, unless the user requests a global identity.
 
