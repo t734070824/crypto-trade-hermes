@@ -32,6 +32,18 @@ At minimum, preserve enough information to reconstruct why the system acted:
 
 Future strategy changes should be promoted only after comparison against recorded runtime evidence. Prefer comparisons that reuse the same captured inputs/events so differences are strategy-driven rather than caused by drifting market samples.
 
+## Current v1.3 Implementation Notes
+
+The paper scanner now supports a first runtime evidence path:
+
+```bash
+scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 3 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl
+```
+
+Use `--no-save-runtime-record` for dry-run validation. Runtime JSONL paths are ignored by default via `/state/*.jsonl`, `/runtime/`, and `/runtime_data/`.
+
+Implemented schema function: `build_runtime_record(...)` with `schema_version=runtime.v1`, `environment=paper`, timestamps, market inputs, signals, risk, portfolio state, paper execution intents, and outcomes. `execution_events.real_orders_submitted` must remain `false` in v1.3.
+
 ## Pitfall to Avoid
 
 Do not let Telegram summaries become the evidence store. Telegram is observability; canonical evolution data should be structured runtime records that can support replay, comparison, audit, and regression tests.

@@ -172,18 +172,19 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 **Goal:** 明确 paper/testnet/live 未来必须共享同一套实时交易引擎；paper 只是 broker adapter，不是独立 scanner 产品。
 
-### v1.3 — Runtime Data Recorder 🟡
+### v1.3 — Runtime Data Recorder ✅
 
-**Status:** planned in `plans/binance-usds-futures-trend-v1.3.md`; implementation next.
+**Status:** implemented in current v1.3 change set: runtime record builder, append-only JSONL recorder, scan CLI runtime evidence args, ignored runtime dataset paths, and regression tests.
 
 **Goal:** 运行过程中记录结构化 runtime evidence，用于策略复盘和后续策略进化。
 
-**Scope:**
-- `RuntimeRecorder`；
-- runtime JSONL append-only schema；
-- paper 环境 runtime record；
-- ignored runtime data path；
-- 不改变现有 CLI 行为。
+**Implemented Scope:**
+- `build_runtime_record(scan, environment, strategy_version, config_version, run_id)`；
+- `append_runtime_record(path, record)` JSONL append-only writer；
+- scan CLI 参数：`--runtime-record-file`、`--runtime-environment paper`、`--strategy-version`、`--config-version`、`--no-save-runtime-record`；
+- paper 环境 runtime record，包含 market inputs / signals / risk / portfolio state / paper execution intents / outcomes；
+- `.gitignore` 忽略 `/runtime/`、`/runtime_data/`、`/state/*.jsonl`；
+- 保持 paper-only，不提交真实订单，不保存 secret/signed payload。
 
 ### v1.4 — Core Interface Extraction 🟡
 
@@ -227,7 +228,7 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 ## Default Next Step
 
-当前默认下一步：**按多版本文档执行 v1.3 Runtime Data Recorder，然后顺序推进 v1.4 接口拆分 → v1.5 PaperBroker shared loop → v1.6 runtime evidence 策略进化。**
+当前默认下一步：**推进 v1.4 Core Interface Extraction，把现有 scanner/lifecycle/backtest 能力拆成 shared realtime engine 接口，然后继续 v1.5 PaperBroker shared loop → v1.6 runtime evidence 策略进化。**
 
 除非用户明确改变优先级，否则后续继续按本文件顺序推进；v1.7 testnet 与 v2.0 live 均需单独授权。
 

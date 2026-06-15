@@ -873,6 +873,210 @@ def apply_paper_lifecycle(
     return updated
 
 
+def _unique_nonempty(values: Iterable[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        text = str(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _runtime_signals(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    for rank, item in enumerate(scan.get("results") or [], start=1):
+        signals.append(
+            {
+                "rank": rank,
+                "symbol": item.get("symbol"),
+                "interval": item.get("interval", scan.get("primary_interval", scan.get("interval"))),
+                "action": item.get("action"),
+                "primary_trend": item.get("primary_trend", item.get("action")),
+                "ranking_bucket": item.get("ranking_bucket"),
+                "rank_score": item.get("rank_score"),
+                "confidence_score": item.get("confidence_score"),
+                "trend_strength": item.get("trend_strength"),
+                "position_size": item.get("position_size"),
+                "factor_flags": list(item.get("factor_flags") or []),
+                "entry_reference": item.get("entry_reference"),
+                "trailing_stop": item.get("trailing_stop"),
+                "take_profit_1": item.get("take_profit_1"),
+                "take_profit_2": item.get("take_profit_2"),
+                "timeframe_agreement_score": item.get("timeframe_agreement_score"),
+                "higher_timeframe_confirmed": item.get("higher_timeframe_confirmed"),
+                "timeframe_signals": item.get("timeframe_signals", {}),
+                "reason": item.get("reason"),
+            }
+        )
+    return signals
+
+
+def _runtime_paper_intents(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    lifecycle = scan.get("paper_lifecycle") or {}
+    positions = lifecycle.get("positions_by_symbol") or {}
+    intents: list[dict[str, Any]] = []
+    for symbol, position in sorted(positions.items()):
+        intent = position.get("last_intent")
+        if not intent or intent == "flat":
+            continue
+        intents.append(
+            {
+                "symbol": symbol,
+                "intent": intent,
+                "status": position.get("status"),
+                "paper_size": position.get("current_size"),
+                "entry_reference": position.get("entry_reference"),
+                "last_reference": position.get("last_reference"),
+                "trailing_stop": position.get("trailing_stop"),
+                "take_profit_1": position.get("take_profit_1"),
+                "take_profit_2": position.get("take_profit_2"),
+            }
+        )
+    if intents:
+        return intents
+    allocation = scan.get("portfolio_allocation") or {}
+    for item in allocation.get("allocations") or []:
+        intents.append(
+            {
+                "symbol": item.get("symbol"),
+                "intent": "allocate_paper_risk",
+                "paper_size": item.get("paper_risk_units"),
+                "rank_score": item.get("rank_score"),
+                "constraints_applied": list(item.get("constraints_applied") or []),
+            }
+        )
+    return intents
+
+
+def build_runtime_record(
+    scan: dict[str, Any],
+    environment: str = "paper",
+    strategy_version: str = "ema50_ema200_atr_trend_paper",
+    config_version: str = "default",
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Build append-only runtime evidence for strategy evolution and audit.
+
+    v1.3 is paper-only. The schema is intentionally environment-aware so v1.5+
+    can reuse it with broker adapters without changing the evidence contract.
+    """
+    if environment != "paper":
+        raise ValueError("v1.3 runtime recording only supports environment=paper")
+    stamps = {
+        "generated_at_utc": scan.get("generated_at_utc"),
+        "generated_at_beijing": scan.get("generated_at_beijing"),
+    }
+    if not stamps["generated_at_utc"] or not stamps["generated_at_beijing"]:
+        stamps = now_stamps()
+    symbols = _unique_nonempty(item.get("symbol") for item in scan.get("results") or [])
+    intervals = [str(item) for item in (scan.get("intervals") or [scan.get("interval")]) if item]
+    context_periods = _unique_nonempty(
+        (item.get("market_context") or {}).get("context_period")
+        for item in scan.get("results") or []
+    )
+    context_limits = _unique_nonempty(
+        (item.get("market_context") or {}).get("context_limit")
+        for item in scan.get("results") or []
+    )
+    lifecycle = scan.get("paper_lifecycle") or {}
+    record = {
+        "schema_version": "runtime.v1",
+        "environment": environment,
+        "run_id": run_id or f"{environment}-{stamps['generated_at_utc']}",
+        "strategy_version": strategy_version,
+        "config_version": config_version,
+        **stamps,
+        "symbol_universe": symbols,
+        "intervals": intervals,
+        "market_inputs": {
+            "source": "binance_free_public_usds_futures",
+            "symbols": symbols,
+            "primary_interval": scan.get("primary_interval", scan.get("interval")),
+            "intervals": intervals,
+            "context_periods": context_periods,
+            "context_limits": context_limits,
+            "data_freshness": {
+                "scan_generated_at_utc": scan.get("generated_at_utc"),
+                "scan_generated_at_beijing": scan.get("generated_at_beijing"),
+            },
+            "errors": list(scan.get("errors") or []),
+        },
+        "signals": _runtime_signals(scan),
+        "risk": {
+            "portfolio_allocation": scan.get("portfolio_allocation", {}),
+            "risk_high_symbols": [item.get("symbol") for item in scan.get("risk_high_trends") or [] if item.get("symbol")],
+            "conflicting_symbols": [item.get("symbol") for item in scan.get("conflicting_trends") or [] if item.get("symbol")],
+        },
+        "portfolio_state": {
+            "paper_state": scan.get("paper_state", {}),
+            "paper_lifecycle": lifecycle,
+            "state_change": scan.get("state_change", {}),
+            "lifecycle_change": scan.get("lifecycle_change", {}),
+        },
+        "execution_events": {
+            "environment": environment,
+            "real_orders_submitted": False,
+            "paper_intents": _runtime_paper_intents(scan),
+        },
+        "outcomes": {
+            "errors_count": len(scan.get("errors") or []),
+            "top_trends": [item.get("symbol") for item in scan.get("top_trends") or [] if item.get("symbol")],
+            "watchlist_count": len(scan.get("watchlist") or []),
+            "open_positions": list(lifecycle.get("open_positions") or []),
+            "closed_positions": list(lifecycle.get("closed_positions") or []),
+            "runtime_summary": "paper runtime evidence recorded; no real orders submitted",
+        },
+    }
+    return record
+
+
+def append_runtime_record(path: str | os.PathLike[str], record: dict[str, Any]) -> dict[str, Any]:
+    """Append one JSONL runtime record and return a small write receipt."""
+    runtime_path = Path(path)
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    with runtime_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        handle.write("\n")
+    return {"path": str(runtime_path), "records_written": 1}
+
+
+def apply_runtime_record(
+    scan: dict[str, Any],
+    runtime_record_file: str | os.PathLike[str] | None = None,
+    environment: str = "paper",
+    strategy_version: str = "ema50_ema200_atr_trend_paper",
+    config_version: str = "default",
+    save_runtime_record: bool = True,
+) -> dict[str, Any]:
+    """Attach v1.3 runtime evidence and optionally append it to JSONL."""
+    updated = dict(scan)
+    record = build_runtime_record(updated, environment, strategy_version, config_version)
+    updated["runtime_record"] = record
+    updated["runtime_record_saved"] = False
+    updated["runtime_record_change"] = {
+        "mode": "paper",
+        **now_stamps(),
+        "schema_version": record.get("schema_version"),
+        "environment": environment,
+        "records_written": 0,
+        "append_only": True,
+    }
+    if runtime_record_file and save_runtime_record:
+        receipt = append_runtime_record(runtime_record_file, record)
+        updated["runtime_record_saved"] = True
+        updated["runtime_record_file"] = receipt["path"]
+        updated["runtime_record_change"].update(receipt)
+    elif runtime_record_file:
+        updated["runtime_record_file"] = str(runtime_record_file)
+        updated["runtime_record_change"]["path"] = str(runtime_record_file)
+    return updated
+
+
 def _interval_hours(interval: str) -> float:
     validated = validate_interval(interval)
     unit = validated[-1]
@@ -1614,6 +1818,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fee-bps", type=float, default=4.0, help="Paper transaction fee in basis points for backtest turnover")
     parser.add_argument("--max-position-size", type=float, default=1.0, help="Max paper long exposure per symbol for backtest")
     parser.add_argument("--max-drawdown-worsening-limit", type=float, default=0.03, help="Max allowed absolute drawdown worsening for v1.0 refinement candidates")
+    parser.add_argument("--runtime-record-file", help="Optional v1.3 append-only runtime evidence JSONL path; scan mode only")
+    parser.add_argument("--runtime-environment", default="paper", choices=["paper"], help="Runtime evidence environment; v1.3 supports paper only")
+    parser.add_argument("--strategy-version", default="ema50_ema200_atr_trend_paper", help="Strategy version label stored in v1.3 runtime evidence")
+    parser.add_argument("--config-version", default="default", help="Config version label stored in v1.3 runtime evidence")
+    parser.add_argument("--no-save-runtime-record", action="store_true", help="Build runtime evidence without appending --runtime-record-file")
     return parser
 
 
@@ -1630,6 +1839,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--lifecycle-file is for scan lifecycle only; omit it for --compare-refinements")
             if args.telegram_brief:
                 raise ValueError("--telegram-brief is for scan briefings only; omit it for --compare-refinements")
+            if args.runtime_record_file:
+                raise ValueError("--runtime-record-file is for scan runtime evidence only; omit it for --compare-refinements")
             if args.all_symbols:
                 symbols = None
             elif args.symbols:
@@ -1655,6 +1866,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--lifecycle-file is for scan lifecycle only; omit it for --backtest")
             if args.telegram_brief:
                 raise ValueError("--telegram-brief is for scan briefings only; omit it for --backtest")
+            if args.runtime_record_file:
+                raise ValueError("--runtime-record-file is for scan runtime evidence only; omit it for --backtest")
             if args.all_symbols:
                 symbols = None
             elif args.symbols:
@@ -1694,6 +1907,15 @@ def main(argv: list[str] | None = None) -> int:
                 scan = apply_paper_state(scan, args.state_file, save_state=not args.no_save_state)
             if args.lifecycle_file:
                 scan = apply_paper_lifecycle(scan, args.lifecycle_file, save_lifecycle=not args.no_save_lifecycle)
+            if args.runtime_record_file:
+                scan = apply_runtime_record(
+                    scan,
+                    args.runtime_record_file,
+                    environment=args.runtime_environment,
+                    strategy_version=args.strategy_version,
+                    config_version=args.config_version,
+                    save_runtime_record=not args.no_save_runtime_record,
+                )
             if args.telegram_brief:
                 print(build_telegram_briefing_zh(scan))
             else:
@@ -1706,6 +1928,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--lifecycle-file requires scan mode: use --all-symbols or --symbols")
         if args.telegram_brief:
             raise ValueError("--telegram-brief requires scan mode: use --all-symbols or --symbols")
+        if args.runtime_record_file:
+            raise ValueError("--runtime-record-file requires scan mode: use --all-symbols or --symbols")
         candles = fetch_klines(args.symbol, args.interval, args.limit, args.base_url)
         market_context = None if args.no_context else fetch_market_context(
             args.symbol,

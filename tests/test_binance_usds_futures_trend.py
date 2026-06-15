@@ -605,6 +605,144 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             self.assertIn("trend filter failed", btc["exit_reason"])
             self.assertTrue(updated["lifecycle_change"]["intent_changes"])
 
+    def test_build_runtime_record_contains_evolution_fields(self):
+        scan = self._paper_scan_fixture(
+            allocations=[{"symbol": "BTCUSDT", "paper_risk_units": 1.0}],
+            results=[
+                {
+                    "symbol": "BTCUSDT",
+                    "interval": "1h",
+                    "action": "hold_long",
+                    "position_size": 1.0,
+                    "confidence_score": 0.9,
+                    "rank_score": 20.0,
+                    "factor_flags": ["funding_neutral"],
+                    "ranking_bucket": "strong_confirmed_trend",
+                    "entry_reference": 100.0,
+                    "trailing_stop": 94.0,
+                    "take_profit_1": 104.0,
+                    "take_profit_2": 108.0,
+                    "market_context": {"context_period": "1h", "context_limit": 30},
+                }
+            ],
+        )
+        scan["paper_lifecycle"] = {
+            "positions_by_symbol": {
+                "BTCUSDT": {"status": "open", "last_intent": "entry", "current_size": 1.0}
+            },
+            "open_positions": ["BTCUSDT"],
+            "closed_positions": [],
+        }
+
+        record = trend.build_runtime_record(
+            scan,
+            environment="paper",
+            strategy_version="v1.3-test",
+            config_version="unit-test",
+            run_id="test-run-1",
+        )
+
+        self.assertEqual(record["schema_version"], "runtime.v1")
+        self.assertEqual(record["environment"], "paper")
+        self.assertEqual(record["run_id"], "test-run-1")
+        self.assertEqual(record["strategy_version"], "v1.3-test")
+        self.assertEqual(record["config_version"], "unit-test")
+        self.assertIn("generated_at_utc", record)
+        self.assertIn("generated_at_beijing", record)
+        for key in ["market_inputs", "signals", "risk", "portfolio_state", "execution_events", "outcomes"]:
+            self.assertIn(key, record)
+        self.assertEqual(record["symbol_universe"], ["BTCUSDT"])
+        self.assertEqual(record["intervals"], ["1h", "4h", "1d"])
+        self.assertFalse(record["execution_events"]["real_orders_submitted"])
+        self.assertEqual(record["execution_events"]["paper_intents"][0]["intent"], "entry")
+        self.assertNotRegex(json.dumps(record).lower(), r"(api_key|secret|signed|live_order|order_id)")
+
+    def test_append_runtime_record_writes_jsonl_append_only(self):
+        record = {"schema_version": "runtime.v1", "environment": "paper", "run_id": "a"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = pathlib.Path(tmpdir) / "runtime" / "records.jsonl"
+
+            first = trend.append_runtime_record(path, record)
+            second = trend.append_runtime_record(path, {**record, "run_id": "b"})
+
+            self.assertEqual(first["records_written"], 1)
+            self.assertEqual(second["records_written"], 1)
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual([json.loads(line)["run_id"] for line in lines], ["a", "b"])
+
+    def test_cli_scan_can_write_runtime_record_file(self):
+        def make_candles(start, step):
+            candles = []
+            price = float(start)
+            for _ in range(240):
+                open_price = price
+                close_price = price + step
+                high = max(open_price, close_price) + 0.7
+                low = min(open_price, close_price) - 0.5
+                candles.append({"open": open_price, "high": high, "low": low, "close": close_price})
+                price = close_price
+            return candles
+
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: make_candles(100, 1.0))
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                runtime_path = pathlib.Path(tmpdir) / "records.jsonl"
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc = trend.main(
+                        [
+                            "--symbols",
+                            "BTCUSDT",
+                            "--interval",
+                            "1h",
+                            "--limit",
+                            "240",
+                            "--no-context",
+                            "--runtime-record-file",
+                            str(runtime_path),
+                            "--strategy-version",
+                            "v1.3-test",
+                            "--config-version",
+                            "unit-test",
+                        ]
+                    )
+
+                self.assertEqual(rc, 0)
+                payload = json.loads(stdout.getvalue())
+                self.assertTrue(payload["ok"])
+                self.assertTrue(payload["scan"]["runtime_record_saved"])
+                self.assertEqual(payload["scan"]["runtime_record_change"]["records_written"], 1)
+                self.assertTrue(payload["scan"]["runtime_record_change"]["append_only"])
+                self.assertEqual(payload["scan"]["runtime_record"]["environment"], "paper")
+                lines = runtime_path.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(lines), 1)
+                record = json.loads(lines[0])
+                self.assertEqual(record["environment"], "paper")
+                self.assertFalse(record["execution_events"]["real_orders_submitted"])
+
+                bad_stdout = io.StringIO()
+                with contextlib.redirect_stdout(bad_stdout):
+                    bad_rc = trend.main(
+                        [
+                            "--symbols",
+                            "BTCUSDT",
+                            "--interval",
+                            "30m",
+                            "--limit",
+                            "240",
+                            "--no-context",
+                            "--runtime-record-file",
+                            str(runtime_path),
+                        ]
+                    )
+                self.assertEqual(bad_rc, 1)
+                self.assertIn("short interval", bad_stdout.getvalue())
+                self.assertEqual(len(runtime_path.read_text(encoding="utf-8").splitlines()), 1)
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
     def test_build_telegram_briefing_zh_is_compact_paper_only_and_includes_state_changes(self):
         scan = self._paper_scan_fixture(
             allocations=[

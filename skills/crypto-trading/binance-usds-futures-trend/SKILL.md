@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when developing or operating the crypto-trade-hermes Binance USDS-M futures trend Skill. Current code provides paper-only signal, lifecycle, backtest, and diagnostic tools from free >=1h data; future work must evolve it into a real-time trading engine where paper/testnet/live share strategy, state, risk, and execution interfaces.
-version: 1.2.0
+version: 1.3.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -24,7 +24,7 @@ The intended architecture is **Skill-driven real-time trading**:
 - only the broker/fill adapter and environment configuration should change;
 - paper mode is a safety/testing adapter, not a separate report-style scanner product.
 
-Current implementation status: the existing script is still **paper-only**. It can generate trend signals, multi-symbol rankings, paper allocations, lifecycle diagnostics, backtests, refinement comparisons, and Telegram briefs. It does **not** place signed Binance orders. Treat existing scan/lifecycle code as reusable signal and diagnostics modules while the project is refactored toward a shared real-time trading engine.
+Current implementation status: the existing script is still **paper-only**. It can generate trend signals, multi-symbol rankings, paper allocations, lifecycle diagnostics, runtime evidence records, backtests, refinement comparisons, and Telegram briefs. It does **not** place signed Binance orders. Treat existing scan/lifecycle/runtime-recording code as reusable signal, state, and evidence modules while the project is refactored toward a shared real-time trading engine.
 
 ## User Constraints
 
@@ -98,6 +98,7 @@ Current paper-only capabilities:
 - optional paper portfolio risk allocation;
 - optional persisted scan state and state-change summaries;
 - optional paper lifecycle state with entry/add/reduce/hold/exit intent;
+- optional append-only runtime evidence records for strategy evolution;
 - historical paper backtest metrics;
 - evidence-based refinement comparison on identical fetched candle samples;
 - compact Telegram diagnostic brief via wrapper script.
@@ -122,16 +123,16 @@ Paper diagnostic scan for the configured universe:
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1
 ```
 
-Paper scan with persisted state and lifecycle diagnostics:
+Paper scan with persisted state, lifecycle diagnostics, and runtime evidence:
 
 ```bash
-scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl
 ```
 
-No-write lifecycle dry run for selected symbols:
+No-write lifecycle/runtime dry run for selected symbols:
 
 ```bash
-scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 3 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --no-save-state --no-save-lifecycle
+scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 3 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl --no-save-state --no-save-lifecycle --no-save-runtime-record
 ```
 
 Historical paper backtest:
@@ -192,6 +193,7 @@ Current outputs are diagnostic contracts for paper mode:
 - `portfolio_allocation`: paper risk allocation and skip reasons;
 - `paper_state` / `state_change`: persisted scan snapshot and diff;
 - `paper_lifecycle` / `lifecycle_change`: paper lifecycle state and intent changes;
+- `runtime_record`: append-only paper runtime evidence schema for future strategy evolution;
 - `backtest`: paper historical performance diagnostics;
 - `refinement`: paper-only baseline/candidate comparison;
 - `summary_zh` or `--telegram-brief`: compact Chinese summaries with UTC and 北京时间（UTC+8） labels.
@@ -208,10 +210,11 @@ Required output invariants:
 
 Important files:
 
-- `scripts/binance_usds_futures_trend.py` — current paper-only signal/scanner/backtest/refinement CLI;
+- `scripts/binance_usds_futures_trend.py` — current paper-only signal/scanner/backtest/refinement/runtime-evidence CLI;
 - `scripts/binance_usds_futures_trend_brief.sh` — scheduled Telegram diagnostic wrapper;
 - `tests/test_binance_usds_futures_trend.py` — regression suite;
 - `state/*.json` — ignored runtime paper state and lifecycle files;
+- `state/*.jsonl`, `runtime/`, `runtime_data/` — ignored append-only runtime evidence datasets;
 - `plans/binance-usds-futures-roadmap.md` — canonical tracked roadmap;
 - `references/*.md` — historical workflow notes and architecture correction notes.
 
