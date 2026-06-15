@@ -1,10 +1,14 @@
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
 import unittest
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "binance_usds_futures_trend.py"
+REPO_ROOT = MODULE_PATH.parents[1]
+CRON_BRIEF_SCRIPT = REPO_ROOT / "scripts" / "binance_usds_futures_trend_brief.sh"
 spec = importlib.util.spec_from_file_location("binance_usds_futures_trend", MODULE_PATH)
 assert spec is not None
 assert spec.loader is not None
@@ -454,6 +458,95 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
 
             self.assertTrue(updated["state_change"]["first_run"])
             self.assertFalse(state_path.exists())
+
+    def test_build_telegram_briefing_zh_is_compact_paper_only_and_includes_state_changes(self):
+        scan = self._paper_scan_fixture(
+            allocations=[
+                {"symbol": "BTCUSDT", "paper_risk_units": 1.0},
+                {"symbol": "ETHUSDT", "paper_risk_units": 0.5},
+            ],
+            results=[
+                {"symbol": "BTCUSDT", "action": "hold_long", "ranking_bucket": "strong_confirmed_trend", "rank_score": 20.0},
+                {"symbol": "ETHUSDT", "action": "hold_long", "ranking_bucket": "early_trend", "rank_score": 10.0},
+                {"symbol": "XRPUSDT", "action": "flat", "ranking_bucket": "watchlist", "rank_score": 0.0},
+            ],
+            errors=[{"symbol": "DOGEUSDT", "error": "temporary public endpoint error"}],
+        )
+        scan.update(
+            {
+                "universe_count": 20,
+                "risk_high_trends": [{"symbol": "SOLUSDT"}],
+                "conflicting_trends": [{"symbol": "XRPUSDT"}],
+                "state_change": {
+                    "mode": "paper",
+                    "first_run": False,
+                    "added_allocations": [{"symbol": "ETHUSDT", "paper_risk_units": 0.5}],
+                    "removed_allocations": [{"symbol": "SOLUSDT", "previous_paper_risk_units": 0.3}],
+                    "changed_allocations": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "previous_paper_risk_units": 0.8,
+                            "current_paper_risk_units": 1.0,
+                            "delta": 0.2,
+                        }
+                    ],
+                    "ranking_changes": [{"symbol": "BTCUSDT", "previous_rank": 2, "current_rank": 1}],
+                    "action_changes": [{"symbol": "XRPUSDT", "previous_action": "flat", "current_action": "hold_long"}],
+                    "bucket_changes": [{"symbol": "BTCUSDT", "previous_bucket": "early_trend", "current_bucket": "strong_confirmed_trend"}],
+                },
+            }
+        )
+
+        brief = trend.build_telegram_briefing_zh(scan)
+
+        self.assertIn("Binance USDS-M Paper Scan", brief)
+        self.assertIn("paper only", brief)
+        self.assertIn("UTC: 2026-06-15T12:00:00+00:00", brief)
+        self.assertIn("北京时间（UTC+8）: 2026-06-15T20:00:00+08:00", brief)
+        self.assertIn("Top trends: BTCUSDT, ETHUSDT", brief)
+        self.assertIn("Allocation: BTCUSDT=1.0, ETHUSDT=0.5", brief)
+        self.assertIn("新增: ETHUSDT=0.5", brief)
+        self.assertIn("移除: SOLUSDT(prev=0.3)", brief)
+        self.assertIn("变化: BTCUSDT 0.8→1.0 (Δ=0.2)", brief)
+        self.assertIn("rank/action/bucket changes: 1/1/1", brief)
+        self.assertIn("risk notes: risk_high=SOLUSDT; conflicting=XRPUSDT; errors_count=1", brief)
+        self.assertNotIn("temporary public endpoint error", brief)
+        self.assertLess(len(brief), 1200)
+
+    def test_main_can_emit_telegram_brief_in_scan_mode(self):
+        scan = self._paper_scan_fixture(
+            allocations=[{"symbol": "BTCUSDT", "paper_risk_units": 1.0}],
+            results=[{"symbol": "BTCUSDT", "action": "hold_long", "ranking_bucket": "strong_confirmed_trend", "rank_score": 10.0}],
+        )
+        scan.update({"universe_count": 1, "risk_high_trends": [], "conflicting_trends": []})
+        original_scan_symbols = getattr(trend, "scan_symbols")
+        setattr(trend, "scan_symbols", lambda **kwargs: scan)
+        try:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = trend.main(["--symbols", "BTCUSDT", "--state-file", "/tmp/paper-state.json", "--no-save-state", "--telegram-brief"])
+        finally:
+            setattr(trend, "scan_symbols", original_scan_symbols)
+
+        self.assertEqual(rc, 0)
+        output = stdout.getvalue()
+        self.assertIn("Binance USDS-M Paper Scan", output)
+        self.assertIn("paper only", output)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(output)
+
+    def test_cron_brief_wrapper_uses_safe_default_multitimeframe_paper_command(self):
+        self.assertTrue(CRON_BRIEF_SCRIPT.exists())
+        content = CRON_BRIEF_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("--all-symbols", content)
+        self.assertIn("--intervals 1h,4h,1d", content)
+        self.assertIn("--portfolio-risk-budget 3", content)
+        self.assertIn("--max-symbol-risk 1", content)
+        self.assertIn("--state-file state/binance-usds-futures-trend-paper-state.json", content)
+        self.assertIn("--telegram-brief", content)
+        self.assertNotRegex(content, r"(1m|5m|10m|15m|30m)")
+        self.assertNotRegex(content.lower(), r"(api_key|secret|password|token)=")
 
     def test_fetch_market_context_uses_free_usds_futures_endpoints(self):
         calls = []

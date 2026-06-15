@@ -37,7 +37,9 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 ## Version Roadmap
 
-### v0.7 — Paper State Persistence
+### v0.7 — Paper State Persistence ✅
+
+**Status:** completed in `[verified] feat: add v0.7 paper state persistence`.
 
 **Goal:** 保存连续扫描状态，记录组合分配变化，为 Telegram 简报、复盘和后续 paper position lifecycle 打基础。
 
@@ -67,7 +69,9 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 - 有 RED/GREEN 测试覆盖首次运行、连续运行、allocation 增减、状态文件损坏/缺失。
 - 真实 Binance 免费数据扫描能生成状态变化摘要。
 
-### v0.8 — Scheduled Scan + Telegram Briefing
+### v0.8 — Scheduled Scan + Telegram Briefing ✅
+
+**Status:** implemented in current v0.8 change set: compact `--telegram-brief` output, safe wrapper script, scheduled Hermes cron delivery support.
 
 **Goal:** 自动定时运行 paper scan，并把简洁中文结果发送到 Telegram。
 
@@ -164,9 +168,9 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 ## Default Next Step
 
-当前默认下一步：**v0.7 Paper State Persistence**。
+当前默认下一步：**v0.9 Historical Backtest Framework**。
 
-除非用户明确改变优先级，否则后续继续按本文件顺序推进：v0.7 → v0.8 → v0.9 → v1.0 → v1.1 → v2.0。
+除非用户明确改变优先级，否则后续继续按本文件顺序推进：v0.9 → v1.0 → v1.1 → v2.0。
 
 ## Stop Conditions
 

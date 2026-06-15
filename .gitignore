@@ -17,6 +17,8 @@
 !/memories/**
 !/cron/
 !/cron/**
+/cron/output/
+/cron/*.swp
 !/plan/
 !/plan/**
 !/plans/

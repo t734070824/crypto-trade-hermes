@@ -722,6 +722,60 @@ def build_scan_summary_zh(scan: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_symbol_list(items: list[dict[str, Any]], key: str = "symbol", limit: int = 8) -> str:
+    symbols = [str(item.get(key)) for item in items[:limit] if item.get(key)]
+    return ", ".join(symbols) if symbols else "无"
+
+
+def build_telegram_briefing_zh(scan: dict[str, Any]) -> str:
+    """Build a compact Telegram-friendly Chinese paper scan briefing.
+
+    The briefing intentionally avoids dumping raw JSON or endpoint error bodies.
+    """
+    allocation = scan.get("portfolio_allocation") or {}
+    allocations = allocation.get("allocations") or []
+    allocation_text = ", ".join(
+        f"{item.get('symbol')}={item.get('paper_risk_units')}" for item in allocations[:8] if item.get("symbol")
+    ) or "无"
+
+    change = scan.get("state_change") or {}
+    added_text = ", ".join(
+        f"{item.get('symbol')}={item.get('paper_risk_units')}" for item in (change.get("added_allocations") or [])[:8]
+    ) or "无"
+    removed_text = ", ".join(
+        f"{item.get('symbol')}(prev={item.get('previous_paper_risk_units')})"
+        for item in (change.get("removed_allocations") or [])[:8]
+    ) or "无"
+    changed_text = ", ".join(
+        f"{item.get('symbol')} {item.get('previous_paper_risk_units')}→{item.get('current_paper_risk_units')} (Δ={item.get('delta')})"
+        for item in (change.get("changed_allocations") or [])[:8]
+    ) or "无"
+
+    errors_count = len(scan.get("errors") or [])
+    if "current_errors_count" in change:
+        errors_count = int(change.get("current_errors_count") or 0)
+    intervals_text = ",".join(scan.get("intervals") or [scan.get("interval", "")])
+    risk_high = _format_symbol_list(scan.get("risk_high_trends") or [])
+    conflicting = _format_symbol_list(scan.get("conflicting_trends") or [])
+    top_trends = _format_symbol_list(scan.get("top_trends") or [])
+    first_run_label = "yes" if change.get("first_run") else "no"
+
+    lines = [
+        "Binance USDS-M Paper Scan（paper only）",
+        f"UTC: {scan.get('generated_at_utc')}",
+        f"北京时间（UTC+8）: {scan.get('generated_at_beijing')}",
+        f"周期: {intervals_text}; universe={scan.get('universe_count', 'unknown')}",
+        f"Top trends: {top_trends}",
+        f"Allocation: {allocation_text}",
+        f"State change: first_run={first_run_label}; 新增: {added_text}; 移除: {removed_text}; 变化: {changed_text}",
+        "rank/action/bucket changes: "
+        f"{len(change.get('ranking_changes') or [])}/{len(change.get('action_changes') or [])}/{len(change.get('bucket_changes') or [])}",
+        f"risk notes: risk_high={risk_high}; conflicting={conflicting}; errors_count={errors_count}",
+        "安全: paper only；未下真实订单；未使用收费 API。",
+    ]
+    return "\n".join(lines)
+
+
 def scan_symbols(
     symbols: list[str] | tuple[str, ...] | None = None,
     interval: str = "1h",
@@ -831,6 +885,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-symbol-risk", type=float, help="Optional v0.5 per-symbol paper risk-unit cap for scan allocation")
     parser.add_argument("--state-file", help="Optional v0.7 paper scan state JSON path; scan mode only")
     parser.add_argument("--no-save-state", action="store_true", help="Compute v0.7 state_change without writing --state-file")
+    parser.add_argument("--telegram-brief", action="store_true", help="Emit a compact v0.8 Telegram briefing instead of full JSON; scan mode only")
     return parser
 
 
@@ -856,11 +911,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.state_file:
                 scan = apply_paper_state(scan, args.state_file, save_state=not args.no_save_state)
-            print(json.dumps({"ok": not bool(scan["errors"]), "scan": scan}, ensure_ascii=False, indent=2))
+            if args.telegram_brief:
+                print(build_telegram_briefing_zh(scan))
+            else:
+                print(json.dumps({"ok": not bool(scan["errors"]), "scan": scan}, ensure_ascii=False, indent=2))
             return 0 if not scan["errors"] else 1
 
         if args.state_file:
             raise ValueError("--state-file requires scan mode: use --all-symbols or --symbols")
+        if args.telegram_brief:
+            raise ValueError("--telegram-brief requires scan mode: use --all-symbols or --symbols")
         candles = fetch_klines(args.symbol, args.interval, args.limit, args.base_url)
         market_context = None if args.no_context else fetch_market_context(
             args.symbol,

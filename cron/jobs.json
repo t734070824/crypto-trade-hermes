@@ -1,0 +1,42 @@
+{
+  "jobs": [
+    {
+      "id": "b1ed6f209937",
+      "name": "Binance USDS-M Paper Telegram Briefing",
+      "prompt": "No-agent job. Runs binance_usds_futures_trend_brief.sh every 4h and delivers stdout as the Binance USDS-M paper-only Telegram briefing. Do not create cron jobs recursively.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "binance_usds_futures_trend_brief.sh",
+      "no_agent": true,
+      "context_from": null,
+      "schedule": {
+        "kind": "interval",
+        "minutes": 240,
+        "display": "every 240m"
+      },
+      "schedule_display": "every 240m",
+      "repeat": {
+        "times": null,
+        "completed": 1
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-06-15T21:04:53.520639+08:00",
+      "next_run_at": "2026-06-16T01:06:27.187169+08:00",
+      "last_run_at": "2026-06-15T21:06:27.187169+08:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "telegram",
+      "enabled_toolsets": null,
+      "workdir": null,
+      "profile": null
+    }
+  ],
+  "updated_at": "2026-06-15T21:08:29.135970+08:00"
+}

@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when generating paper-only Binance USDS-M futures trend-following decisions from free public K-line data with >=1h intervals, ATR harvesting, and no paid APIs.
-version: 0.7.0
+version: 0.8.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -22,7 +22,7 @@ This project Skill supports paper-only Binance USDS-M futures decision generatio
 - never use short intervals below 1h;
 - prefer staying with the main trend, avoiding premature exits, and harvesting in tranches.
 
-The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work. v0.4 adds multi-timeframe confirmation (`1h,4h,1d`) to reduce single-period noise while preserving the primary trend-following contract. v0.5 adds optional portfolio-level paper risk allocation with total-budget and per-symbol caps. v0.6 adds allocation explainability for allocated and skipped symbols and includes compact allocation notes in `summary_zh`. v0.7 adds optional paper state persistence, storing scan snapshots and reporting allocation/ranking/action/bucket changes between consecutive scans.
+The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work. v0.4 adds multi-timeframe confirmation (`1h,4h,1d`) to reduce single-period noise while preserving the primary trend-following contract. v0.5 adds optional portfolio-level paper risk allocation with total-budget and per-symbol caps. v0.6 adds allocation explainability for allocated and skipped symbols and includes compact allocation notes in `summary_zh`. v0.7 adds optional paper state persistence, storing scan snapshots and reporting allocation/ranking/action/bucket changes between consecutive scans. v0.8 adds compact Telegram briefing output for scheduled Hermes cron delivery.
 
 ## When to Use
 
@@ -84,7 +84,13 @@ State-change dry run without writing:
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --no-save-state
 ```
 
-Output is JSON:
+Telegram briefing output for scheduled Hermes cron delivery:
+
+```bash
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --telegram-brief
+```
+
+Output is JSON by default:
 
 - `ok`: whether the run succeeded;
 - `decision.mode`: always `paper` in this version;
@@ -138,7 +144,16 @@ In v0.7 paper state persistence mode, enabled by `--state-file`, `scan` addition
 - `state_change`: comparison between the previous state file and the current scan, including `first_run`, `added_allocations`, `removed_allocations`, `changed_allocations`, `ranking_changes`, `action_changes`, `bucket_changes`, and optional `state_file_error` for corrupted/unreadable state files;
 - state files are written atomically when enabled, and `--no-save-state` computes changes without writing.
 
-## Decision Logic v0.7
+In v0.8 Telegram briefing mode, enabled by `--telegram-brief` in scan mode, stdout is compact text instead of JSON and includes:
+
+- `paper only` title and safety line;
+- UTC and 北京时间（UTC+8） timestamps;
+- intervals, universe count, Top trends, and portfolio allocation;
+- state-change summary: added, removed, changed paper allocations plus rank/action/bucket change counts;
+- risk notes with risk-high/conflicting symbols and `errors_count`;
+- no raw full JSON or endpoint error bodies.
+
+## Decision Logic v0.8
 
 1. Validate symbol is in the configured trade universe.
 2. Validate interval is >=1h; reject `1m`, `3m`, `5m`, `10m`, `15m`, `30m`.
@@ -190,6 +205,7 @@ https://fapi.binance.com/fapi/v1/klines
 13. In portfolio allocation mode, allocate paper risk units only to positive `hold_long` decisions by rank order, capped by `total_risk_budget`, `max_symbol_risk`, and each decision's existing `position_size`; never place live orders.
 14. In allocation explainability mode, each allocated symbol records applied constraints and a paper-only explanation; skipped symbols retain `skipped_symbols` and add structured `skipped_details` reasons such as `not_hold_long`, `non_positive_rank_score`, `non_positive_position_size`, and `no_remaining_budget`.
 15. In paper state persistence mode, `--state-file` loads the previous paper snapshot if present, computes allocation/ranking/action/bucket changes, attaches `scan.state_change` and `scan.paper_state`, then atomically writes the current snapshot unless `--no-save-state` is set. Missing state files are treated as first run; corrupted JSON records `state_file_error` and is replaced by the current valid paper snapshot.
+16. In Telegram briefing mode, `--telegram-brief` is scan-mode only and emits compact text for scheduled Hermes cron delivery, including UTC/北京时间（UTC+8）, top trends, allocation, state change, risk notes, `errors_count`, and a paper-only safety line without raw full JSON or secrets.
 
 ## Testing
 
@@ -213,6 +229,7 @@ The test suite verifies:
 - v0.5 portfolio allocation respects total budget, per-symbol cap, rank order, and invalid-constraint guardrails;
 - v0.6 allocation explainability records applied constraints, allocation explanations, skipped details, and summary display;
 - v0.7 paper state persistence covers first run, consecutive run changes, allocation add/remove/change, ranking/action/bucket changes, corrupted state files, and no-save dry runs;
+- v0.8 Telegram briefing covers compact paper-only text output, state-change display, secret-safe omission of raw endpoint errors, scan-mode CLI output, and safe cron wrapper defaults;
 - input guardrails reject non-positive `risk_unit` and `top < 1`.
 
 ## Verification Recipe
@@ -231,6 +248,8 @@ scripts/binance_usds_futures_trend.py --all-symbols --interval 1h --limit 240 --
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --telegram-brief
+scripts/binance_usds_futures_trend_brief.sh
 ```
 
 3. Confirm:
@@ -242,6 +261,7 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 - portfolio allocation, when enabled, does not exceed total budget or per-symbol cap;
 - allocation explainability includes `constraints_applied`, `allocation_explanation`, and `skipped_details`;
 - if `--state-file` is used, output includes `paper_state` and `state_change`, and true runtime state goes under ignored `state/*.json` rather than tracked files;
+- if `--telegram-brief` is used, stdout is compact text with UTC / 北京时间（UTC+8）、`paper only`, allocation, state-change summary, risk notes, and no raw full JSON;
 - no API key or paid API is required.
 
 ## Common Pitfalls
@@ -253,7 +273,8 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 5. **Over-exiting trends.** The baseline reduces size when extended but does not flip to flat while the major trend filter remains valid.
 6. **Omitting timezone labels.** Any run output or report must include UTC or Beijing time (UTC+8) labels.
 7. **Breaking portfolio-output compatibility while adding explainability.** When adding richer allocation diagnostics, keep simple legacy fields such as `skipped_symbols` and add structured detail alongside them (for example `skipped_details`) rather than replacing them; update tests to prove both compatibility and the new explanations.
-8. **Accidentally committing runtime state.** v0.7 real state files should live under ignored `state/*.json`; tests should use temporary directories, and only plan/reference/example docs should be tracked.
+8. **Accidentally committing runtime state or overwriting repo ignore policy.** Real state files should live under ignored `state/*.json`; tests should use temporary directories, and only plan/reference/example docs should be tracked. This repo's `.gitignore` uses a broad default-deny plus allowlist policy, so never replace it wholesale when adding runtime ignore rules.
+9. **Letting scheduled briefing drift into raw JSON spam or secret leakage.** Use `--telegram-brief` / `scripts/binance_usds_futures_trend_brief.sh` for Telegram delivery; do not paste `.env` values, API keys, or raw full scan JSON into chat unless explicitly debugging a redacted fixture.
 
 ## References
 
@@ -264,11 +285,13 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 - `references/session-v0.5-portfolio-risk-workflow.md` — workflow note for adding portfolio-level paper risk allocation.
 - `references/session-v0.6-allocation-explainability-workflow.md` — workflow note for adding allocation and skip explanations.
 - `references/session-v0.7-paper-state-persistence-workflow.md` — workflow note for adding paper state snapshots and state-change reporting.
+- `references/session-v0.8-scheduled-telegram-briefing-workflow.md` — workflow note for scheduled scanner delivery and Telegram briefing output.
 - `plans/binance-usds-futures-trend-v0.3.md` — v0.3 batch scan and ranking implementation plan.
 - `plans/binance-usds-futures-trend-v0.4.md` — v0.4 multi-timeframe confirmation implementation plan.
 - `plans/binance-usds-futures-trend-v0.5.md` — v0.5 portfolio paper risk allocation implementation plan.
 - `plans/binance-usds-futures-trend-v0.6.md` — v0.6 allocation explainability implementation plan.
 - `plans/binance-usds-futures-trend-v0.7.md` — v0.7 paper state persistence implementation plan.
+- `plans/binance-usds-futures-trend-v0.8.md` — v0.8 scheduled scan and Telegram briefing implementation plan.
 
 ## Roadmap
 
@@ -276,11 +299,10 @@ Canonical tracked roadmap: `plans/binance-usds-futures-roadmap.md`.
 
 Default sequence unless the user explicitly reprioritizes:
 
-1. v0.8 scheduled scans and Telegram briefings.
-2. v0.9 historical backtest framework.
-3. v1.0 evidence-based strategy refinement, including higher-timeframe scoring and additional free public factors.
-4. v1.1 paper trading lifecycle.
-5. v2.0 separate Binance testnet execution Skill only after long paper validation.
+1. v0.9 historical backtest framework.
+2. v1.0 evidence-based strategy refinement, including higher-timeframe scoring and additional free public factors.
+3. v1.1 paper trading lifecycle.
+4. v2.0 separate Binance testnet execution Skill only after long paper validation.
 
 ## Verification Checklist
 
