@@ -186,11 +186,18 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 - `.gitignore` 忽略 `/runtime/`、`/runtime_data/`、`/state/*.jsonl`；
 - 保持 paper-only，不提交真实订单，不保存 secret/signed payload。
 
-### v1.4 — Core Interface Extraction 🟡
+### v1.4 — Core Interface Extraction ✅
 
-**Status:** planned in `plans/binance-usds-futures-trend-v1.4.md`.
+**Status:** implemented in current v1.4 change set: `scripts/binance_trend_core/` package skeleton, Protocol/dataclass boundaries, wrapper adapters around existing scanner/runtime functions, and regression tests proving CLI compatibility.
 
 **Goal:** 抽象 `MarketData`、`SignalEngine`、`Strategy`、`RiskManager`、`PortfolioState`、`ExecutionEngine`、`BrokerAdapter`，同时保持现有 CLI 兼容。
+
+**Implemented Scope:**
+- 新增 `scripts/binance_trend_core/` 核心接口包；
+- `BrokerAdapter` 明确隔离 `paper/testnet/live` 执行边界；
+- `FunctionSignalEngine` 包装现有 `decide` / scan 路径，保持 `<1h` 周期拒绝；
+- `RuntimeRecorder` wrapper 对齐 v1.3 runtime evidence builder/writer；
+- 保持现有 CLI JSON contract：`mode=paper`、`portfolio_allocation`、`paper_lifecycle` 不变。
 
 ### v1.5 — Shared Trading Loop + PaperBroker 🟡
 

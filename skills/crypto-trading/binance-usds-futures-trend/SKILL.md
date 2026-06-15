@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when developing or operating the crypto-trade-hermes Binance USDS-M futures trend Skill. Current code provides paper-only signal, lifecycle, backtest, and diagnostic tools from free >=1h data; future work must evolve it into a real-time trading engine where paper/testnet/live share strategy, state, risk, and execution interfaces.
-version: 1.3.0
+version: 1.4.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -24,7 +24,7 @@ The intended architecture is **Skill-driven real-time trading**:
 - only the broker/fill adapter and environment configuration should change;
 - paper mode is a safety/testing adapter, not a separate report-style scanner product.
 
-Current implementation status: the existing script is still **paper-only**. It can generate trend signals, multi-symbol rankings, paper allocations, lifecycle diagnostics, runtime evidence records, backtests, refinement comparisons, and Telegram briefs. It does **not** place signed Binance orders. Treat existing scan/lifecycle/runtime-recording code as reusable signal, state, and evidence modules while the project is refactored toward a shared real-time trading engine.
+Current implementation status: the existing CLI is still **paper-only**. It can generate trend signals, multi-symbol rankings, paper allocations, lifecycle diagnostics, runtime evidence records, backtests, refinement comparisons, and Telegram briefs. v1.4 adds a lightweight `scripts/binance_trend_core/` package with shared Protocol/dataclass boundaries for future realtime trading. It does **not** place signed Binance orders. Treat existing scan/lifecycle/runtime-recording code as reusable signal, state, and evidence modules while the project is refactored toward a shared real-time trading engine.
 
 ## User Constraints
 
@@ -91,6 +91,7 @@ scripts/binance_usds_futures_trend.py
 
 Current paper-only capabilities:
 
+- lightweight core realtime interface package under `scripts/binance_trend_core/`;
 - single-symbol trend decision from free K-lines;
 - full-universe or selected-symbol scan;
 - multi-timeframe confirmation, usually `1h,4h,1d`;
@@ -115,6 +116,7 @@ Run tests after any code or behavior change:
 
 ```bash
 python3 -m unittest tests/test_binance_usds_futures_trend.py -v
+python3 -m py_compile scripts/binance_usds_futures_trend.py scripts/binance_trend_core/*.py tests/test_binance_usds_futures_trend.py
 ```
 
 Paper diagnostic scan for the configured universe:

@@ -67,3 +67,13 @@ Real free-data smoke test must match v1.3 scan behavior except for optional new 
 - Existing CLI commands remain backward compatible.
 - Paper/testnet/live divergence is isolated to `BrokerAdapter` design.
 - No signed Binance endpoint is used.
+
+## Implementation Status
+
+Completed in v1.4 change set:
+
+- Added `scripts/binance_trend_core/` package skeleton and module imports.
+- Added lightweight Protocol/dataclass boundaries for market data, signals, strategy, risk, portfolio state, execution, brokers, and runtime recording.
+- Added `RejectingBrokerAdapter` as safe default; it exposes the adapter boundary but never submits orders.
+- Added tests for importability, broker interface signatures, wrapper short-interval rejection, and scan CLI compatibility.
+- Preserved current CLI behavior and paper-only runtime; no signed Binance endpoints were added.

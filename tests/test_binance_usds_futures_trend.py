@@ -1,5 +1,7 @@
 import contextlib
+import importlib
 import importlib.util
+import inspect
 import io
 import json
 import pathlib
@@ -17,6 +19,94 @@ spec.loader.exec_module(trend)
 
 
 class BinanceUsdsFuturesTrendTests(unittest.TestCase):
+    def test_core_realtime_interface_modules_are_importable(self):
+        module_names = [
+            "scripts.binance_trend_core",
+            "scripts.binance_trend_core.types",
+            "scripts.binance_trend_core.market_data",
+            "scripts.binance_trend_core.signals",
+            "scripts.binance_trend_core.strategy",
+            "scripts.binance_trend_core.risk",
+            "scripts.binance_trend_core.portfolio",
+            "scripts.binance_trend_core.execution",
+            "scripts.binance_trend_core.brokers",
+            "scripts.binance_trend_core.runtime",
+        ]
+        for module_name in module_names:
+            with self.subTest(module=module_name):
+                self.assertIsNotNone(importlib.import_module(module_name))
+
+    def test_broker_adapter_interface_exposes_required_boundary(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+
+        for attr in ["environment", "submit_order", "cancel_order", "get_account_state"]:
+            self.assertTrue(hasattr(brokers.BrokerAdapter, attr), attr)
+        self.assertIn("instruction", inspect.signature(brokers.BrokerAdapter.submit_order).parameters)
+        self.assertIn("order_id", inspect.signature(brokers.BrokerAdapter.cancel_order).parameters)
+        self.assertEqual(inspect.signature(brokers.BrokerAdapter.get_account_state).parameters.keys(), {"self"})
+
+        adapter = brokers.RejectingBrokerAdapter(environment="paper")
+        self.assertEqual(adapter.environment, "paper")
+        self.assertEqual(adapter.get_account_state()["environment"], "paper")
+        with self.assertRaises(RuntimeError):
+            adapter.submit_order({"symbol": "BTCUSDT", "side": "BUY"})
+
+    def test_signal_engine_wrapper_preserves_short_interval_rejection(self):
+        signals = importlib.import_module("scripts.binance_trend_core.signals")
+        engine = signals.FunctionSignalEngine(decide_fn=trend.decide)
+        candles = [{"open": 1.0, "high": 1.2, "low": 0.9, "close": 1.1} for _ in range(240)]
+
+        with self.assertRaises(ValueError):
+            engine.generate_signal(candles, symbol="BTCUSDT", interval="30m")
+
+    def test_cli_scan_still_attaches_portfolio_allocation_and_lifecycle(self):
+        scan = self._paper_scan_fixture(
+            allocations=[{"symbol": "BTCUSDT", "paper_risk_units": 1.0}],
+            results=[
+                {
+                    "symbol": "BTCUSDT",
+                    "action": "hold_long",
+                    "position_size": 1.0,
+                    "entry_reference": 100.0,
+                    "trailing_stop": 94.0,
+                    "take_profit_1": 104.0,
+                    "take_profit_2": 108.0,
+                    "rank_score": 20.0,
+                    "ranking_bucket": "strong_confirmed_trend",
+                    "reason": "major trend filter passed: participate in trend",
+                }
+            ],
+        )
+        original_scan_symbols = getattr(trend, "scan_symbols")
+        setattr(trend, "scan_symbols", lambda **kwargs: scan)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                lifecycle_path = pathlib.Path(tmpdir) / "paper-lifecycle.json"
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc = trend.main(
+                        [
+                            "--symbols",
+                            "BTCUSDT",
+                            "--portfolio-risk-budget",
+                            "1",
+                            "--max-symbol-risk",
+                            "1",
+                            "--lifecycle-file",
+                            str(lifecycle_path),
+                            "--no-save-lifecycle",
+                        ]
+                    )
+        finally:
+            setattr(trend, "scan_symbols", original_scan_symbols)
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["scan"]["mode"], "paper")
+        self.assertIn("portfolio_allocation", payload["scan"])
+        self.assertIn("paper_lifecycle", payload["scan"])
+        self.assertEqual(payload["scan"]["paper_lifecycle"]["positions_by_symbol"]["BTCUSDT"]["last_intent"], "entry")
+
     def test_rejects_short_intervals_below_one_hour(self):
         for interval in ["1m", "5m", "10m", "15m", "30m"]:
             with self.subTest(interval=interval):
