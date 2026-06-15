@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when generating paper-only Binance USDS-M futures trend-following decisions from free public K-line data with >=1h intervals, ATR harvesting, and no paid APIs.
-version: 1.0.0
+version: 1.1.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -22,7 +22,7 @@ This project Skill supports paper-only Binance USDS-M futures decision generatio
 - never use short intervals below 1h;
 - prefer staying with the main trend, avoiding premature exits, and harvesting in tranches.
 
-The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work. v0.4 adds multi-timeframe confirmation (`1h,4h,1d`) to reduce single-period noise while preserving the primary trend-following contract. v0.5 adds optional portfolio-level paper risk allocation with total-budget and per-symbol caps. v0.6 adds allocation explainability for allocated and skipped symbols and includes compact allocation notes in `summary_zh`. v0.7 adds optional paper state persistence, storing scan snapshots and reporting allocation/ranking/action/bucket changes between consecutive scans. v0.8 adds compact Telegram briefing output for scheduled Hermes cron delivery. v0.9 adds a paper-only historical backtest framework with CAGR, drawdown, Calmar, Sharpe, win rate, holding-time, turnover, and per-symbol contribution metrics. v1.0 adds evidence-based strategy refinement comparison so baseline and candidate variants are compared on the same fetched candle sample with paper-only backtest evidence before any default strategy changes.
+The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work. v0.4 adds multi-timeframe confirmation (`1h,4h,1d`) to reduce single-period noise while preserving the primary trend-following contract. v0.5 adds optional portfolio-level paper risk allocation with total-budget and per-symbol caps. v0.6 adds allocation explainability for allocated and skipped symbols and includes compact allocation notes in `summary_zh`. v0.7 adds optional paper state persistence, storing scan snapshots and reporting allocation/ranking/action/bucket changes between consecutive scans. v0.8 adds compact Telegram briefing output for scheduled Hermes cron delivery. v0.9 adds a paper-only historical backtest framework with CAGR, drawdown, Calmar, Sharpe, win rate, holding-time, turnover, and per-symbol contribution metrics. v1.0 adds evidence-based strategy refinement comparison so baseline and candidate variants are compared on the same fetched candle sample with paper-only backtest evidence before any default strategy changes. v1.1 adds paper-only lifecycle tracking for scan outputs, including entry/add/reduce/exit intent, trailing-stop updates, take-profit tranche records, and per-symbol lifecycle change summaries.
 
 ## When to Use
 
@@ -88,6 +88,18 @@ Telegram briefing output for scheduled Hermes cron delivery:
 
 ```bash
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --telegram-brief
+```
+
+Paper lifecycle tracking for consecutive scans:
+
+```bash
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json
+```
+
+Lifecycle dry run without writing:
+
+```bash
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --no-save-lifecycle
 ```
 
 Historical backtest for selected symbols:
@@ -191,6 +203,23 @@ In v1.0 evidence-based refinement mode, enabled by `--compare-refinements`, outp
 - `selected_variant`: diagnostic candidate only; do not treat it as a live/default strategy change;
 - `summary_zh`: compact Chinese paper-only comparison summary.
 
+In v1.1 paper lifecycle mode, enabled by `--lifecycle-file` in scan mode, output additionally includes:
+
+- `paper_lifecycle.mode`: always `paper`;
+- `positions_by_symbol`: per-symbol paper status, `last_intent`, `current_size`, original `entry_reference`, latest reference, trailing stop, TP references, executed TP tranches, and reason;
+- `open_positions` and `closed_positions` summaries;
+- `lifecycle_change`: `first_run`, `intent_changes`, `status_changes`, `tranche_events`, and `current_errors_count`;
+- `--no-save-lifecycle` computes lifecycle output without writing the lifecycle file.
+
+## Decision Logic v1.1
+- `--lifecycle-file` is scan-mode only and keeps paper lifecycle state separate from v0.7 scan state;
+- lifecycle state is paper-only: it records intent and diagnostics, never signed order IDs or exchange execution fields;
+- current `hold_long` with positive paper size emits `entry`, `add`, `reduce`, or `hold` by comparing against the previous open paper position size;
+- when an existing open paper position flips away from `hold_long`, lifecycle emits `exit` and marks the position `closed`;
+- long trailing stops are monotonic: never lower a previous paper trailing stop while the position remains open;
+- take-profit tranche records are appended when the latest reference crosses prior saved TP thresholds;
+- missing lifecycle files are first runs; corrupted lifecycle files are reported in `lifecycle_change.lifecycle_file_error` and replaced only when saving is enabled.
+
 ## Decision Logic v1.0
 - compute periodic returns after mark-to-market **and after fee deductions** so Sharpe and CAGR/total-return use the same equity path;
 - multi-symbol portfolio metrics must come from a common-`close_time` aligned combined equity curve, not a simple average of per-symbol CAGR/Sharpe;
@@ -252,6 +281,7 @@ https://fapi.binance.com/fapi/v1/klines
 16. In Telegram briefing mode, `--telegram-brief` is scan-mode only and emits compact text for scheduled Hermes cron delivery, including UTC/北京时间（UTC+8）, top trends, allocation, state change, risk notes, `errors_count`, and a paper-only safety line without raw full JSON or secrets.
 17. In historical backtest mode, `--backtest` fetches free K-lines, simulates paper-only long exposure from existing EMA/ATR decisions after each candle close, applies paper turnover fees, and reports performance metrics. It rejects `<1h` intervals and insufficient history; it does not use signed endpoints, live order fields, or paid APIs.
 18. In evidence-based refinement mode, `--compare-refinements` fetches one candle sample per symbol, reuses that identical sample for baseline and every candidate variant, computes `evidence_score = cagr + 0.03*calmar + 0.02*sharpe`, blocks candidates whose absolute max drawdown worsens beyond the configured guardrail, and never auto-promotes defaults.
+19. In paper lifecycle mode, `--lifecycle-file` loads previous per-symbol paper lifecycle state, emits `entry`/`add`/`reduce`/`hold`/`exit` intent, preserves original entry references, never lowers long trailing stops, records take-profit tranche events when previous TP thresholds are crossed, and atomically persists the updated lifecycle unless `--no-save-lifecycle` is set.
 
 ## Testing
 
@@ -278,6 +308,7 @@ The test suite verifies:
 - v0.8 Telegram briefing covers compact paper-only text output, state-change display, secret-safe omission of raw endpoint errors, scan-mode CLI output, and safe cron wrapper defaults;
 - v0.9 historical backtest covers paper-only metric output, UTC / 北京时间（UTC+8） labels, `<1h` and insufficient-history rejection, multi-symbol aggregation, CLI JSON output, and omission of live/signed/order/secret fields;
 - v1.0 evidence-based refinement covers baseline/candidate comparison on the same fetched candle sample, evidence score selection, drawdown guardrails, `risk_unit` candidate impact, `<1h` rejection, CLI JSON output, paper-only summaries, and no auto-promotion of defaults;
+- v1.1 paper lifecycle covers first-run entry intent, consecutive-run reduce intent, trailing-stop updates, take-profit tranche records, flat-signal exits, persistence, and CLI `--lifecycle-file` / `--no-save-lifecycle`;
 - input guardrails reject non-positive `risk_unit` and `top < 1`.
 
 ## Verification Recipe
@@ -299,6 +330,7 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --telegram-brief
 scripts/binance_usds_futures_trend.py --backtest --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 500
 scripts/binance_usds_futures_trend.py --compare-refinements --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 500
+scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 3 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --no-save-state --no-save-lifecycle
 scripts/binance_usds_futures_trend_brief.sh
 ```
 
@@ -314,6 +346,7 @@ scripts/binance_usds_futures_trend_brief.sh
 - if `--telegram-brief` is used, stdout is compact text with UTC / 北京时间（UTC+8）、`paper only`, allocation, state-change summary, risk notes, and no raw full JSON;
 - if `--backtest` is used, output includes `backtest.mode=paper`, UTC / 北京时间（UTC+8）, CAGR/drawdown/Calmar/Sharpe/win-rate/holding/turnover/per-symbol metrics, `errors_count`, and no live/signed/order fields;
 - if `--compare-refinements` is used, output includes `refinement.mode=paper`, UTC / 北京时间（UTC+8）, variant metrics, evidence score, drawdown guardrails, `auto_promote_defaults=false`, and no live/default strategy promotion;
+- if `--lifecycle-file` is used, output includes `paper_lifecycle.mode=paper`, `positions_by_symbol`, `lifecycle_change`, paper intent only, and no live/signed/order fields;
 - tracked cron config does not include origin-specific Telegram chat IDs/names, while `cronjob list` still reports a valid scheduled job;
 - `cron/output/` and editor swap files are ignored so manual-run artifacts do not enter commits;
 - no API key or paid API is required.
@@ -347,6 +380,7 @@ scripts/binance_usds_futures_trend_brief.sh
 - `references/session-v0.8-scheduled-telegram-briefing-workflow.md` — workflow note for scheduled scanner delivery and Telegram briefing output.
 - `references/session-v0.9-historical-backtest-workflow.md` — workflow note for the paper-only historical backtest framework and verification.
 - `references/session-v1.0-evidence-based-refinement-workflow.md` — workflow note for baseline/candidate paper-only strategy refinement comparison and guardrails.
+- `references/session-v1.1-paper-lifecycle-workflow.md` — workflow note for paper-only position lifecycle state, intent, trailing, and tranche records.
 - `plans/binance-usds-futures-trend-v0.3.md` — v0.3 batch scan and ranking implementation plan.
 - `plans/binance-usds-futures-trend-v0.4.md` — v0.4 multi-timeframe confirmation implementation plan.
 - `plans/binance-usds-futures-trend-v0.5.md` — v0.5 portfolio paper risk allocation implementation plan.
@@ -355,6 +389,7 @@ scripts/binance_usds_futures_trend_brief.sh
 - `plans/binance-usds-futures-trend-v0.8.md` — v0.8 scheduled scan and Telegram briefing implementation plan.
 - `plans/binance-usds-futures-trend-v0.9.md` — v0.9 historical backtest framework implementation plan.
 - `plans/binance-usds-futures-trend-v1.0.md` — v1.0 evidence-based strategy refinement comparison implementation plan.
+- `plans/binance-usds-futures-trend-v1.1.md` — v1.1 paper trading lifecycle implementation plan.
 
 ## Roadmap
 

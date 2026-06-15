@@ -682,6 +682,197 @@ def apply_paper_state(
     return updated
 
 
+def _optional_round(value: Any, digits: int = 8) -> float | None:
+    if value is None:
+        return None
+    return _round_float(value, digits)
+
+
+def _paper_position_from_decision(decision: dict[str, Any], previous_position: dict[str, Any] | None) -> dict[str, Any]:
+    symbol = str(decision.get("symbol"))
+    action = decision.get("action")
+    target_size = _round_float(decision.get("position_size"))
+    reference = _optional_round(decision.get("entry_reference"))
+    previous_open = bool(
+        previous_position
+        and previous_position.get("status") == "open"
+        and float(previous_position.get("current_size") or 0.0) > 0
+    )
+    previous_size = float(previous_position.get("current_size") or 0.0) if previous_position else 0.0
+    previous_entry = previous_position.get("entry_reference") if previous_position else None
+
+    if action == "hold_long" and target_size > 0:
+        if not previous_open:
+            intent = "entry"
+        elif target_size > previous_size + 1e-12:
+            intent = "add"
+        elif target_size < previous_size - 1e-12:
+            intent = "reduce"
+        else:
+            intent = "hold"
+
+        previous_trailing = None if not previous_position else previous_position.get("trailing_stop")
+        current_trailing = decision.get("trailing_stop")
+        trailing_candidates = [float(item) for item in (previous_trailing, current_trailing) if item is not None]
+        trailing_stop = round(max(trailing_candidates), 8) if trailing_candidates else None
+        executed_tranches = list((previous_position or {}).get("executed_tranches") or [])
+        executed_names = {item.get("name") for item in executed_tranches if isinstance(item, dict)}
+        if previous_open and reference is not None:
+            for tranche_name in ("take_profit_1", "take_profit_2"):
+                threshold = previous_position.get(tranche_name) if previous_position else None
+                if threshold is not None and tranche_name not in executed_names and float(reference) >= float(threshold):
+                    executed_tranches.append(
+                        {
+                            "name": tranche_name,
+                            "trigger_price": _round_float(threshold),
+                            "executed_at_reference": reference,
+                            "size_after": target_size,
+                        }
+                    )
+
+        return {
+            "symbol": symbol,
+            "status": "open",
+            "last_intent": intent,
+            "current_size": target_size,
+            "entry_reference": _optional_round(previous_entry) if previous_open and previous_entry is not None else reference,
+            "last_reference": reference,
+            "trailing_stop": trailing_stop,
+            "take_profit_1": _optional_round(decision.get("take_profit_1")),
+            "take_profit_2": _optional_round(decision.get("take_profit_2")),
+            "executed_tranches": executed_tranches,
+            "ranking_bucket": decision.get("ranking_bucket"),
+            "rank_score": _round_float(decision.get("rank_score")),
+            "reason": decision.get("reason"),
+        }
+
+    if previous_open:
+        assert previous_position is not None
+        return {
+            "symbol": symbol,
+            "status": "closed",
+            "last_intent": "exit",
+            "current_size": 0.0,
+            "entry_reference": _optional_round(previous_entry),
+            "last_reference": reference,
+            "trailing_stop": _optional_round(previous_position.get("trailing_stop")),
+            "take_profit_1": _optional_round(previous_position.get("take_profit_1")),
+            "take_profit_2": _optional_round(previous_position.get("take_profit_2")),
+            "executed_tranches": list(previous_position.get("executed_tranches") or []),
+            "ranking_bucket": decision.get("ranking_bucket"),
+            "rank_score": _round_float(decision.get("rank_score")),
+            "exit_reason": decision.get("reason", "signal no longer hold_long"),
+            "reason": decision.get("reason"),
+        }
+
+    return {
+        "symbol": symbol,
+        "status": "flat",
+        "last_intent": "flat",
+        "current_size": 0.0,
+        "entry_reference": reference,
+        "last_reference": reference,
+        "trailing_stop": None,
+        "take_profit_1": None,
+        "take_profit_2": None,
+        "executed_tranches": [],
+        "ranking_bucket": decision.get("ranking_bucket"),
+        "rank_score": _round_float(decision.get("rank_score")),
+        "reason": decision.get("reason"),
+    }
+
+
+def build_paper_lifecycle_snapshot(scan: dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build paper-only per-symbol lifecycle state from a scan and optional prior lifecycle."""
+    previous_positions = {} if previous is None else (previous.get("positions_by_symbol") or {})
+    positions_by_symbol: dict[str, dict[str, Any]] = {}
+    seen_symbols: set[str] = set()
+    for decision in scan.get("results") or []:
+        symbol = decision.get("symbol")
+        if not symbol:
+            continue
+        symbol_text = str(symbol)
+        seen_symbols.add(symbol_text)
+        previous_position = previous_positions.get(symbol_text)
+        positions_by_symbol[symbol_text] = _paper_position_from_decision(decision, previous_position)
+
+    for symbol, previous_position in sorted(previous_positions.items()):
+        if symbol in seen_symbols:
+            continue
+        if previous_position.get("status") == "open" and float(previous_position.get("current_size") or 0.0) > 0:
+            carried = dict(previous_position)
+            carried["last_intent"] = "hold"
+            carried["stale"] = True
+            carried["stale_reason"] = "symbol missing from current scan; paper position carried without execution"
+            positions_by_symbol[symbol] = carried
+
+    open_positions = [symbol for symbol, item in positions_by_symbol.items() if item.get("status") == "open"]
+    closed_positions = [symbol for symbol, item in positions_by_symbol.items() if item.get("status") == "closed"]
+    return {
+        "mode": "paper",
+        "generated_at_utc": scan.get("generated_at_utc"),
+        "generated_at_beijing": scan.get("generated_at_beijing"),
+        "interval": scan.get("interval"),
+        "intervals": list(scan.get("intervals") or [scan.get("interval")]),
+        "primary_interval": scan.get("primary_interval", scan.get("interval")),
+        "open_positions": open_positions,
+        "closed_positions": closed_positions,
+        "positions_by_symbol": positions_by_symbol,
+        "errors_count": len(scan.get("errors") or []),
+    }
+
+
+def compute_paper_lifecycle_change(previous: dict[str, Any] | None, current: dict[str, Any]) -> dict[str, Any]:
+    previous_positions = {} if previous is None else (previous.get("positions_by_symbol") or {})
+    current_positions = current.get("positions_by_symbol") or {}
+    status_changes: list[dict[str, Any]] = []
+    intent_changes: list[dict[str, str]] = []
+    tranche_events: list[dict[str, Any]] = []
+    for symbol in sorted(set(previous_positions).union(current_positions)):
+        before = previous_positions.get(symbol) or {}
+        after = current_positions.get(symbol) or {}
+        if before.get("status") != after.get("status") and after.get("status"):
+            status_changes.append({"symbol": symbol, "previous_status": before.get("status"), "current_status": after.get("status")})
+        intent = after.get("last_intent")
+        if intent and intent != before.get("last_intent") and intent != "flat":
+            intent_changes.append({"symbol": symbol, "intent": str(intent)})
+        before_tranches = {item.get("name") for item in before.get("executed_tranches") or [] if isinstance(item, dict)}
+        for tranche in after.get("executed_tranches") or []:
+            if isinstance(tranche, dict) and tranche.get("name") not in before_tranches:
+                tranche_events.append({"symbol": symbol, **tranche})
+    return {
+        "mode": "paper",
+        **now_stamps(),
+        "first_run": previous is None,
+        "previous_lifecycle_loaded": previous is not None,
+        "open_positions": list(current.get("open_positions") or []),
+        "closed_positions": list(current.get("closed_positions") or []),
+        "status_changes": status_changes,
+        "intent_changes": intent_changes,
+        "tranche_events": tranche_events,
+        "current_errors_count": current.get("errors_count", 0),
+    }
+
+
+def apply_paper_lifecycle(
+    scan: dict[str, Any],
+    lifecycle_file: str | os.PathLike[str],
+    save_lifecycle: bool = True,
+) -> dict[str, Any]:
+    """Attach v1.1 paper lifecycle state/change to a scan and optionally persist it."""
+    updated = dict(scan)
+    previous, lifecycle_error = load_paper_state(lifecycle_file)
+    current = build_paper_lifecycle_snapshot(updated, previous)
+    change = compute_paper_lifecycle_change(previous, current)
+    if lifecycle_error:
+        change["lifecycle_file_error"] = lifecycle_error
+    updated["paper_lifecycle"] = current
+    updated["lifecycle_change"] = change
+    if save_lifecycle:
+        save_paper_state(lifecycle_file, current)
+    return updated
+
+
 def _interval_hours(interval: str) -> float:
     validated = validate_interval(interval)
     unit = validated[-1]
@@ -1414,6 +1605,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-symbol-risk", type=float, help="Optional v0.5 per-symbol paper risk-unit cap for scan allocation")
     parser.add_argument("--state-file", help="Optional v0.7 paper scan state JSON path; scan mode only")
     parser.add_argument("--no-save-state", action="store_true", help="Compute v0.7 state_change without writing --state-file")
+    parser.add_argument("--lifecycle-file", help="Optional v1.1 paper lifecycle JSON path; scan mode only")
+    parser.add_argument("--no-save-lifecycle", action="store_true", help="Compute v1.1 lifecycle_change without writing --lifecycle-file")
     parser.add_argument("--telegram-brief", action="store_true", help="Emit a compact v0.8 Telegram briefing instead of full JSON; scan mode only")
     parser.add_argument("--backtest", action="store_true", help="Run v0.9 paper-only historical backtest instead of current scan/decision")
     parser.add_argument("--compare-refinements", action="store_true", help="Run v1.0 paper-only evidence-based strategy refinement comparison")
@@ -1433,6 +1626,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("choose only one mode: --compare-refinements or --backtest")
             if args.state_file:
                 raise ValueError("--state-file is for scan state only; omit it for --compare-refinements")
+            if args.lifecycle_file:
+                raise ValueError("--lifecycle-file is for scan lifecycle only; omit it for --compare-refinements")
             if args.telegram_brief:
                 raise ValueError("--telegram-brief is for scan briefings only; omit it for --compare-refinements")
             if args.all_symbols:
@@ -1456,6 +1651,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.backtest:
             if args.state_file:
                 raise ValueError("--state-file is for scan state only; omit it for --backtest")
+            if args.lifecycle_file:
+                raise ValueError("--lifecycle-file is for scan lifecycle only; omit it for --backtest")
             if args.telegram_brief:
                 raise ValueError("--telegram-brief is for scan briefings only; omit it for --backtest")
             if args.all_symbols:
@@ -1495,6 +1692,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.state_file:
                 scan = apply_paper_state(scan, args.state_file, save_state=not args.no_save_state)
+            if args.lifecycle_file:
+                scan = apply_paper_lifecycle(scan, args.lifecycle_file, save_lifecycle=not args.no_save_lifecycle)
             if args.telegram_brief:
                 print(build_telegram_briefing_zh(scan))
             else:
@@ -1503,6 +1702,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.state_file:
             raise ValueError("--state-file requires scan mode: use --all-symbols or --symbols")
+        if args.lifecycle_file:
+            raise ValueError("--lifecycle-file requires scan mode: use --all-symbols or --symbols")
         if args.telegram_brief:
             raise ValueError("--telegram-brief requires scan mode: use --all-symbols or --symbols")
         candles = fetch_klines(args.symbol, args.interval, args.limit, args.base_url)

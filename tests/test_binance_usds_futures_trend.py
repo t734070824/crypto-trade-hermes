@@ -459,6 +459,147 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             self.assertTrue(updated["state_change"]["first_run"])
             self.assertFalse(state_path.exists())
 
+    def test_apply_paper_lifecycle_creates_entry_intent_and_persists_snapshot(self):
+        scan = self._paper_scan_fixture(
+            results=[
+                {
+                    "symbol": "BTCUSDT",
+                    "action": "hold_long",
+                    "position_size": 1.0,
+                    "entry_reference": 100.0,
+                    "trailing_stop": 94.0,
+                    "take_profit_1": 104.0,
+                    "take_profit_2": 108.0,
+                    "reason": "major trend filter passed: participate in trend",
+                    "rank_score": 20.0,
+                    "ranking_bucket": "strong_confirmed_trend",
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "action": "flat",
+                    "position_size": 0.0,
+                    "entry_reference": 50.0,
+                    "trailing_stop": None,
+                    "take_profit_1": None,
+                    "take_profit_2": None,
+                    "reason": "major trend filter failed: require close > EMA200 and EMA50 > EMA200",
+                    "rank_score": 0.0,
+                    "ranking_bucket": "watchlist",
+                },
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lifecycle_path = pathlib.Path(tmpdir) / "paper-lifecycle.json"
+
+            updated = trend.apply_paper_lifecycle(scan, lifecycle_path)
+
+            lifecycle = updated["paper_lifecycle"]
+            self.assertTrue(updated["lifecycle_change"]["first_run"])
+            btc = lifecycle["positions_by_symbol"]["BTCUSDT"]
+            self.assertEqual(btc["status"], "open")
+            self.assertEqual(btc["last_intent"], "entry")
+            self.assertEqual(btc["current_size"], 1.0)
+            self.assertEqual(btc["executed_tranches"], [])
+            self.assertEqual(lifecycle["positions_by_symbol"]["ETHUSDT"]["status"], "flat")
+            self.assertTrue(lifecycle_path.exists())
+            saved = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["positions_by_symbol"]["BTCUSDT"]["status"], "open")
+            self.assertNotIn("secret", json.dumps(saved).lower())
+
+    def test_apply_paper_lifecycle_updates_trailing_stop_and_records_take_profit_tranche(self):
+        previous = self._paper_scan_fixture(
+            results=[
+                {
+                    "symbol": "BTCUSDT",
+                    "action": "hold_long",
+                    "position_size": 1.0,
+                    "entry_reference": 100.0,
+                    "trailing_stop": 94.0,
+                    "take_profit_1": 104.0,
+                    "take_profit_2": 108.0,
+                    "reason": "major trend filter passed: participate in trend",
+                    "rank_score": 20.0,
+                    "ranking_bucket": "strong_confirmed_trend",
+                }
+            ],
+        )
+        current = self._paper_scan_fixture(
+            results=[
+                {
+                    "symbol": "BTCUSDT",
+                    "action": "hold_long",
+                    "position_size": 0.5,
+                    "entry_reference": 105.0,
+                    "trailing_stop": 100.0,
+                    "take_profit_1": 109.0,
+                    "take_profit_2": 113.0,
+                    "reason": "major trend filter passed: participate in trend",
+                    "rank_score": 22.0,
+                    "ranking_bucket": "strong_confirmed_trend",
+                }
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lifecycle_path = pathlib.Path(tmpdir) / "paper-lifecycle.json"
+            trend.apply_paper_lifecycle(previous, lifecycle_path)
+
+            updated = trend.apply_paper_lifecycle(current, lifecycle_path)
+
+            btc = updated["paper_lifecycle"]["positions_by_symbol"]["BTCUSDT"]
+            self.assertEqual(btc["status"], "open")
+            self.assertEqual(btc["last_intent"], "reduce")
+            self.assertEqual([item["name"] for item in btc["executed_tranches"]], ["take_profit_1"])
+            self.assertLess(btc["current_size"], 1.0)
+            self.assertGreaterEqual(btc["trailing_stop"], 100.0)
+            self.assertFalse(updated["lifecycle_change"]["first_run"])
+            self.assertIn({"symbol": "BTCUSDT", "intent": "reduce"}, updated["lifecycle_change"]["intent_changes"])
+
+    def test_apply_paper_lifecycle_exits_open_position_when_signal_flips_flat(self):
+        previous = self._paper_scan_fixture(
+            results=[
+                {
+                    "symbol": "BTCUSDT",
+                    "action": "hold_long",
+                    "position_size": 1.0,
+                    "entry_reference": 100.0,
+                    "trailing_stop": 94.0,
+                    "take_profit_1": 104.0,
+                    "take_profit_2": 108.0,
+                    "reason": "major trend filter passed: participate in trend",
+                    "rank_score": 20.0,
+                    "ranking_bucket": "strong_confirmed_trend",
+                }
+            ],
+        )
+        current = self._paper_scan_fixture(
+            results=[
+                {
+                    "symbol": "BTCUSDT",
+                    "action": "flat",
+                    "position_size": 0.0,
+                    "entry_reference": 96.0,
+                    "trailing_stop": None,
+                    "take_profit_1": None,
+                    "take_profit_2": None,
+                    "reason": "major trend filter failed: require close > EMA200 and EMA50 > EMA200",
+                    "rank_score": 0.0,
+                    "ranking_bucket": "watchlist",
+                }
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lifecycle_path = pathlib.Path(tmpdir) / "paper-lifecycle.json"
+            trend.apply_paper_lifecycle(previous, lifecycle_path)
+
+            updated = trend.apply_paper_lifecycle(current, lifecycle_path)
+
+            btc = updated["paper_lifecycle"]["positions_by_symbol"]["BTCUSDT"]
+            self.assertEqual(btc["status"], "closed")
+            self.assertEqual(btc["last_intent"], "exit")
+            self.assertEqual(btc["current_size"], 0.0)
+            self.assertIn("trend filter failed", btc["exit_reason"])
+            self.assertTrue(updated["lifecycle_change"]["intent_changes"])
+
     def test_build_telegram_briefing_zh_is_compact_paper_only_and_includes_state_changes(self):
         scan = self._paper_scan_fixture(
             allocations=[
@@ -512,6 +653,46 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertIn("risk notes: risk_high=SOLUSDT; conflicting=XRPUSDT; errors_count=1", brief)
         self.assertNotIn("temporary public endpoint error", brief)
         self.assertLess(len(brief), 1200)
+
+    def test_main_can_attach_paper_lifecycle_in_scan_mode_without_saving(self):
+        scan = self._paper_scan_fixture(
+            results=[
+                {
+                    "symbol": "BTCUSDT",
+                    "action": "hold_long",
+                    "position_size": 1.0,
+                    "entry_reference": 100.0,
+                    "trailing_stop": 94.0,
+                    "take_profit_1": 104.0,
+                    "take_profit_2": 108.0,
+                    "reason": "major trend filter passed: participate in trend",
+                    "rank_score": 20.0,
+                    "ranking_bucket": "strong_confirmed_trend",
+                }
+            ],
+        )
+        scan.update({"universe_count": 1, "risk_high_trends": [], "conflicting_trends": []})
+        original_scan_symbols = getattr(trend, "scan_symbols")
+        setattr(trend, "scan_symbols", lambda **kwargs: scan)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lifecycle_path = pathlib.Path(tmpdir) / "paper-lifecycle.json"
+            try:
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc = trend.main([
+                        "--symbols",
+                        "BTCUSDT",
+                        "--lifecycle-file",
+                        str(lifecycle_path),
+                        "--no-save-lifecycle",
+                    ])
+            finally:
+                setattr(trend, "scan_symbols", original_scan_symbols)
+
+            self.assertEqual(rc, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["scan"]["paper_lifecycle"]["positions_by_symbol"]["BTCUSDT"]["last_intent"], "entry")
+            self.assertFalse(lifecycle_path.exists())
 
     def test_main_can_emit_telegram_brief_in_scan_mode(self):
         scan = self._paper_scan_fixture(

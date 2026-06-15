@@ -148,20 +148,23 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 - 不因短期样本过拟合而提升默认风险。
 - 不把 candidate selection 当成实盘收益或默认策略变更。
 
-### v1.1 — Paper Trading Lifecycle
+### v1.1 — Paper Trading Lifecycle ✅
+
+**Status:** implemented in current v1.1 change set: paper-only lifecycle state, entry/add/reduce/hold/exit intent, monotonic trailing-stop updates, take-profit tranche records, CLI `--lifecycle-file`, and dry-run `--no-save-lifecycle`.
 
 **Goal:** 从“单次 scanner”升级为完整 paper 持仓生命周期。
 
-**Scope:**
+**Implemented Scope:**
 - paper position state；
-- entry / add / reduce / exit intent；
-- trailing stop 更新；
+- entry / add / reduce / hold / exit intent；
+- trailing stop 更新（多头 paper trailing stop 不下移）；
 - take-profit tranche 执行记录；
-- 持仓变化归因。
+- 持仓变化归因：`lifecycle_change.status_changes` / `intent_changes` / `tranche_events`。
 
 **Guardrails:**
 - 仍然不真实下单。
-- 所有 order intent 必须标记 `paper`。
+- 所有 lifecycle intent 必须标记 `paper`。
+- lifecycle 文件应放在 ignored `state/*.json` 运行态路径。
 
 ### v2.0 — Binance Testnet Execution Skill
 
@@ -180,9 +183,9 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 ## Default Next Step
 
-当前默认下一步：**v1.1 Paper Trading Lifecycle**。
+当前默认下一步：**长期 paper lifecycle 运行观察；满足 v2.0 prerequisites 后，单独设计 Binance Testnet Execution Skill**。
 
-除非用户明确改变优先级，否则后续继续按本文件顺序推进：v1.1 → v2.0。
+除非用户明确改变优先级，否则后续继续按本文件顺序推进：长期 paper 验证 → v2.0 testnet-only execution Skill。
 
 ## Stop Conditions
 
