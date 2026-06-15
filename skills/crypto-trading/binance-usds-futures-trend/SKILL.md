@@ -369,6 +369,7 @@ scripts/binance_usds_futures_trend_brief.sh
 14. **Comparing variants on drifting samples.** Do not let baseline and candidates fetch live klines separately inside each variant loop. Fetch each symbol's candle sample once, reuse the same sample for every variant, and test fetch call counts so differences are strategy-driven rather than data-timing artifacts.
 15. **Trusting lifecycle files too much.** When extending v1.1 lifecycle handling, validate loaded lifecycle state lightly before treating it as previous paper state: require `mode=paper` and `positions_by_symbol` to be an object. Avoid carrying arbitrary unknown fields from local lifecycle JSON; rebuild stale/carried positions from an explicit whitelist so hand-edited or polluted runtime files do not keep propagating misleading data.
 16. **Adding no-op lifecycle flags.** If adding dry-run or lifecycle-related CLI flags, ensure they have an effect only in scan mode and either pair with `--lifecycle-file` or produce a clear error. Silent no-op flags make scheduled paper runs harder to audit.
+17. **Forgetting lifecycle persistence in scheduled brief wrappers.** If a cron wrapper runs recurring paper scans and already persists `--state-file`, it should usually also pass `--lifecycle-file` so scan state and per-symbol paper lifecycle stay in sync across runs. Add a regression test that checks the wrapper text contains both flags.
 
 ## References
 
