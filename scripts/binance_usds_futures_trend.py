@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Minimal Binance USDS futures trend-following paper decision helper.
+"""Binance USDS futures trend-following paper decision helper.
 
-Uses only free public Binance Futures K-line data. It does not place orders.
+Uses only free public Binance Futures data. It does not place orders.
 All generated timestamps explicitly include UTC and Beijing time (UTC+8).
 """
 
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime, timedelta, timezone
@@ -24,6 +23,7 @@ ALLOWED_SYMBOLS = {
 }
 _SHORT_INTERVALS = {"1m", "3m", "5m", "10m", "15m", "30m"}
 _ALLOWED_INTERVALS = {"1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
+_PUBLIC_FACTOR_PERIODS = {"1h", "2h", "4h", "6h", "12h", "1d"}
 BEIJING = timezone(timedelta(hours=8), name="UTC+8")
 
 
@@ -34,6 +34,15 @@ def validate_interval(interval: str) -> str:
     if interval not in _ALLOWED_INTERVALS:
         raise ValueError(f"unsupported interval: {interval}; allowed: {sorted(_ALLOWED_INTERVALS)}")
     return interval
+
+
+def validate_period(period: str) -> str:
+    """Validate public futures statistics periods; reject sub-1h periods."""
+    if period in _SHORT_INTERVALS:
+        raise ValueError(f"short period is forbidden by policy: {period}; use >= 1h")
+    if period not in _PUBLIC_FACTOR_PERIODS:
+        raise ValueError(f"unsupported public factor period: {period}; allowed: {sorted(_PUBLIC_FACTOR_PERIODS)}")
+    return period
 
 
 def validate_symbol(symbol: str) -> str:
@@ -83,19 +92,143 @@ def parse_klines(raw_klines: list[list[Any]]) -> list[dict[str, float]]:
     return candles
 
 
+def _get_json(path: str, params: dict[str, Any], base_url: str = BINANCE_FAPI_BASE) -> Any:
+    query = urllib.parse.urlencode(params)
+    url = f"{base_url.rstrip('/')}{path}?{query}"
+    request = urllib.request.Request(url, headers={"User-Agent": "crypto-trade-hermes/0.2"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def fetch_klines(symbol: str, interval: str, limit: int = 240, base_url: str = BINANCE_FAPI_BASE) -> list[dict[str, float]]:
     symbol = validate_symbol(symbol)
     interval = validate_interval(interval)
     if not 200 <= limit <= 1500:
         raise ValueError("limit must be between 200 and 1500 to support EMA200")
-    query = urllib.parse.urlencode({"symbol": symbol, "interval": interval, "limit": limit})
-    url = f"{base_url.rstrip('/')}/fapi/v1/klines?{query}"
-    request = urllib.request.Request(url, headers={"User-Agent": "crypto-trade-hermes/0.1"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = _get_json("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit}, base_url)
     if not isinstance(payload, list):
         raise RuntimeError(f"unexpected Binance response: {payload!r}")
     return parse_klines(payload)
+
+
+def _last_float(rows: list[dict[str, Any]], key: str) -> float | None:
+    if not rows:
+        return None
+    value = rows[-1].get(key)
+    return None if value is None else float(value)
+
+
+def _pct_change(first: float | None, last: float | None) -> float | None:
+    if first is None or last is None or first == 0:
+        return None
+    return (last - first) / first * 100.0
+
+
+def fetch_market_context(
+    symbol: str,
+    period: str,
+    limit: int = 30,
+    base_url: str = BINANCE_FAPI_BASE,
+) -> dict[str, Any]:
+    """Fetch free/public USDS-M futures context factors from Binance endpoints."""
+    symbol = validate_symbol(symbol)
+    period = validate_period(period)
+    if not 2 <= limit <= 500:
+        raise ValueError("market context limit must be between 2 and 500")
+
+    mark_rows = _get_json("/fapi/v1/markPriceKlines", {"symbol": symbol, "interval": period, "limit": limit}, base_url)
+    mark_candles = parse_klines(mark_rows if isinstance(mark_rows, list) else [])
+    mark_trend_confirmed = bool(mark_candles and mark_candles[-1]["close"] >= mark_candles[0]["close"])
+
+    funding_rows = _get_json("/fapi/v1/fundingRate", {"symbol": symbol, "limit": min(limit, 100)}, base_url)
+    latest_funding_rate = _last_float(funding_rows if isinstance(funding_rows, list) else [], "fundingRate")
+
+    oi_rows = _get_json("/futures/data/openInterestHist", {"symbol": symbol, "period": period, "limit": limit}, base_url)
+    oi_list = oi_rows if isinstance(oi_rows, list) else []
+    first_oi = float(oi_list[0]["sumOpenInterest"]) if oi_list else None
+    last_oi = float(oi_list[-1]["sumOpenInterest"]) if oi_list else None
+    open_interest_change_pct = _pct_change(first_oi, last_oi)
+
+    long_short_rows = _get_json(
+        "/futures/data/globalLongShortAccountRatio",
+        {"symbol": symbol, "period": period, "limit": min(limit, 500)},
+        base_url,
+    )
+    global_long_short_ratio = _last_float(long_short_rows if isinstance(long_short_rows, list) else [], "longShortRatio")
+
+    taker_rows = _get_json(
+        "/futures/data/takerlongshortRatio",
+        {"symbol": symbol, "period": period, "limit": min(limit, 500)},
+        base_url,
+    )
+    taker_buy_sell_ratio = _last_float(taker_rows if isinstance(taker_rows, list) else [], "buySellRatio")
+
+    return {
+        "mark_trend_confirmed": mark_trend_confirmed,
+        "latest_funding_rate": latest_funding_rate,
+        "open_interest_change_pct": None if open_interest_change_pct is None else round(open_interest_change_pct, 8),
+        "global_long_short_ratio": global_long_short_ratio,
+        "taker_buy_sell_ratio": taker_buy_sell_ratio,
+        "context_period": period,
+        "context_limit": limit,
+    }
+
+
+def score_market_context(market_context: dict[str, Any] | None) -> tuple[float, list[str]]:
+    """Return confidence multiplier and diagnostic factor flags.
+
+    Secondary factors reduce/add confidence but do not override the main trend by themselves.
+    """
+    if not market_context:
+        return 1.0, []
+    score = 1.0
+    flags: list[str] = []
+
+    if market_context.get("mark_trend_confirmed") is False:
+        score -= 0.20
+        flags.append("mark_trend_divergence")
+
+    funding = market_context.get("latest_funding_rate")
+    if funding is not None:
+        funding = float(funding)
+        if abs(funding) >= 0.001:
+            score -= 0.20
+            flags.append("funding_extreme")
+        elif abs(funding) <= 0.0003:
+            score += 0.05
+            flags.append("funding_neutral")
+
+    oi_change = market_context.get("open_interest_change_pct")
+    if oi_change is not None:
+        oi_change = float(oi_change)
+        if oi_change <= -5.0:
+            score -= 0.20
+            flags.append("oi_contracting")
+        elif oi_change >= 1.0:
+            score += 0.10
+            flags.append("oi_expanding")
+
+    long_short = market_context.get("global_long_short_ratio")
+    if long_short is not None:
+        long_short = float(long_short)
+        if long_short >= 3.0:
+            score -= 0.15
+            flags.append("long_side_crowded")
+        elif 0.8 <= long_short <= 1.8:
+            score += 0.05
+            flags.append("long_short_balanced")
+
+    taker_ratio = market_context.get("taker_buy_sell_ratio")
+    if taker_ratio is not None:
+        taker_ratio = float(taker_ratio)
+        if taker_ratio < 1.0:
+            score -= 0.10
+            flags.append("taker_sell_pressure")
+        elif taker_ratio >= 1.1:
+            score += 0.05
+            flags.append("taker_buy_pressure")
+
+    return round(min(1.25, max(0.25, score)), 4), flags
 
 
 def now_stamps() -> dict[str, str]:
@@ -106,13 +239,19 @@ def now_stamps() -> dict[str, str]:
     }
 
 
-def decide(candles: list[dict[str, float]], symbol: str, interval: str, risk_unit: float = 1.0) -> dict[str, Any]:
+def decide(
+    candles: list[dict[str, float]],
+    symbol: str,
+    interval: str,
+    risk_unit: float = 1.0,
+    market_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Generate a paper-only trend decision.
 
     Logic is intentionally simple and testable:
     - only >=1h intervals;
     - major trend filter: close > EMA200 and EMA50 > EMA200;
-    - participation: hold/enter long while filter is valid;
+    - v0.2 public factors change confidence/size but do not force premature exits;
     - harvesting: two ATR-based take-profit levels;
     - avoid premature exit: ATR trailing stop below entry reference.
     """
@@ -126,6 +265,7 @@ def decide(candles: list[dict[str, float]], symbol: str, interval: str, risk_uni
     ema50 = ema(closes, 50)
     ema200 = ema(closes, 200)
     current_atr = atr(candles, 14)
+    confidence_score, factor_flags = score_market_context(market_context)
     stamps = now_stamps()
 
     base: dict[str, Any] = {
@@ -137,6 +277,9 @@ def decide(candles: list[dict[str, float]], symbol: str, interval: str, risk_uni
         "ema50": round(ema50, 8),
         "ema200": round(ema200, 8),
         "atr14": round(current_atr, 8),
+        "confidence_score": confidence_score,
+        "factor_flags": factor_flags,
+        "market_context": market_context or {},
     }
 
     if not (last_close > ema200 and ema50 > ema200):
@@ -151,10 +294,10 @@ def decide(candles: list[dict[str, float]], symbol: str, interval: str, risk_uni
         }
 
     # Smaller size when price is extended far above the fast trend; this keeps participation
-    # but avoids over-adding after vertical moves.
+    # but avoids over-adding after vertical moves. v0.2 public factors further scale size.
     extension = max(0.0, (last_close - ema50) / max(current_atr, 1e-12))
     size_multiplier = 0.5 if extension > 4.0 else 1.0
-    position_size = round(max(0.0, risk_unit * size_multiplier), 4)
+    position_size = round(max(0.0, risk_unit * size_multiplier * confidence_score), 4)
     return {
         **base,
         "action": "hold_long",
@@ -162,7 +305,7 @@ def decide(candles: list[dict[str, float]], symbol: str, interval: str, risk_uni
         "trailing_stop": round(last_close - 3.0 * current_atr, 8),
         "take_profit_1": round(last_close + 2.0 * current_atr, 8),
         "take_profit_2": round(last_close + 4.0 * current_atr, 8),
-        "reason": "major trend filter passed: participate in trend, harvest by ATR tranches, trail stop by ATR",
+        "reason": "major trend filter passed: participate in trend, harvest by ATR tranches, trail stop by ATR; v0.2 factors adjust confidence only",
     }
 
 
@@ -171,8 +314,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbol", default="BTCUSDT", help="USDS futures symbol in configured universe")
     parser.add_argument("--interval", default="1h", help="K-line interval; must be >= 1h")
     parser.add_argument("--limit", type=int, default=240, help="K-line count, 200-1500")
+    parser.add_argument("--context-limit", type=int, default=30, help="Public factor sample count, 2-500")
     parser.add_argument("--risk-unit", type=float, default=1.0, help="Paper position sizing unit")
     parser.add_argument("--base-url", default=BINANCE_FAPI_BASE, help="Override Binance Futures base URL for tests")
+    parser.add_argument("--no-context", action="store_true", help="Disable v0.2 public factor context fetch")
     return parser
 
 
@@ -181,7 +326,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         candles = fetch_klines(args.symbol, args.interval, args.limit, args.base_url)
-        decision = decide(candles, args.symbol, args.interval, args.risk_unit)
+        market_context = None if args.no_context else fetch_market_context(
+            args.symbol,
+            args.interval,
+            args.context_limit,
+            args.base_url,
+        )
+        decision = decide(candles, args.symbol, args.interval, args.risk_unit, market_context)
     except Exception as exc:  # CLI should return structured failure for cron/logging.
         print(json.dumps({"ok": False, "error": str(exc), **now_stamps()}, ensure_ascii=False, indent=2))
         return 1

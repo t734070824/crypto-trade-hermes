@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when generating paper-only Binance USDS-M futures trend-following decisions from free public K-line data with >=1h intervals, ATR harvesting, and no paid APIs.
-version: 0.1.0
+version: 0.2.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -22,7 +22,7 @@ This project Skill supports paper-only Binance USDS-M futures decision generatio
 - never use short intervals below 1h;
 - prefer staying with the main trend, avoiding premature exits, and harvesting in tranches.
 
-The initial implementation is deliberately conservative: it emits a structured `paper` decision only; it never sends signed orders.
+The implementation is deliberately conservative: it emits a structured `paper` decision only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter.
 
 ## When to Use
 
@@ -56,10 +56,13 @@ Output is JSON:
 - `generated_at_utc`: ISO timestamp in UTC;
 - `generated_at_beijing`: ISO timestamp in Beijing time (UTC+8);
 - `ema50`, `ema200`, `atr14`: trend/risk indicators;
+- `confidence_score`: v0.2 public-factor confidence multiplier;
+- `factor_flags`: diagnostic flags from mark trend, funding, open interest, long/short, and taker flow;
+- `market_context`: fetched free public USDS-M context factors;
 - `take_profit_1`, `take_profit_2`: ATR tranche harvesting references;
 - `trailing_stop`: ATR trailing stop reference.
 
-## Decision Logic v0.1
+## Decision Logic v0.2
 
 1. Validate symbol is in the configured trade universe.
 2. Validate interval is >=1h; reject `1m`, `3m`, `5m`, `10m`, `15m`, `30m`.
@@ -69,21 +72,32 @@ Output is JSON:
 https://fapi.binance.com/fapi/v1/klines
 ```
 
-4. Require at least 200 candles.
-5. Compute:
+4. Optionally fetch v0.2 public context factors from free Binance USDS-M endpoints:
+
+```text
+/fapi/v1/markPriceKlines
+/fapi/v1/fundingRate
+/futures/data/openInterestHist
+/futures/data/globalLongShortAccountRatio
+/futures/data/takerlongshortRatio
+```
+
+5. Require at least 200 K-line candles.
+6. Compute:
    - EMA50;
    - EMA200;
    - ATR14.
-6. Main trend filter:
+7. Main trend filter:
    - `close > EMA200`;
    - `EMA50 > EMA200`.
-7. If the filter passes:
+8. If the filter passes:
    - action: `hold_long`;
    - take-profit 1: close + 2 * ATR14;
    - take-profit 2: close + 4 * ATR14;
    - trailing stop: close - 3 * ATR14;
-   - if price is extended > 4 ATR above EMA50, reduce paper size to 0.5 risk unit, not full exit.
-8. If the filter fails:
+   - if price is extended > 4 ATR above EMA50, reduce paper size to 0.5 risk unit, not full exit;
+   - v0.2 context factors adjust `confidence_score` / `position_size`, not the trend participation decision.
+9. If the filter fails:
    - action: `flat`;
    - size: 0.
 
@@ -99,8 +113,11 @@ The test suite verifies:
 
 - short intervals are rejected;
 - >=1h intervals are accepted;
+- short public-factor periods are rejected;
 - synthetic strong uptrend produces `hold_long`;
-- synthetic downtrend produces `flat`.
+- synthetic downtrend produces `flat`;
+- v0.2 public context factors adjust confidence/size without forcing premature trend exits;
+- v0.2 context fetch uses free Binance USDS-M endpoints.
 
 ## Verification Recipe
 
@@ -132,10 +149,15 @@ scripts/binance_usds_futures_trend.py --symbol BTCUSDT --interval 1h --limit 240
 4. **Over-exiting trends.** The baseline reduces size when extended but does not flip to flat while the major trend filter remains valid.
 5. **Omitting timezone labels.** Any run output or report must include UTC or Beijing time (UTC+8) labels.
 
+## References
+
+- `references/binance-skills-hub-usds-futures.md` — concise notes from the local Binance Skills Hub checkout, including USDS-M Futures endpoints/factors useful for v0.2.
+
 ## Roadmap
 
 - Add multi-symbol batch scan for the configured universe.
 - Add higher-timeframe agreement, e.g. 4h + 1d trend filter.
+- Add free Binance USDS-M factors from the local Binance Skills Hub reference: mark-price Kline, funding, open interest, long/short ratios, taker buy/sell volume, and premium index Kline.
 - Add volatility targeting and max portfolio risk constraints.
 - Add paper state persistence under a tracked or intentionally ignored path after policy review.
 - Only after long paper validation: design a separate live execution Skill with Binance testnet-first signed requests.
