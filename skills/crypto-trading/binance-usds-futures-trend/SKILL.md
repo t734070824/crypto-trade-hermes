@@ -230,6 +230,7 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 4. **Confusing paper decisions with execution.** This Skill does not place orders. Live trading needs a separate signed-execution workflow, risk cap, kill switch, and testnet-first validation.
 5. **Over-exiting trends.** The baseline reduces size when extended but does not flip to flat while the major trend filter remains valid.
 6. **Omitting timezone labels.** Any run output or report must include UTC or Beijing time (UTC+8) labels.
+7. **Breaking portfolio-output compatibility while adding explainability.** When adding richer allocation diagnostics, keep simple legacy fields such as `skipped_symbols` and add structured detail alongside them (for example `skipped_details`) rather than replacing them; update tests to prove both compatibility and the new explanations.
 
 ## References
 
@@ -246,11 +247,16 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 
 ## Roadmap
 
-- Refine higher-timeframe agreement scoring.
-- Add paper state persistence under a tracked or intentionally ignored path after policy review.
-- Add free Binance USDS-M factors from the local Binance Skills Hub reference: premium index Kline and any missing context factors that remain free/public.
-- Add scheduled scans and Telegram briefings.
-- Only after long paper validation: design a separate live execution Skill with Binance testnet-first signed requests.
+Canonical tracked roadmap: `plans/binance-usds-futures-roadmap.md`.
+
+Default sequence unless the user explicitly reprioritizes:
+
+1. v0.7 paper state persistence.
+2. v0.8 scheduled scans and Telegram briefings.
+3. v0.9 historical backtest framework.
+4. v1.0 evidence-based strategy refinement, including higher-timeframe scoring and additional free public factors.
+5. v1.1 paper trading lifecycle.
+6. v2.0 separate Binance testnet execution Skill only after long paper validation.
 
 ## Verification Checklist
 
