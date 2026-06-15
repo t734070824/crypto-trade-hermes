@@ -37,6 +37,7 @@ Hard constraints for this profile:
 - never use intervals below `1h` (`1m`, `3m`, `5m`, `10m`, `15m`, `30m` are invalid);
 - all time-related output must label UTC or 北京时间（UTC+8）;
 - strategy preference: stay with the main trend, avoid premature exits, and harvest in tranches;
+- runtime data must be recorded during operation so future strategy changes can be evaluated against real paper/testnet/live evidence;
 - target: seek CAGR 30%, pursue CAGR 100%, but never present paper/backtest output as achieved live returns;
 - Binance auth secrets are in the active profile `.env` as `LALA_KEY` and `LALA_SECRET`; never expose values.
 
@@ -74,9 +75,11 @@ Future work should converge on these components:
    - `PaperBroker`: simulated fills, fees, slippage, balances;
    - `BinanceTestnetBroker`: signed Binance futures testnet execution;
    - `BinanceLiveBroker`: signed live execution behind stricter gates.
-9. `Observability` — compact Telegram reports and logs around the same trading loop, not a separate decision path.
+9. `RuntimeRecorder` — records run inputs, signals, decisions, risk checks, orders, fills, state transitions, errors, and performance snapshots for later evaluation.
+10. `StrategyEvolution` — compares future strategy variants against recorded runtime evidence before promoting changes.
+11. `Observability` — compact Telegram reports and logs around the same trading loop, not a separate decision path.
 
-Architectural invariant: paper/testnet/live must share strategy, risk, lifecycle, state, and execution orchestration. Divergence belongs only inside broker adapters and environment config.
+Architectural invariant: paper/testnet/live must share strategy, risk, lifecycle, state, execution orchestration, and runtime data schema. Divergence belongs only inside broker adapters and environment config.
 
 ## Current Capabilities
 
@@ -215,6 +218,7 @@ Important files:
 State-file rules:
 
 - runtime state belongs under ignored `state/*.json`;
+- runtime datasets for strategy evolution must be append-only or reproducibly versioned, with UTC and 北京时间（UTC+8） timestamps;
 - tests should use temp directories;
 - do not commit live runtime account/order/fill state;
 - future testnet/live state must include environment markers and remain isolated from paper state.
@@ -226,12 +230,14 @@ Current priority is documentation and architecture alignment, then implementatio
 1. Keep existing scanner/lifecycle/backtest code stable as paper-only diagnostics.
 2. Reframe the scanner as `SignalEngine`, not the whole trading engine.
 3. Design shared realtime interfaces: `Strategy`, `RiskManager`, `PortfolioState`, `LifecycleManager`, `ExecutionEngine`, `BrokerAdapter`.
-4. Implement `PaperBroker` and run the same trading loop against simulated fills.
-5. Add Binance futures testnet adapter using signed endpoints and isolated testnet credentials/config.
-6. Add live adapter only after testnet validation, explicit risk caps, kill switch, audit logs, and user approval.
-7. Keep Telegram output as observability around the real trading loop, not as the source of trading state.
+4. Design the runtime data schema before implementing the first trading loop, including signals, decisions, risk checks, fills, state transitions, errors, and performance snapshots.
+5. Implement `PaperBroker` and run the same trading loop against simulated fills while recording runtime evidence.
+6. Add Binance futures testnet adapter using signed endpoints and isolated testnet credentials/config.
+7. Add live adapter only after testnet validation, explicit risk caps, kill switch, audit logs, runtime evidence review, and user approval.
+8. Keep Telegram output as observability around the real trading loop, not as the source of trading state.
+9. Use recorded runtime data to evaluate and evolve future strategy variants before promotion.
 
-Do not add more report-only paper features unless they directly support the shared realtime engine or diagnostics around it.
+Do not add more report-only paper features unless they directly support the shared realtime engine, runtime data collection, strategy evolution, or diagnostics around it.
 
 ## Verification Recipe
 
@@ -287,6 +293,7 @@ Confirm:
 10. **Skipping independent review before push.** This repo requires an independent agent review before every push.
 11. **Forgetting timezone labels.** Any time-related output or report must explicitly label UTC or 北京时间（UTC+8）.
 12. **Mixing environments.** Future paper, testnet, and live adapters must isolate credentials, balances, order IDs, fills, and state files while sharing core interfaces.
+13. **Failing to preserve runtime evidence.** Strategy evolution must be based on recorded run data, not subjective impressions from Telegram summaries or isolated backtests.
 
 ## References
 
@@ -318,6 +325,7 @@ Tracked plans:
 - [ ] Commands use intervals `>=1h`.
 - [ ] UTC and 北京时间（UTC+8） requirements are preserved.
 - [ ] No paid API or secret value is required.
+- [ ] Runtime data recording and strategy-evolution evidence requirements are preserved.
 - [ ] Runtime state stays ignored.
 - [ ] Tests and/or appropriate documentation validation ran.
 - [ ] Independent agent review passed before push.
