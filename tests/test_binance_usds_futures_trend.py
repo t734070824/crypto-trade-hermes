@@ -548,6 +548,177 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertNotRegex(content, r"(1m|5m|10m|15m|30m)")
         self.assertNotRegex(content.lower(), r"(api_key|secret|password|token)=")
 
+    def _backtest_candles(self, start=100.0, steps=None):
+        if steps is None:
+            steps = [0.4] * 120 + [-0.2] * 60 + [0.5] * 120
+        candles = []
+        price = float(start)
+        for index, step in enumerate(steps):
+            open_price = price
+            close_price = max(1.0, price + float(step))
+            high = max(open_price, close_price) + 0.7
+            low = min(open_price, close_price) - 0.5
+            candles.append(
+                {
+                    "open_time": index * 3_600_000,
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": close_price,
+                    "volume": 1000.0,
+                    "close_time": (index + 1) * 3_600_000 - 1,
+                }
+            )
+            price = close_price
+        return candles
+
+    def test_backtest_symbol_outputs_paper_metrics_with_timezone_labels(self):
+        candles = self._backtest_candles()
+
+        result = trend.backtest_symbol(candles, symbol="BTCUSDT", interval="1h", initial_equity=10_000)
+
+        self.assertEqual(result["mode"], "paper")
+        self.assertEqual(result["symbol"], "BTCUSDT")
+        self.assertEqual(result["interval"], "1h")
+        self.assertIn("generated_at_utc", result)
+        self.assertIn("generated_at_beijing", result)
+        self.assertIn("paper only", result["summary_zh"])
+        metrics = result["metrics"]
+        for key in [
+            "cagr",
+            "max_drawdown",
+            "calmar",
+            "sharpe",
+            "win_rate",
+            "average_holding_candles",
+            "turnover",
+            "total_return",
+        ]:
+            self.assertIn(key, metrics)
+        self.assertGreater(result["bars_processed"], 0)
+        self.assertGreater(len(result["equity_curve"]), 0)
+        self.assertEqual(result["errors_count"], 0)
+        self.assertEqual(result["per_symbol_contribution"]["BTCUSDT"], metrics["total_return"])
+        self.assertNotRegex(json.dumps(result).lower(), r"(api_key|secret|signed|live_order|order_id)")
+
+    def test_backtest_rejects_short_interval_and_insufficient_history(self):
+        candles = self._backtest_candles()
+        with self.assertRaises(ValueError):
+            trend.backtest_symbol(candles, symbol="BTCUSDT", interval="30m")
+        with self.assertRaises(ValueError):
+            trend.backtest_symbol(candles[:200], symbol="BTCUSDT", interval="1h")
+
+    def test_backtest_symbols_aggregates_per_symbol_contribution_and_errors(self):
+        candle_map = {
+            "BTCUSDT": self._backtest_candles(100, [0.5] * 260),
+            "SOLUSDT": self._backtest_candles(50, [0.25] * 260),
+        }
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: candle_map[symbol])
+        try:
+            result = trend.backtest_symbols(["BTCUSDT", "SOLUSDT"], interval="4h", limit=260, initial_equity=10_000)
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
+        self.assertEqual(result["mode"], "paper")
+        self.assertEqual(result["interval"], "4h")
+        self.assertEqual(result["universe_count"], 2)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["errors_count"], 0)
+        self.assertEqual(set(result["per_symbol_contribution"]), {"BTCUSDT", "SOLUSDT"})
+        self.assertAlmostEqual(
+            sum(result["per_symbol_contribution"].values()),
+            result["metrics"]["total_return"],
+            places=7,
+        )
+        self.assertEqual([item["symbol"] for item in result["symbol_results"]], ["BTCUSDT", "SOLUSDT"])
+        self.assertIn("CAGR", result["summary_zh"])
+        self.assertIn("北京时间（UTC+8）", result["summary_zh"])
+
+    def test_backtest_aggregate_metrics_use_combined_portfolio_equity_curve(self):
+        symbol_results = [
+            {
+                "symbol": "BTCUSDT",
+                "metrics": {"initial_equity": 100.0, "final_equity": 160.0, "turnover": 1.0},
+                "equity_curve": [{"close_time": 1, "equity": 100.0}, {"close_time": 2, "equity": 160.0}],
+                "trades": [{"return": 0.6, "holding_candles": 2}],
+            },
+            {
+                "symbol": "ETHUSDT",
+                "metrics": {"initial_equity": 300.0, "final_equity": 300.0, "turnover": 0.0},
+                "equity_curve": [{"close_time": 1, "equity": 300.0}, {"close_time": 2, "equity": 300.0}],
+                "trades": [],
+            },
+        ]
+
+        metrics = trend._aggregate_backtest_metrics(symbol_results, "1d")
+        contribution = trend._per_symbol_contribution(symbol_results)
+
+        self.assertEqual(metrics["initial_equity"], 400.0)
+        self.assertEqual(metrics["final_equity"], 460.0)
+        self.assertEqual(metrics["total_return"], 0.15)
+        self.assertEqual(sum(contribution.values()), metrics["total_return"])
+        self.assertNotEqual(metrics["total_return"], 0.3)
+
+    def test_backtest_aggregate_uses_common_timestamps_for_unequal_histories(self):
+        symbol_results = [
+            {
+                "symbol": "BTCUSDT",
+                "metrics": {"initial_equity": 100.0, "final_equity": 130.0, "turnover": 0.0},
+                "equity_curve": [
+                    {"close_time": 1, "equity": 100.0},
+                    {"close_time": 2, "equity": 120.0},
+                    {"close_time": 3, "equity": 130.0},
+                ],
+                "trades": [],
+            },
+            {
+                "symbol": "ETHUSDT",
+                "metrics": {"initial_equity": 300.0, "final_equity": 330.0, "turnover": 0.0},
+                "equity_curve": [
+                    {"close_time": 2, "equity": 300.0},
+                    {"close_time": 3, "equity": 330.0},
+                ],
+                "trades": [],
+            },
+        ]
+
+        metrics = trend._aggregate_backtest_metrics(symbol_results, "1d")
+        contribution = trend._per_symbol_contribution(symbol_results)
+
+        self.assertEqual(metrics["final_equity"], 460.0)
+        self.assertEqual(metrics["total_return"], 0.15)
+        self.assertEqual(round(sum(contribution.values()), 8), metrics["total_return"])
+
+    def test_backtest_fee_impacts_periodic_return_metrics(self):
+        candles = self._backtest_candles(100, [0.5] * 260)
+
+        no_fee = trend.backtest_symbol(candles, symbol="BTCUSDT", interval="1h", fee_bps=0)
+        high_fee = trend.backtest_symbol(candles, symbol="BTCUSDT", interval="1h", fee_bps=1_000)
+
+        self.assertLess(high_fee["metrics"]["final_equity"], no_fee["metrics"]["final_equity"])
+        self.assertLess(high_fee["metrics"]["sharpe"], no_fee["metrics"]["sharpe"])
+
+    def test_main_can_emit_backtest_json_without_context_or_orders(self):
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: self._backtest_candles(100, [0.5] * 260))
+        try:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = trend.main(["--backtest", "--symbols", "BTCUSDT", "--interval", "1h", "--limit", "260"])
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["backtest"]["mode"], "paper")
+        self.assertIn("generated_at_utc", payload["backtest"])
+        self.assertIn("generated_at_beijing", payload["backtest"])
+        self.assertEqual(payload["backtest"]["errors_count"], 0)
+        self.assertIn("paper only", payload["backtest"]["summary_zh"])
+        self.assertNotRegex(stdout.getvalue().lower(), r"(api_key|secret|signed|live_order|order_id)")
+
     def test_fetch_market_context_uses_free_usds_futures_endpoints(self):
         calls = []
 

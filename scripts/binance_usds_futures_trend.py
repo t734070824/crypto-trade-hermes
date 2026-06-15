@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import tempfile
 import urllib.parse
@@ -681,6 +682,354 @@ def apply_paper_state(
     return updated
 
 
+def _interval_hours(interval: str) -> float:
+    validated = validate_interval(interval)
+    unit = validated[-1]
+    amount = int(validated[:-1])
+    if unit == "h":
+        return float(amount)
+    if unit == "d":
+        return float(amount * 24)
+    if unit == "w":
+        return float(amount * 24 * 7)
+    if unit == "M":
+        return float(amount * 24 * 30)
+    raise ValueError(f"unsupported interval for backtest annualization: {interval}")
+
+
+def _annual_periods(interval: str) -> float:
+    return 365.0 * 24.0 / _interval_hours(interval)
+
+
+def _max_drawdown(equity_values: list[float]) -> float:
+    if not equity_values:
+        return 0.0
+    peak = equity_values[0]
+    worst = 0.0
+    for value in equity_values:
+        peak = max(peak, value)
+        if peak > 0:
+            worst = min(worst, value / peak - 1.0)
+    return round(worst, 8)
+
+
+def _sharpe(periodic_returns: list[float], interval: str) -> float:
+    if len(periodic_returns) < 2:
+        return 0.0
+    mean_return = sum(periodic_returns) / len(periodic_returns)
+    variance = sum((item - mean_return) ** 2 for item in periodic_returns) / (len(periodic_returns) - 1)
+    if variance <= 0:
+        return 0.0
+    return round((mean_return / math.sqrt(variance)) * math.sqrt(_annual_periods(interval)), 8)
+
+
+def _performance_metrics(
+    equity_values: list[float],
+    periodic_returns: list[float],
+    interval: str,
+    initial_equity: float,
+    trades: list[dict[str, Any]],
+    total_turnover: float,
+) -> dict[str, float]:
+    final_equity = equity_values[-1] if equity_values else initial_equity
+    total_return = final_equity / initial_equity - 1.0
+    periods = max(len(periodic_returns), 1)
+    years = max(periods / _annual_periods(interval), 1e-12)
+    cagr = (final_equity / initial_equity) ** (1.0 / years) - 1.0 if final_equity > 0 else -1.0
+    max_dd = _max_drawdown([initial_equity, *equity_values])
+    calmar = 0.0 if max_dd == 0 else cagr / abs(max_dd)
+    wins = [trade for trade in trades if float(trade.get("return", 0.0)) > 0]
+    win_rate = 0.0 if not trades else len(wins) / len(trades)
+    avg_holding = 0.0 if not trades else sum(float(trade.get("holding_candles", 0.0)) for trade in trades) / len(trades)
+    return {
+        "initial_equity": round(initial_equity, 8),
+        "final_equity": round(final_equity, 8),
+        "total_return": round(total_return, 8),
+        "cagr": round(cagr, 8),
+        "max_drawdown": max_dd,
+        "calmar": round(calmar, 8),
+        "sharpe": _sharpe(periodic_returns, interval),
+        "win_rate": round(win_rate, 8),
+        "average_holding_candles": round(avg_holding, 8),
+        "turnover": round(total_turnover, 8),
+    }
+
+
+def _build_backtest_summary_zh(backtest: dict[str, Any]) -> str:
+    metrics = backtest.get("metrics") or {}
+    lines = [
+        "Binance USDS-M 历史回测（paper only）",
+        f"UTC: {backtest.get('generated_at_utc')}",
+        f"北京时间（UTC+8）: {backtest.get('generated_at_beijing')}",
+        f"周期: {backtest.get('interval')}; universe={backtest.get('universe_count', 1)}; bars={backtest.get('bars_processed', 0)}",
+        "指标: "
+        f"CAGR={metrics.get('cagr', 0.0)}; "
+        f"max_drawdown={metrics.get('max_drawdown', 0.0)}; "
+        f"Calmar={metrics.get('calmar', 0.0)}; "
+        f"Sharpe={metrics.get('sharpe', 0.0)}; "
+        f"win_rate={metrics.get('win_rate', 0.0)}; "
+        f"turnover={metrics.get('turnover', 0.0)}",
+        "安全: paper only；未下真实订单；未使用收费 API。",
+    ]
+    return "\n".join(lines)
+
+
+def backtest_symbol(
+    candles: list[dict[str, float]],
+    symbol: str,
+    interval: str,
+    initial_equity: float = 10_000.0,
+    fee_bps: float = 4.0,
+    max_position_size: float = 1.0,
+) -> dict[str, Any]:
+    """Run a simple paper-only historical backtest for one symbol.
+
+    The simulation uses existing EMA/ATR paper decisions and applies the target long
+    exposure after each candle close, so no future candle is used to form the signal.
+    """
+    symbol = validate_symbol(symbol)
+    interval = validate_interval(interval)
+    if len(candles) <= 200:
+        raise ValueError("at least 201 candles are required for historical backtest")
+    if initial_equity <= 0:
+        raise ValueError("initial_equity must be positive")
+    if fee_bps < 0:
+        raise ValueError("fee_bps must be non-negative")
+    if max_position_size <= 0:
+        raise ValueError("max_position_size must be positive")
+
+    equity = float(initial_equity)
+    current_position = 0.0
+    entry_equity: float | None = None
+    holding_candles = 0
+    total_turnover = 0.0
+    periodic_returns: list[float] = []
+    equity_curve: list[dict[str, Any]] = []
+    trades: list[dict[str, Any]] = []
+
+    for index in range(200, len(candles)):
+        previous_close = float(candles[index - 1]["close"])
+        close = float(candles[index]["close"])
+        before_period_equity = equity
+        if current_position > 0 and previous_close > 0:
+            equity *= 1.0 + current_position * (close / previous_close - 1.0)
+            holding_candles += 1
+
+        decision = decide(candles[: index + 1], symbol, interval, risk_unit=1.0, market_context=None)
+        target_position = 0.0
+        if decision.get("action") == "hold_long":
+            target_position = min(float(decision.get("position_size") or 0.0), float(max_position_size))
+        position_delta = target_position - current_position
+        if abs(position_delta) > 1e-12:
+            fee = equity * abs(position_delta) * float(fee_bps) / 10_000.0
+            equity -= fee
+            total_turnover += abs(position_delta)
+            if current_position <= 0 < target_position:
+                entry_equity = equity
+                holding_candles = 0
+            elif current_position > 0 and target_position <= 0:
+                trade_return = 0.0 if not entry_equity else equity / entry_equity - 1.0
+                trades.append(
+                    {
+                        "symbol": symbol,
+                        "return": round(trade_return, 8),
+                        "holding_candles": holding_candles,
+                        "exit_index": index,
+                        "status": "closed",
+                    }
+                )
+                entry_equity = None
+                holding_candles = 0
+        current_position = target_position
+        periodic_returns.append(0.0 if before_period_equity <= 0 else equity / before_period_equity - 1.0)
+        equity_curve.append(
+            {
+                "index": index,
+                "open_time": candles[index].get("open_time"),
+                "close_time": candles[index].get("close_time"),
+                "close": round(close, 8),
+                "equity": round(equity, 8),
+                "position_size": round(current_position, 8),
+                "action": decision.get("action"),
+            }
+        )
+
+    if current_position > 0 and entry_equity:
+        trades.append(
+            {
+                "symbol": symbol,
+                "return": round(equity / entry_equity - 1.0, 8),
+                "holding_candles": holding_candles,
+                "exit_index": len(candles) - 1,
+                "status": "open_at_end",
+            }
+        )
+
+    metrics = _performance_metrics(
+        [item["equity"] for item in equity_curve],
+        periodic_returns,
+        interval,
+        float(initial_equity),
+        trades,
+        total_turnover,
+    )
+    result: dict[str, Any] = {
+        "mode": "paper",
+        **now_stamps(),
+        "symbol": symbol,
+        "interval": interval,
+        "strategy": "ema50_ema200_atr_trend_paper",
+        "bars_processed": len(equity_curve),
+        "fee_bps": round(float(fee_bps), 8),
+        "max_position_size": round(float(max_position_size), 8),
+        "metrics": metrics,
+        "trades": trades,
+        "equity_curve": equity_curve,
+        "per_symbol_contribution": {symbol: metrics["total_return"]},
+        "errors": [],
+        "errors_count": 0,
+    }
+    result["summary_zh"] = _build_backtest_summary_zh(result)
+    return result
+
+
+def _aligned_equity_maps(symbol_results: list[dict[str, Any]]) -> tuple[list[Any], list[dict[Any, float]]]:
+    """Return common close_time values and per-symbol equity maps for portfolio aggregation."""
+    equity_maps: list[dict[Any, float]] = []
+    common_times: set[Any] | None = None
+    for result in symbol_results:
+        mapping: dict[Any, float] = {}
+        for point in result.get("equity_curve", []):
+            timestamp = point.get("close_time")
+            if timestamp is None:
+                continue
+            mapping[timestamp] = float(point["equity"])
+        equity_maps.append(mapping)
+        timestamps = set(mapping)
+        common_times = timestamps if common_times is None else common_times & timestamps
+    return sorted(common_times or []), equity_maps
+
+
+def _per_symbol_contribution(symbol_results: list[dict[str, Any]]) -> dict[str, float]:
+    common_times, equity_maps = _aligned_equity_maps(symbol_results)
+    total_initial_equity = sum(float(item["metrics"].get("initial_equity", 0.0)) for item in symbol_results)
+    if total_initial_equity <= 0 or not common_times:
+        return {item["symbol"]: 0.0 for item in symbol_results}
+    final_time = common_times[-1]
+    contributions: dict[str, float] = {}
+    for result, equity_map in zip(symbol_results, equity_maps):
+        initial = float(result["metrics"].get("initial_equity", 0.0))
+        aligned_final = float(equity_map[final_time])
+        contributions[result["symbol"]] = round((aligned_final - initial) / total_initial_equity, 8)
+    return contributions
+
+
+def _aggregate_backtest_metrics(symbol_results: list[dict[str, Any]], interval: str) -> dict[str, float]:
+    if not symbol_results:
+        return {
+            "initial_equity": 0.0,
+            "final_equity": 0.0,
+            "total_return": 0.0,
+            "cagr": 0.0,
+            "max_drawdown": 0.0,
+            "calmar": 0.0,
+            "sharpe": 0.0,
+            "win_rate": 0.0,
+            "average_holding_candles": 0.0,
+            "turnover": 0.0,
+        }
+    initial_equity = sum(float(item["metrics"].get("initial_equity", 0.0)) for item in symbol_results)
+    common_times, equity_maps = _aligned_equity_maps(symbol_results)
+    if initial_equity <= 0 or not common_times:
+        return {
+            "initial_equity": round(initial_equity, 8),
+            "final_equity": round(initial_equity, 8),
+            "total_return": 0.0,
+            "cagr": 0.0,
+            "max_drawdown": 0.0,
+            "calmar": 0.0,
+            "sharpe": 0.0,
+            "win_rate": 0.0,
+            "average_holding_candles": 0.0,
+            "turnover": 0.0,
+        }
+
+    combined_equity_values = [
+        sum(float(equity_map[timestamp]) for equity_map in equity_maps)
+        for timestamp in common_times
+    ]
+    periodic_returns: list[float] = []
+    previous_equity = initial_equity
+    for equity in combined_equity_values:
+        periodic_returns.append(0.0 if previous_equity <= 0 else equity / previous_equity - 1.0)
+        previous_equity = equity
+
+    trades = [trade for item in symbol_results for trade in item.get("trades", [])]
+    total_turnover = sum(float(item["metrics"].get("turnover", 0.0)) for item in symbol_results)
+    return _performance_metrics(
+        combined_equity_values,
+        periodic_returns,
+        interval,
+        initial_equity,
+        trades,
+        total_turnover,
+    )
+
+
+def backtest_symbols(
+    symbols: list[str] | tuple[str, ...] | None = None,
+    interval: str = "1h",
+    limit: int = 500,
+    initial_equity: float = 10_000.0,
+    fee_bps: float = 4.0,
+    max_position_size: float = 1.0,
+    base_url: str = BINANCE_FAPI_BASE,
+) -> dict[str, Any]:
+    """Fetch free K-lines and run paper-only historical backtests for symbols."""
+    interval = validate_interval(interval)
+    selected_symbols = list(DEFAULT_SYMBOLS if symbols is None else symbols)
+    selected_symbols = [validate_symbol(symbol) for symbol in selected_symbols]
+    if limit <= 200:
+        raise ValueError("backtest limit must be greater than 200")
+
+    symbol_results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for symbol in selected_symbols:
+        try:
+            candles = fetch_klines(symbol, interval, limit, base_url)
+            symbol_results.append(
+                backtest_symbol(
+                    candles,
+                    symbol=symbol,
+                    interval=interval,
+                    initial_equity=initial_equity,
+                    fee_bps=fee_bps,
+                    max_position_size=max_position_size,
+                )
+            )
+        except Exception as exc:
+            errors.append({"symbol": symbol, "error": str(exc)})
+
+    metrics = _aggregate_backtest_metrics(symbol_results, interval)
+    per_symbol_contribution = _per_symbol_contribution(symbol_results)
+    backtest: dict[str, Any] = {
+        "mode": "paper",
+        **now_stamps(),
+        "interval": interval,
+        "universe_count": len(selected_symbols),
+        "symbols_tested": [item["symbol"] for item in symbol_results],
+        "bars_processed": sum(int(item.get("bars_processed", 0)) for item in symbol_results),
+        "strategy": "ema50_ema200_atr_trend_paper",
+        "metrics": metrics,
+        "per_symbol_contribution": per_symbol_contribution,
+        "symbol_results": symbol_results,
+        "errors": errors,
+        "errors_count": len(errors),
+    }
+    backtest["summary_zh"] = _build_backtest_summary_zh(backtest)
+    return backtest
+
+
 def build_scan_summary_zh(scan: dict[str, Any]) -> str:
     """Build a compact Chinese report with explicit UTC and Beijing time labels."""
     top_n = scan.get("top_n", 0)
@@ -886,6 +1235,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-file", help="Optional v0.7 paper scan state JSON path; scan mode only")
     parser.add_argument("--no-save-state", action="store_true", help="Compute v0.7 state_change without writing --state-file")
     parser.add_argument("--telegram-brief", action="store_true", help="Emit a compact v0.8 Telegram briefing instead of full JSON; scan mode only")
+    parser.add_argument("--backtest", action="store_true", help="Run v0.9 paper-only historical backtest instead of current scan/decision")
+    parser.add_argument("--initial-equity", type=float, default=10_000.0, help="Paper initial equity per symbol for backtest")
+    parser.add_argument("--fee-bps", type=float, default=4.0, help="Paper transaction fee in basis points for backtest turnover")
+    parser.add_argument("--max-position-size", type=float, default=1.0, help="Max paper long exposure per symbol for backtest")
     return parser
 
 
@@ -893,6 +1246,29 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     try:
+        if args.backtest:
+            if args.state_file:
+                raise ValueError("--state-file is for scan state only; omit it for --backtest")
+            if args.telegram_brief:
+                raise ValueError("--telegram-brief is for scan briefings only; omit it for --backtest")
+            if args.all_symbols:
+                symbols = None
+            elif args.symbols:
+                symbols = [part.strip().upper() for part in args.symbols.split(",") if part.strip()]
+            else:
+                symbols = [args.symbol.upper()]
+            backtest = backtest_symbols(
+                symbols=symbols,
+                interval=args.interval,
+                limit=args.limit,
+                initial_equity=args.initial_equity,
+                fee_bps=args.fee_bps,
+                max_position_size=args.max_position_size,
+                base_url=args.base_url,
+            )
+            print(json.dumps({"ok": not bool(backtest["errors"]), "backtest": backtest}, ensure_ascii=False, indent=2))
+            return 0 if not backtest["errors"] else 1
+
         if args.all_symbols or args.symbols:
             symbols = None if args.all_symbols else [part.strip().upper() for part in args.symbols.split(",") if part.strip()]
             intervals = None if not args.intervals else [part.strip() for part in args.intervals.split(",") if part.strip()]

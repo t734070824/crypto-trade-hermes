@@ -69,6 +69,20 @@ Never place live orders, never use paid APIs, never print secrets, and do not cr
 - Briefing should be compact; avoid raw full JSON in Telegram.
 - `--telegram-brief` is scan-mode only (`--all-symbols` or `--symbols`).
 
+## Cron Config Hygiene
+
+When a Hermes cron job is created and manually run, `cron/jobs.json` can contain runtime metadata and delivery internals. Before staging/pushing scheduled trading changes:
+
+- Use `deliver: "telegram"` for the home Telegram target when possible; avoid committing origin-specific `chat_id`, chat name, or thread metadata.
+- If Hermes persists an `origin` block after a manual run, remove that block from the tracked JSON only after confirming `deliver` is still set and `cronjob list` can still load the job.
+- Ignore runtime artifacts such as `cron/output/` and editor swap files (`cron/*.swp`); do not commit manual-run output transcripts.
+- Keep the cron script path relative to the profile script directory for Hermes no-agent jobs, e.g. `script: "binance_usds_futures_trend_brief.sh"`.
+- Record `last_status=ok` / next-run timestamps in the final user report, but do not rely on runtime status fields as source code semantics.
+
+## Review and Push Gate
+
+For this repository, push only after an independent agent reviews the staged diff. A useful fail-closed reviewer prompt should require JSON with `passed`, `security_concerns`, `logic_errors`, and `suggestions`, and should force `passed=false` when security or logic lists are non-empty. Include scanner-specific blockers: secrets/chat IDs, live/signed trading, paid API use, `<1h` defaults, recursive cron scheduling, raw JSON spam, and committed runtime outputs.
+
 ## Verification Checklist
 
 1. RED: tests fail before `build_telegram_briefing_zh` and `--telegram-brief` exist.

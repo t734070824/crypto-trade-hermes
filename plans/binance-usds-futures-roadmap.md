@@ -95,7 +95,9 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 - 可手动 run cron job 验证输出。
 - Telegram 简报不泄露密钥，不包含过长 JSON。
 
-### v0.9 — Historical Backtest Framework
+### v0.9 — Historical Backtest Framework ✅
+
+**Status:** implemented in current v0.9 change set: paper-only historical backtest framework, CLI `--backtest`, synthetic fixture tests, and real free-data verification path.
 
 **Goal:** 用历史数据评估策略是否接近 CAGR 30% / 追求 CAGR 100%。
 
@@ -168,9 +170,9 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 ## Default Next Step
 
-当前默认下一步：**v0.9 Historical Backtest Framework**。
+当前默认下一步：**v1.0 Strategy Refinement from Evidence**。
 
-除非用户明确改变优先级，否则后续继续按本文件顺序推进：v0.9 → v1.0 → v1.1 → v2.0。
+除非用户明确改变优先级，否则后续继续按本文件顺序推进：v1.0 → v1.1 → v2.0。
 
 ## Stop Conditions
 
