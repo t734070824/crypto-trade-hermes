@@ -14,4 +14,5 @@ exec scripts/binance_usds_futures_trend.py \
   --portfolio-risk-budget 3 \
   --max-symbol-risk 1 \
   --state-file state/binance-usds-futures-trend-paper-state.json \
+  --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json \
   --telegram-brief

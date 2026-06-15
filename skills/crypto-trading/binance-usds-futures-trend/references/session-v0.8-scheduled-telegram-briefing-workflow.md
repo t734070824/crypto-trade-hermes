@@ -25,6 +25,7 @@ scripts/binance_usds_futures_trend.py \
   --portfolio-risk-budget 3 \
   --max-symbol-risk 1 \
   --state-file state/binance-usds-futures-trend-paper-state.json \
+  --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json \
   --telegram-brief
 ```
 
@@ -54,7 +55,7 @@ Use Hermes cron with a self-contained prompt. Do **not** recursively create cron
 ```text
 Run the Binance USDS-M futures paper scanner briefing from /root/.hermes/profiles/crypto-trade-hermes.
 Execute:
-scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --telegram-brief
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --telegram-brief
 Deliver the script stdout as the Telegram briefing.
 If the command fails, report the failure concisely with UTC and Beijing time (UTC+8).
 Never place live orders, never use paid APIs, never print secrets, and do not create/update/remove cron jobs from inside this run.
@@ -65,6 +66,7 @@ Never place live orders, never use paid APIs, never print secrets, and do not cr
 - Schedule must be >=1h cadence; default is every 4h.
 - Use only free Binance public endpoints.
 - Runtime state stays under ignored `state/*.json`.
+- For long-running paper scans, pair `--state-file` with `--lifecycle-file` so both scan state and per-symbol lifecycle persist across runs.
 - Do not expose `.env` values, API keys, or secrets.
 - Briefing should be compact; avoid raw full JSON in Telegram.
 - `--telegram-brief` is scan-mode only (`--all-symbols` or `--symbols`).

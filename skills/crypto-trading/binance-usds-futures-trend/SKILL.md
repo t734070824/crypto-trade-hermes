@@ -87,7 +87,7 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit
 Telegram briefing output for scheduled Hermes cron delivery:
 
 ```bash
-scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --telegram-brief
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --telegram-brief
 ```
 
 Paper lifecycle tracking for consecutive scans:
@@ -327,7 +327,7 @@ scripts/binance_usds_futures_trend.py --all-symbols --interval 1h --limit 240 --
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1
 scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json
-scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --telegram-brief
+scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 5 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --telegram-brief
 scripts/binance_usds_futures_trend.py --backtest --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 500
 scripts/binance_usds_futures_trend.py --compare-refinements --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 500
 scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 3 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --no-save-state --no-save-lifecycle
@@ -367,6 +367,8 @@ scripts/binance_usds_futures_trend_brief.sh
 12. **Overstating backtest/refinement results.** v0.9 backtests and v1.0 refinement comparisons are paper-only historical diagnostics. Report them as framework/evidence output, not live returns or proof that CAGR targets are achieved. Do not auto-promote a candidate into defaults without a separate reviewed change.
 13. **Creating no-op refinement variants.** A candidate that only raises `max_position_size` can be a no-op when `decide()` already returns smaller `position_size`. When adding refinement variants, make at least one tested parameter actually propagate into simulated exposure (for example `risk_unit`) and add a regression test proving candidate metrics/positions can differ from baseline.
 14. **Comparing variants on drifting samples.** Do not let baseline and candidates fetch live klines separately inside each variant loop. Fetch each symbol's candle sample once, reuse the same sample for every variant, and test fetch call counts so differences are strategy-driven rather than data-timing artifacts.
+15. **Trusting lifecycle files too much.** When extending v1.1 lifecycle handling, validate loaded lifecycle state lightly before treating it as previous paper state: require `mode=paper` and `positions_by_symbol` to be an object. Avoid carrying arbitrary unknown fields from local lifecycle JSON; rebuild stale/carried positions from an explicit whitelist so hand-edited or polluted runtime files do not keep propagating misleading data.
+16. **Adding no-op lifecycle flags.** If adding dry-run or lifecycle-related CLI flags, ensure they have an effect only in scan mode and either pair with `--lifecycle-file` or produce a clear error. Silent no-op flags make scheduled paper runs harder to audit.
 
 ## References
 

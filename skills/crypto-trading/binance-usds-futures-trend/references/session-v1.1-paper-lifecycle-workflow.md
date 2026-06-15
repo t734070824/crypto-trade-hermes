@@ -53,6 +53,14 @@ scripts/binance_usds_futures_trend.py --all-symbols --intervals 1h,4h,1d --lifec
 - Runtime lifecycle files should live under ignored `state/*.json`.
 - Report lifecycle as paper intent, never as live execution.
 
+## Review Follow-ups
+
+Independent review passed the v1.1 change, with non-blocking hardening suggestions for future lifecycle work:
+
+- Add light schema checks when loading lifecycle JSON: require `mode=paper` and object-like `positions_by_symbol` before treating it as a previous lifecycle.
+- When carrying stale positions, rebuild from a whitelist of lifecycle fields instead of copying `dict(previous_position)`, so hand-edited unknown fields do not propagate forever.
+- If new lifecycle dry-run flags are added, avoid silent no-ops; scan-mode-only flags should either require `--lifecycle-file` or emit a clear error.
+
 ## Tests Added
 
 - First run creates entry intent and persists snapshot.

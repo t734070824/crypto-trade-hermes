@@ -94,6 +94,11 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     trend.scan_symbols(["BTCUSDT"], interval="1h", top=top)
 
+    def test_brief_wrapper_persists_lifecycle_state(self):
+        script_text = CRON_BRIEF_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('--state-file state/binance-usds-futures-trend-paper-state.json', script_text)
+        self.assertIn('--lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json', script_text)
+
     def test_market_context_changes_confidence_not_trend_participation(self):
         candles = []
         price = 100.0
