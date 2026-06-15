@@ -10,4 +10,4 @@
 §
 交易数据周期偏好：不要使用 1min、5min、10min、30min 等短周期；至少使用大于等于 1h 的周期数据。
 §
-在 crypto-trade-hermes profile 中，任何可能修改已跟踪或可提交文件的操作（memory、skill_manage、write_file、patch、cron/home/hooks 文件生成等）之后，应先检查 git 状态；若出现符合仓库策略的变更，应提交并 push。
+在 crypto-trade-hermes profile 中，config.yaml、plan/、plans/ 已纳入仓库提交范围；任何可能修改已跟踪或可提交文件的操作（memory、skill_manage、write_file、patch、cron/home/hooks/plan/plans/config 文件生成或修改等）之后，应先检查 git 状态；若出现符合仓库策略的变更，应提交并 push。

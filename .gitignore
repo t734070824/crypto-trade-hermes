@@ -2,8 +2,9 @@
 # Default: ignore everything at repository root.
 /*
 
-# Keep Git metadata/rules and requested root document.
+# Keep Git metadata/rules, requested root documents, and profile config.
 !/.gitignore
+!/config.yaml
 !/SOUL.md
 !/soul.md
 
@@ -16,6 +17,10 @@
 !/memories/**
 !/cron/
 !/cron/**
+!/plan/
+!/plan/**
+!/plans/
+!/plans/**
 
 # Allow skills/ as a container so newly-created skill folders can be committed.
 !/skills/

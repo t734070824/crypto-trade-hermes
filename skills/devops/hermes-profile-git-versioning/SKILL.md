@@ -37,6 +37,7 @@ A Hermes profile contains live runtime state, logs, databases, caches, credentia
 
 # Keep repo metadata/rules and explicitly requested root files
 !/.gitignore
+!/config.yaml
 !/SOUL.md
 !/soul.md
 
@@ -49,6 +50,10 @@ A Hermes profile contains live runtime state, logs, databases, caches, credentia
 !/memories/**
 !/cron/
 !/cron/**
+!/plan/
+!/plan/**
+!/plans/
+!/plans/**
 
 # Allow skills/ as a container so newly-created skill folders can be committed
 !/skills/
@@ -74,6 +79,8 @@ git check-ignore -v .env || true
 git check-ignore -v skills/<existing-skill>/SKILL.md || true
 git check-ignore -v skills/<future-skill>/SKILL.md || true
 git check-ignore -v SOUL.md || true
+git check-ignore -v config.yaml || true
+git check-ignore -v plans/example.md || true
 git check-ignore -v cron/example.txt || true
 ```
 
@@ -95,7 +102,7 @@ git push -u origin main
 
 7. After any tool action that may change files in this profile, run a repository status check before replying.
 
-This includes `memory`, `skill_manage`, `write_file`, `patch`, generated cron/home/hooks files, or commands that create/update files. Do not assume only `memories/` changed.
+This includes `memory`, `skill_manage`, `write_file`, `patch`, generated cron/home/hooks files, or commands that create/update files. Do **not** narrow this to `memories/` only: user corrections in this repo showed that `skill_manage` can update newly-created tracked skill folders at the same time as memory changes.
 
 ```bash
 git status --short --branch
@@ -107,13 +114,14 @@ If there are changes allowed by the repository policy, commit and push them befo
 git add -A
 git status --short
 # verify the staged list contains only intended allowlisted paths:
-#   .gitignore, SOUL.md/soul.md, home/**, hooks/**, memories/**, cron/**,
+#   .gitignore, config.yaml, SOUL.md/soul.md, home/**, hooks/**,
+#   memories/**, cron/**, plan/**, plans/**,
 #   and newly-created skills/** folders that are not ignored.
 git commit -m "chore: update profile state"
 git push
 ```
 
-If unexpected files appear, inspect with `git status --short --ignored` and `git check-ignore -v <path>`; fix `.gitignore` or ask before committing. The user's default for git flows is to push after committing.
+Config note: in the crypto-trade-hermes profile, `config.yaml` is explicitly allowlisted and should be committed/pushed when intentionally changed, while `.env`, logs, databases, sessions, caches, pid/lock files, and live gateway state remain ignored. If unexpected files appear, inspect with `git status --short --ignored` and `git check-ignore -v <path>`; fix `.gitignore` or ask before committing. The user's default for git flows is to push after committing.
 
 If Git identity is missing, set repository-local identity, not global, unless the user requests a global identity.
 
@@ -132,3 +140,4 @@ git config user.email "hermes-agent@users.noreply.github.com"
 ## References
 
 - `references/selective-profile-repo.md` — example policy and verification notes from a profile-root repository setup.
+- `references/profile-config-visibility.md` — Hermes profile config keys for Telegram/gateway real-time tool progress and context-usage footer, plus the note that ignored `config.yaml` changes are local rather than pushed.
