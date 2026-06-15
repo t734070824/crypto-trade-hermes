@@ -166,26 +166,70 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 - 所有 lifecycle intent 必须标记 `paper`。
 - lifecycle 文件应放在 ignored `state/*.json` 运行态路径。
 
-### v2.0 — Binance Testnet Execution Skill
+### v1.2 — Realtime Architecture Correction ✅
 
-**Goal:** 只有长期 paper 验证后，单独设计 Binance testnet execution Skill。
+**Status:** completed as architecture/reference correction in `references/session-v1.2-realtime-architecture-correction.md`.
 
-**Prerequisites:**
-- v0.9 回测指标可接受。
-- v1.1 paper lifecycle 稳定运行。
-- 有 kill switch、最大仓位、最大日亏损、异常处理。
-- 独立 Skill，不能把 signed execution 混入当前 paper scanner。
+**Goal:** 明确 paper/testnet/live 未来必须共享同一套实时交易引擎；paper 只是 broker adapter，不是独立 scanner 产品。
+
+### v1.3 — Runtime Data Recorder 🟡
+
+**Status:** planned in `plans/binance-usds-futures-trend-v1.3.md`; implementation next.
+
+**Goal:** 运行过程中记录结构化 runtime evidence，用于策略复盘和后续策略进化。
+
+**Scope:**
+- `RuntimeRecorder`；
+- runtime JSONL append-only schema；
+- paper 环境 runtime record；
+- ignored runtime data path；
+- 不改变现有 CLI 行为。
+
+### v1.4 — Core Interface Extraction 🟡
+
+**Status:** planned in `plans/binance-usds-futures-trend-v1.4.md`.
+
+**Goal:** 抽象 `MarketData`、`SignalEngine`、`Strategy`、`RiskManager`、`PortfolioState`、`ExecutionEngine`、`BrokerAdapter`，同时保持现有 CLI 兼容。
+
+### v1.5 — Shared Trading Loop + PaperBroker 🟡
+
+**Status:** planned in `plans/binance-usds-futures-trend-v1.5.md`.
+
+**Goal:** 用同一套 trading loop 跑 paper，并通过 `PaperBroker` 生成模拟 fill / execution events。
+
+### v1.6 — Strategy Evolution from Runtime Evidence 🟡
+
+**Status:** planned in `plans/binance-usds-futures-trend-v1.6.md`.
+
+**Goal:** 基于 recorded runtime evidence replay/comparison 候选策略，禁止凭感觉或漂移样本调参。
+
+### v1.7 — Binance Futures Testnet Adapter 🔒
+
+**Status:** planned but locked behind v1.3-v1.6 evidence and explicit user authorization.
+
+**Goal:** 只在 paper/shared loop 稳定后接 Binance futures testnet adapter；仍不接 live。
+
+### v1.8 — Live Readiness Gates and Audit 🔒
+
+**Status:** planned as readiness/audit only; no live order implementation.
+
+**Goal:** 建立 live 前置审计、kill switch、证据窗口、风险阈值和人工授权门槛。
+
+### v2.0 — Future Live Adapter (Not Authorized) 🔒
+
+**Goal:** 仅在 v1.8 全部 gate 通过且用户单独授权后，另起版本设计 live adapter。
 
 **Guardrails:**
-- testnet-first。
-- live execution 需要另行明确授权。
-- 不允许默认实盘。
+- live 默认不可用；
+- 必须 testnet-first；
+- 必须有 kill switch、最大仓位、最大日亏损、异常处理和 runtime audit；
+- 任何 live 相关实现前必须新增计划并再次独立审核。
 
 ## Default Next Step
 
-当前默认下一步：**长期 paper lifecycle 运行观察；满足 v2.0 prerequisites 后，单独设计 Binance Testnet Execution Skill**。
+当前默认下一步：**按多版本文档执行 v1.3 Runtime Data Recorder，然后顺序推进 v1.4 接口拆分 → v1.5 PaperBroker shared loop → v1.6 runtime evidence 策略进化。**
 
-除非用户明确改变优先级，否则后续继续按本文件顺序推进：长期 paper 验证 → v2.0 testnet-only execution Skill。
+除非用户明确改变优先级，否则后续继续按本文件顺序推进；v1.7 testnet 与 v2.0 live 均需单独授权。
 
 ## Stop Conditions
 

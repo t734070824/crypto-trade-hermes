@@ -311,11 +311,18 @@ Historical workflow notes are intentionally kept out of the main operational pat
 - `references/session-v1.0-evidence-based-refinement-workflow.md` — paper-only refinement comparison;
 - `references/session-v1.1-paper-lifecycle-workflow.md` — paper lifecycle state and intent;
 - `references/session-v1.2-realtime-architecture-correction.md` — correction toward shared real-time trading architecture.
+- `references/session-v1.3-runtime-data-strategy-evolution.md` — runtime data capture requirements for evidence-based strategy evolution.
 
 Tracked plans:
 
 - `plans/binance-usds-futures-roadmap.md` — canonical roadmap;
-- `plans/binance-usds-futures-trend-v0.3.md` through `plans/binance-usds-futures-trend-v1.1.md` — historical implementation plans.
+- `plans/binance-usds-futures-trend-v0.3.md` through `plans/binance-usds-futures-trend-v1.1.md` — historical implementation plans;
+- `plans/binance-usds-futures-trend-v1.3.md` — runtime data recorder implementation plan;
+- `plans/binance-usds-futures-trend-v1.4.md` — core realtime interface extraction plan;
+- `plans/binance-usds-futures-trend-v1.5.md` — shared trading loop and PaperBroker plan;
+- `plans/binance-usds-futures-trend-v1.6.md` — strategy evolution from runtime evidence plan;
+- `plans/binance-usds-futures-trend-v1.7.md` — Binance futures testnet adapter plan;
+- `plans/binance-usds-futures-trend-v1.8.md` — live readiness gate/audit plan.
 
 ## Verification Checklist
 
