@@ -69,6 +69,25 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(trend.validate_period("1h"), "1h")
         self.assertEqual(trend.validate_period("4h"), "4h")
 
+    def test_rejects_non_positive_risk_unit_and_top(self):
+        candles = []
+        price = 100.0
+        for _ in range(240):
+            open_price = price
+            close_price = price + 1.0
+            candles.append({"open": open_price, "high": close_price + 0.7, "low": open_price - 0.5, "close": close_price})
+            price = close_price
+
+        for risk_unit in [0, -1]:
+            with self.subTest(risk_unit=risk_unit):
+                with self.assertRaises(ValueError):
+                    trend.decide(candles, symbol="BTCUSDT", interval="1h", risk_unit=risk_unit)
+
+        for top in [0, -3]:
+            with self.subTest(top=top):
+                with self.assertRaises(ValueError):
+                    trend.scan_symbols(["BTCUSDT"], interval="1h", top=top)
+
     def test_market_context_changes_confidence_not_trend_participation(self):
         candles = []
         price = 100.0
@@ -111,6 +130,68 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertGreater(neutral["position_size"], crowded["position_size"])
         self.assertIn("funding_extreme", crowded["factor_flags"])
         self.assertIn("oi_contracting", crowded["factor_flags"])
+
+    def test_scan_symbols_ranks_trends_and_builds_chinese_summary(self):
+        def make_candles(start, step):
+            candles = []
+            price = float(start)
+            for _ in range(240):
+                open_price = price
+                close_price = price + step
+                high = max(open_price, close_price) + 0.7
+                low = min(open_price, close_price) - 0.5
+                candles.append({"open": open_price, "high": high, "low": low, "close": close_price})
+                price = close_price
+            return candles
+
+        candle_map = {
+            "BTCUSDT": make_candles(100, 1.0),
+            "SOLUSDT": make_candles(50, 0.6),
+            "ETHUSDT": make_candles(300, -1.0),
+        }
+        context_map = {
+            "BTCUSDT": {
+                "mark_trend_confirmed": True,
+                "latest_funding_rate": 0.0001,
+                "open_interest_change_pct": 3.0,
+                "global_long_short_ratio": 1.1,
+                "taker_buy_sell_ratio": 1.2,
+            },
+            "SOLUSDT": {
+                "mark_trend_confirmed": True,
+                "latest_funding_rate": 0.0015,
+                "open_interest_change_pct": -6.0,
+                "global_long_short_ratio": 3.5,
+                "taker_buy_sell_ratio": 0.8,
+            },
+            "ETHUSDT": {
+                "mark_trend_confirmed": False,
+                "latest_funding_rate": 0.0002,
+                "open_interest_change_pct": 0.0,
+                "global_long_short_ratio": 1.0,
+                "taker_buy_sell_ratio": 1.0,
+            },
+        }
+
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        original_fetch_market_context = getattr(trend, "fetch_market_context")
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: candle_map[symbol])
+        setattr(trend, "fetch_market_context", lambda symbol, period, limit=30, base_url=trend.BINANCE_FAPI_BASE: context_map[symbol])
+        try:
+            scan = trend.scan_symbols(["ETHUSDT", "SOLUSDT", "BTCUSDT"], interval="1h", limit=240, top=2)
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+            setattr(trend, "fetch_market_context", original_fetch_market_context)
+
+        self.assertEqual(scan["mode"], "paper")
+        self.assertEqual(scan["interval"], "1h")
+        self.assertIn("generated_at_utc", scan)
+        self.assertIn("generated_at_beijing", scan)
+        self.assertEqual([item["symbol"] for item in scan["top_trends"]], ["BTCUSDT", "SOLUSDT"])
+        self.assertEqual(scan["watchlist"][0]["symbol"], "ETHUSDT")
+        self.assertGreater(scan["results"][0]["rank_score"], scan["results"][1]["rank_score"])
+        self.assertIn("北京时间（UTC+8）", scan["summary_zh"])
+        self.assertIn("最强趋势 Top 2", scan["summary_zh"])
 
     def test_fetch_market_context_uses_free_usds_futures_endpoints(self):
         calls = []

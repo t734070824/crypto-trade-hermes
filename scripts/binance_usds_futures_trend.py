@@ -15,12 +15,13 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
-ALLOWED_SYMBOLS = {
+DEFAULT_SYMBOLS = (
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT",
     "LINKUSDT", "AVAXUSDT", "ADAUSDT", "LTCUSDT", "TRXUSDT", "DOTUSDT",
     "POLUSDT", "BCHUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "SUIUSDT",
     "INJUSDT", "ATOMUSDT",
-}
+)
+ALLOWED_SYMBOLS = set(DEFAULT_SYMBOLS)
 _SHORT_INTERVALS = {"1m", "3m", "5m", "10m", "15m", "30m"}
 _ALLOWED_INTERVALS = {"1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
 _PUBLIC_FACTOR_PERIODS = {"1h", "2h", "4h", "6h", "12h", "1d"}
@@ -258,10 +259,13 @@ def decide(
     symbol = validate_symbol(symbol)
     interval = validate_interval(interval)
     if len(candles) < 200:
-        raise ValueError("need at least 200 candles for EMA200 trend filter")
+        raise ValueError("at least 200 candles are required for EMA200 trend filter")
+    if risk_unit <= 0:
+        raise ValueError("risk_unit must be positive")
 
-    closes = [float(c["close"]) for c in candles]
+    closes = [float(candle["close"]) for candle in candles]
     last_close = closes[-1]
+
     ema50 = ema(closes, 50)
     ema200 = ema(closes, 200)
     current_atr = atr(candles, 14)
@@ -309,6 +313,120 @@ def decide(
     }
 
 
+def enrich_for_ranking(decision: dict[str, Any]) -> dict[str, Any]:
+    """Add v0.3 portfolio-ranking fields to one paper decision."""
+    enriched = dict(decision)
+    action = enriched.get("action")
+    atr14 = float(enriched.get("atr14") or 0.0)
+    entry = float(enriched.get("entry_reference") or 0.0)
+    ema50_value = float(enriched.get("ema50") or 0.0)
+    ema200_value = float(enriched.get("ema200") or 0.0)
+    confidence = float(enriched.get("confidence_score") or 0.0)
+    position_size = float(enriched.get("position_size") or 0.0)
+
+    if action != "hold_long" or atr14 <= 0:
+        enriched.update({"trend_strength": 0.0, "rank_score": 0.0, "ranking_bucket": "watchlist"})
+        return enriched
+
+    price_gap_atr = max(0.0, (entry - ema200_value) / atr14)
+    ema_gap_atr = max(0.0, (ema50_value - ema200_value) / atr14)
+    extension_atr = max(0.0, (entry - ema50_value) / atr14)
+    trend_strength = round(price_gap_atr + ema_gap_atr, 4)
+    rank_score = round(trend_strength * confidence * max(position_size, 0.01), 4)
+    flags = set(enriched.get("factor_flags") or [])
+    risk_flags = {"funding_extreme", "oi_contracting", "long_side_crowded", "taker_sell_pressure", "mark_trend_divergence"}
+    bucket = "risk_high_trend" if extension_atr > 4.0 or confidence < 0.75 or flags.intersection(risk_flags) else "top_trend"
+    enriched.update(
+        {
+            "trend_strength": trend_strength,
+            "rank_score": rank_score,
+            "extension_atr": round(extension_atr, 4),
+            "ranking_bucket": bucket,
+        }
+    )
+    return enriched
+
+
+def build_scan_summary_zh(scan: dict[str, Any]) -> str:
+    """Build a compact Chinese report with explicit UTC and Beijing time labels."""
+    top_n = scan.get("top_n", 0)
+    lines = [
+        "Binance USDS-M 多币种趋势扫描（paper only）",
+        f"UTC: {scan['generated_at_utc']}",
+        f"北京时间（UTC+8）: {scan['generated_at_beijing']}",
+        f"周期: {scan['interval']}；扫描数量: {scan['universe_count']}",
+        f"最强趋势 Top {top_n}: " + (", ".join(item["symbol"] for item in scan.get("top_trends", [])) or "无"),
+    ]
+    risk_symbols = ", ".join(item["symbol"] for item in scan.get("risk_high_trends", [])) or "无"
+    watch_symbols = ", ".join(item["symbol"] for item in scan.get("watchlist", [])[:10]) or "无"
+    lines.append(f"趋势内但风险偏高: {risk_symbols}")
+    lines.append(f"观望/空仓: {watch_symbols}")
+    return "\n".join(lines)
+
+
+def scan_symbols(
+    symbols: list[str] | tuple[str, ...] | None = None,
+    interval: str = "1h",
+    limit: int = 240,
+    context_limit: int = 30,
+    risk_unit: float = 1.0,
+    base_url: str = BINANCE_FAPI_BASE,
+    include_context: bool = True,
+    top: int = 5,
+) -> dict[str, Any]:
+    """Scan multiple configured symbols and rank paper trend opportunities."""
+    interval = validate_interval(interval)
+    if top < 1:
+        raise ValueError("top must be >= 1")
+    selected_symbols = list(DEFAULT_SYMBOLS if symbols is None else symbols)
+    selected_symbols = [validate_symbol(symbol) for symbol in selected_symbols]
+    stamps = now_stamps()
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+
+    for symbol in selected_symbols:
+        try:
+            candles = fetch_klines(symbol, interval, limit, base_url)
+            market_context = None if not include_context else fetch_market_context(symbol, interval, context_limit, base_url)
+            decision = decide(candles, symbol, interval, risk_unit, market_context)
+            results.append(enrich_for_ranking(decision))
+        except Exception as exc:
+            errors.append({"symbol": symbol, "error": str(exc)})
+            results.append(
+                {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "mode": "paper",
+                    "action": "error",
+                    "position_size": 0,
+                    "confidence_score": 0,
+                    "trend_strength": 0.0,
+                    "rank_score": -1.0,
+                    "ranking_bucket": "error",
+                    "reason": str(exc),
+                }
+            )
+
+    ranked = sorted(results, key=lambda item: (float(item.get("rank_score", -1.0)), item.get("symbol", "")), reverse=True)
+    top_trends = [item for item in ranked if item.get("action") == "hold_long"][:top]
+    risk_high = [item for item in ranked if item.get("ranking_bucket") == "risk_high_trend"]
+    watchlist = [item for item in ranked if item.get("action") in {"flat", "error"}]
+    scan: dict[str, Any] = {
+        "mode": "paper",
+        "interval": interval,
+        **stamps,
+        "universe_count": len(selected_symbols),
+        "top_n": top,
+        "results": ranked,
+        "top_trends": top_trends,
+        "risk_high_trends": risk_high,
+        "watchlist": watchlist,
+        "errors": errors,
+    }
+    scan["summary_zh"] = build_scan_summary_zh(scan)
+    return scan
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Binance USDS futures paper trend decision")
     parser.add_argument("--symbol", default="BTCUSDT", help="USDS futures symbol in configured universe")
@@ -318,6 +436,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--risk-unit", type=float, default=1.0, help="Paper position sizing unit")
     parser.add_argument("--base-url", default=BINANCE_FAPI_BASE, help="Override Binance Futures base URL for tests")
     parser.add_argument("--no-context", action="store_true", help="Disable v0.2 public factor context fetch")
+    parser.add_argument("--symbols", help="Comma-separated symbols for v0.3 batch scan; omit for single-symbol mode")
+    parser.add_argument("--all-symbols", action="store_true", help="Scan the full configured universe")
+    parser.add_argument("--top", type=int, default=5, help="Top N trends to include in v0.3 scan summary")
     return parser
 
 
@@ -325,6 +446,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     try:
+        if args.all_symbols or args.symbols:
+            symbols = None if args.all_symbols else [part.strip().upper() for part in args.symbols.split(",") if part.strip()]
+            scan = scan_symbols(
+                symbols=symbols,
+                interval=args.interval,
+                limit=args.limit,
+                context_limit=args.context_limit,
+                risk_unit=args.risk_unit,
+                base_url=args.base_url,
+                include_context=not args.no_context,
+                top=args.top,
+            )
+            print(json.dumps({"ok": not bool(scan["errors"]), "scan": scan}, ensure_ascii=False, indent=2))
+            return 0 if not scan["errors"] else 1
+
         candles = fetch_klines(args.symbol, args.interval, args.limit, args.base_url)
         market_context = None if args.no_context else fetch_market_context(
             args.symbol,

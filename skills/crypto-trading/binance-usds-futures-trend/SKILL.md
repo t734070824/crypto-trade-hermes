@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when generating paper-only Binance USDS-M futures trend-following decisions from free public K-line data with >=1h intervals, ATR harvesting, and no paid APIs.
-version: 0.2.0
+version: 0.3.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -22,7 +22,7 @@ This project Skill supports paper-only Binance USDS-M futures decision generatio
 - never use short intervals below 1h;
 - prefer staying with the main trend, avoiding premature exits, and harvesting in tranches.
 
-The implementation is deliberately conservative: it emits a structured `paper` decision only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter.
+The implementation is deliberately conservative: it emits structured `paper` decisions only; it never sends signed orders. v0.2 adds free Binance USDS-M public context factors while keeping EMA trend participation as the primary filter. v0.3 adds multi-symbol batch scanning and ranking so portfolio attention can focus on the strongest trends before any live execution work.
 
 ## When to Use
 
@@ -48,6 +48,18 @@ Primary script:
 scripts/binance_usds_futures_trend.py --symbol BTCUSDT --interval 1h --limit 240
 ```
 
+Batch scan the configured universe:
+
+```bash
+scripts/binance_usds_futures_trend.py --all-symbols --interval 1h --limit 240 --context-limit 30 --top 5
+```
+
+Batch scan selected symbols:
+
+```bash
+scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --top 3
+```
+
 Output is JSON:
 
 - `ok`: whether the run succeeded;
@@ -62,7 +74,16 @@ Output is JSON:
 - `take_profit_1`, `take_profit_2`: ATR tranche harvesting references;
 - `trailing_stop`: ATR trailing stop reference.
 
-## Decision Logic v0.2
+In v0.3 batch mode, output is `scan` JSON:
+
+- `scan.mode`: always `paper`;
+- `scan.results`: all symbols sorted by `rank_score`;
+- `scan.top_trends`: strongest hold-long candidates;
+- `scan.risk_high_trends`: symbols still in trend but with crowding, contraction, extension, or low-confidence flags;
+- `scan.watchlist`: flat/error symbols to observe but not allocate to;
+- `scan.summary_zh`: concise Chinese report with UTC and 北京时间（UTC+8） labels.
+
+## Decision Logic v0.3
 
 1. Validate symbol is in the configured trade universe.
 2. Validate interval is >=1h; reject `1m`, `3m`, `5m`, `10m`, `15m`, `30m`.
@@ -100,6 +121,12 @@ https://fapi.binance.com/fapi/v1/klines
 9. If the filter fails:
    - action: `flat`;
    - size: 0.
+10. In batch mode, scan all selected symbols and add ranking fields:
+   - `trend_strength`: ATR-normalized major-trend strength;
+   - `extension_atr`: ATR-normalized distance above EMA50;
+   - `rank_score`: `trend_strength * confidence_score * position_size`;
+   - `ranking_bucket`: `top_trend`, `risk_high_trend`, `watchlist`, or `error`.
+11. Input guardrails: `risk_unit` must be positive and `top` must be `>= 1`.
 
 ## Testing
 
@@ -117,7 +144,9 @@ The test suite verifies:
 - synthetic strong uptrend produces `hold_long`;
 - synthetic downtrend produces `flat`;
 - v0.2 public context factors adjust confidence/size without forcing premature trend exits;
-- v0.2 context fetch uses free Binance USDS-M endpoints.
+- v0.2 context fetch uses free Binance USDS-M endpoints;
+- v0.3 batch scanning ranks multi-symbol trend candidates and builds a Chinese summary;
+- input guardrails reject non-positive `risk_unit` and `top < 1`.
 
 ## Verification Recipe
 
@@ -127,10 +156,11 @@ The test suite verifies:
 python3 -m unittest tests/test_binance_usds_futures_trend.py -v
 ```
 
-2. Run one real free-data decision:
+2. Run one real free-data decision or full-universe scan:
 
 ```bash
 scripts/binance_usds_futures_trend.py --symbol BTCUSDT --interval 1h --limit 240
+scripts/binance_usds_futures_trend.py --all-symbols --interval 1h --limit 240 --context-limit 30 --top 5
 ```
 
 3. Confirm:
@@ -153,10 +183,10 @@ scripts/binance_usds_futures_trend.py --symbol BTCUSDT --interval 1h --limit 240
 
 - `references/binance-skills-hub-usds-futures.md` — condensed notes from the fetched Binance Skills Hub repo for USDⓈ-M Futures public/auth endpoints used by this skill.
 - `references/session-v0.2-public-factors-workflow.md` — workflow note for expanding free Binance public factors while preserving the primary trend-following contract.
+- `plans/binance-usds-futures-trend-v0.3.md` — v0.3 batch scan and ranking implementation plan.
 
 ## Roadmap
 
-- Add multi-symbol batch scan for the configured universe.
 - Add higher-timeframe agreement, e.g. 4h + 1d trend filter.
 - Add free Binance USDS-M factors from the local Binance Skills Hub reference: mark-price Kline, funding, open interest, long/short ratios, taker buy/sell volume, and premium index Kline.
 - Add volatility targeting and max portfolio risk constraints.
