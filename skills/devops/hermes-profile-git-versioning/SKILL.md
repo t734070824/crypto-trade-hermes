@@ -150,3 +150,4 @@ git config user.email "hermes-agent@users.noreply.github.com"
 
 - `references/selective-profile-repo.md` — example policy and verification notes from a profile-root repository setup.
 - `references/profile-config-visibility.md` — Hermes profile config keys for Telegram/gateway real-time tool progress and context-usage footer, plus the note that ignored `config.yaml` changes are local rather than pushed.
+- `references/profile-source-test-allowlist.md` — how to safely add project `scripts/` and `tests/` directories to a profile-root repository, including Python cache and Skills Hub cache ignore rules.
