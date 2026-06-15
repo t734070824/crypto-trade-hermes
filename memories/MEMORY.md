@@ -18,4 +18,4 @@ Binance 相关 API 密钥配置在当前 profile 的 .env 中，变量名为 LAL
 §
 后续所有 git 提交流程在 push 之前，必须先用独立 agent 进行审核；审核不通过时，根据审核意见修改并再次审核，循环直到审核通过后才允许 push。
 §
-crypto-trade-hermes 后续 Binance USDS-M paper trading 开发以仓库文件 plans/binance-usds-futures-roadmap.md 为 canonical roadmap；默认顺序为 v0.7 Paper State Persistence → v0.8 Scheduled Scan + Telegram Briefing → v0.9 Historical Backtest → v1.0 Evidence-based Strategy Refinement → v1.1 Paper Trading Lifecycle → v2.0 separate Binance testnet execution Skill，除非用户明确改优先级。
+crypto-trade-hermes 后续 Binance USDS-M paper trading 开发以仓库文件 plans/binance-usds-futures-roadmap.md 为 canonical roadmap；v1.0 Evidence-based Strategy Refinement 已完成；默认下一步为 v1.1 Paper Trading Lifecycle → v2.0 separate Binance testnet execution Skill，除非用户明确改优先级。

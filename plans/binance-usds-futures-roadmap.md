@@ -123,11 +123,20 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 - 有小型 fixture 测试。
 - 至少能跑一组真实历史数据样本并输出指标。
 
-### v1.0 — Strategy Refinement from Evidence
+### v1.0 — Strategy Refinement from Evidence ✅
+
+**Status:** implemented in current v1.0 change set: paper-only baseline/candidate variant comparison on the same fetched candle sample, evidence score, drawdown guardrail, CLI `--compare-refinements`, and no auto-promotion of defaults.
 
 **Goal:** 只基于 paper/backtest 证据调整策略，不凭感觉改参数。
 
-**Candidate Work:**
+**Implemented Scope:**
+- 比较 `baseline`、`trend_hold_bias`、`risk_capped` 候选策略。
+- 每个 symbol 只 fetch 一次 K 线，并在所有 variants 复用同一历史样本。
+- 使用同一历史样本输出 before/after metrics 和 `evidence_score`。
+- 候选策略若 max drawdown 恶化超过 guardrail，则不允许选中。
+- 输出 `selection_policy.auto_promote_defaults=false`，v1.0 只做诊断，不修改默认策略。
+
+**Future Candidate Work:**
 - 优化 higher-timeframe agreement scoring。
 - 增加 premium index Kline 等免费 public factor。
 - 调整 funding / open interest / long-short / taker flow 权重。
@@ -137,6 +146,7 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 **Guardrails:**
 - 每个策略调整必须有前后指标对比。
 - 不因短期样本过拟合而提升默认风险。
+- 不把 candidate selection 当成实盘收益或默认策略变更。
 
 ### v1.1 — Paper Trading Lifecycle
 
@@ -170,9 +180,9 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 ## Default Next Step
 
-当前默认下一步：**v1.0 Strategy Refinement from Evidence**。
+当前默认下一步：**v1.1 Paper Trading Lifecycle**。
 
-除非用户明确改变优先级，否则后续继续按本文件顺序推进：v1.0 → v1.1 → v2.0。
+除非用户明确改变优先级，否则后续继续按本文件顺序推进：v1.1 → v2.0。
 
 ## Stop Conditions
 

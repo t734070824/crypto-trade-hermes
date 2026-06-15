@@ -781,6 +781,7 @@ def backtest_symbol(
     initial_equity: float = 10_000.0,
     fee_bps: float = 4.0,
     max_position_size: float = 1.0,
+    risk_unit: float = 1.0,
 ) -> dict[str, Any]:
     """Run a simple paper-only historical backtest for one symbol.
 
@@ -797,6 +798,8 @@ def backtest_symbol(
         raise ValueError("fee_bps must be non-negative")
     if max_position_size <= 0:
         raise ValueError("max_position_size must be positive")
+    if risk_unit <= 0:
+        raise ValueError("risk_unit must be positive")
 
     equity = float(initial_equity)
     current_position = 0.0
@@ -815,7 +818,7 @@ def backtest_symbol(
             equity *= 1.0 + current_position * (close / previous_close - 1.0)
             holding_candles += 1
 
-        decision = decide(candles[: index + 1], symbol, interval, risk_unit=1.0, market_context=None)
+        decision = decide(candles[: index + 1], symbol, interval, risk_unit=risk_unit, market_context=None)
         target_position = 0.0
         if decision.get("action") == "hold_long":
             target_position = min(float(decision.get("position_size") or 0.0), float(max_position_size))
@@ -882,6 +885,7 @@ def backtest_symbol(
         "bars_processed": len(equity_curve),
         "fee_bps": round(float(fee_bps), 8),
         "max_position_size": round(float(max_position_size), 8),
+        "risk_unit": round(float(risk_unit), 8),
         "metrics": metrics,
         "trades": trades,
         "equity_curve": equity_curve,
@@ -891,6 +895,32 @@ def backtest_symbol(
     }
     result["summary_zh"] = _build_backtest_summary_zh(result)
     return result
+
+
+def _build_backtest_symbols_result(
+    selected_symbols: list[str],
+    interval: str,
+    symbol_results: list[dict[str, Any]],
+    errors: list[dict[str, str]],
+) -> dict[str, Any]:
+    metrics = _aggregate_backtest_metrics(symbol_results, interval)
+    per_symbol_contribution = _per_symbol_contribution(symbol_results)
+    backtest: dict[str, Any] = {
+        "mode": "paper",
+        **now_stamps(),
+        "interval": interval,
+        "universe_count": len(selected_symbols),
+        "symbols_tested": [item["symbol"] for item in symbol_results],
+        "bars_processed": sum(int(item.get("bars_processed", 0)) for item in symbol_results),
+        "strategy": "ema50_ema200_atr_trend_paper",
+        "metrics": metrics,
+        "per_symbol_contribution": per_symbol_contribution,
+        "symbol_results": symbol_results,
+        "errors": errors,
+        "errors_count": len(errors),
+    }
+    backtest["summary_zh"] = _build_backtest_summary_zh(backtest)
+    return backtest
 
 
 def _aligned_equity_maps(symbol_results: list[dict[str, Any]]) -> tuple[list[Any], list[dict[Any, float]]]:
@@ -983,6 +1013,7 @@ def backtest_symbols(
     initial_equity: float = 10_000.0,
     fee_bps: float = 4.0,
     max_position_size: float = 1.0,
+    risk_unit: float = 1.0,
     base_url: str = BINANCE_FAPI_BASE,
 ) -> dict[str, Any]:
     """Fetch free K-lines and run paper-only historical backtests for symbols."""
@@ -1005,29 +1036,178 @@ def backtest_symbols(
                     initial_equity=initial_equity,
                     fee_bps=fee_bps,
                     max_position_size=max_position_size,
+                    risk_unit=risk_unit,
                 )
             )
         except Exception as exc:
             errors.append({"symbol": symbol, "error": str(exc)})
 
-    metrics = _aggregate_backtest_metrics(symbol_results, interval)
-    per_symbol_contribution = _per_symbol_contribution(symbol_results)
-    backtest: dict[str, Any] = {
+    return _build_backtest_symbols_result(selected_symbols, interval, symbol_results, errors)
+
+
+DEFAULT_REFINEMENT_VARIANTS = (
+    {
+        "name": "baseline",
+        "description": "v0.9 baseline EMA50/EMA200 + ATR trend paper backtest behavior",
+        "max_position_size": 1.0,
+        "risk_unit": 1.0,
+    },
+    {
+        "name": "trend_hold_bias",
+        "description": "slightly higher paper risk unit for confirmed trend participation diagnostics",
+        "max_position_size": 1.15,
+        "risk_unit": 1.15,
+    },
+    {
+        "name": "risk_capped",
+        "description": "lower paper exposure cap for defensive drawdown comparison",
+        "max_position_size": 0.75,
+        "risk_unit": 0.75,
+    },
+)
+
+
+def _abs_drawdown(metrics: dict[str, Any]) -> float:
+    return abs(float(metrics.get("max_drawdown", 0.0) or 0.0))
+
+
+def _evidence_score(metrics: dict[str, Any]) -> float:
+    """Rank evidence without ignoring risk-adjusted metrics."""
+    cagr = float(metrics.get("cagr", 0.0) or 0.0)
+    calmar = float(metrics.get("calmar", 0.0) or 0.0)
+    sharpe = float(metrics.get("sharpe", 0.0) or 0.0)
+    return round(cagr + 0.03 * calmar + 0.02 * sharpe, 8)
+
+
+def _build_refinement_summary_zh(refinement: dict[str, Any]) -> str:
+    selected = refinement.get("selected_variant") or "none"
+    lines = [
+        "Binance USDS-M 策略证据化对比（paper only）",
+        f"UTC: {refinement.get('generated_at_utc')}",
+        f"北京时间（UTC+8）: {refinement.get('generated_at_beijing')}",
+        f"周期: {refinement.get('interval')}; universe={refinement.get('universe_count', 0)}; selected={selected}",
+    ]
+    for item in refinement.get("variants", []):
+        metrics = item.get("metrics") or {}
+        eligibility = "eligible" if item.get("eligible") else "blocked"
+        lines.append(
+            f"{item.get('variant')}: {eligibility}; score={item.get('evidence_score')}; "
+            f"CAGR={metrics.get('cagr', 0.0)}; max_drawdown={metrics.get('max_drawdown', 0.0)}; "
+            f"Calmar={metrics.get('calmar', 0.0)}; Sharpe={metrics.get('sharpe', 0.0)}"
+        )
+    lines.append("安全: paper only；候选策略仅作历史证据诊断；未下真实订单；未使用收费 API。")
+    return "\n".join(lines)
+
+
+def compare_strategy_variants(
+    symbols: list[str] | tuple[str, ...] | None = None,
+    interval: str = "1h",
+    limit: int = 500,
+    initial_equity: float = 10_000.0,
+    fee_bps: float = 4.0,
+    base_url: str = BINANCE_FAPI_BASE,
+    max_drawdown_worsening_limit: float = 0.03,
+) -> dict[str, Any]:
+    """Compare paper-only strategy variants before changing defaults.
+
+    v1.0 deliberately reports diagnostics only. It does not promote a candidate into
+    scan defaults, and it blocks candidates whose drawdown worsens beyond guardrails.
+    """
+    interval = validate_interval(interval)
+    selected_symbols = list(DEFAULT_SYMBOLS if symbols is None else symbols)
+    selected_symbols = [validate_symbol(symbol) for symbol in selected_symbols]
+    if max_drawdown_worsening_limit < 0:
+        raise ValueError("max_drawdown_worsening_limit must be non-negative")
+
+    candles_by_symbol: dict[str, list[dict[str, float]]] = {}
+    fetch_errors: list[dict[str, str]] = []
+    for symbol in selected_symbols:
+        try:
+            candles_by_symbol[symbol] = fetch_klines(symbol, interval, limit, base_url)
+        except Exception as exc:
+            fetch_errors.append({"symbol": symbol, "error": str(exc)})
+
+    variants: list[dict[str, Any]] = []
+    baseline_metrics: dict[str, Any] | None = None
+    baseline_score = 0.0
+    baseline_drawdown = 0.0
+    for config in DEFAULT_REFINEMENT_VARIANTS:
+        symbol_results: list[dict[str, Any]] = []
+        errors = list(fetch_errors)
+        for symbol, candles in candles_by_symbol.items():
+            try:
+                symbol_results.append(
+                    backtest_symbol(
+                        candles,
+                        symbol=symbol,
+                        interval=interval,
+                        initial_equity=initial_equity,
+                        fee_bps=fee_bps,
+                        max_position_size=float(config["max_position_size"]),
+                        risk_unit=float(config["risk_unit"]),
+                    )
+                )
+            except Exception as exc:
+                errors.append({"symbol": symbol, "error": str(exc)})
+        backtest = _build_backtest_symbols_result(selected_symbols, interval, symbol_results, errors)
+        metrics = dict(backtest.get("metrics") or {})
+        score = _evidence_score(metrics)
+        guardrail_flags: list[str] = []
+        eligible = not bool(backtest.get("errors"))
+        if config["name"] == "baseline":
+            baseline_metrics = metrics
+            baseline_score = score
+            baseline_drawdown = _abs_drawdown(metrics)
+        else:
+            candidate_drawdown = _abs_drawdown(metrics)
+            if candidate_drawdown > baseline_drawdown + max_drawdown_worsening_limit:
+                eligible = False
+                guardrail_flags.append("drawdown_guardrail")
+        if backtest.get("errors"):
+            guardrail_flags.append("backtest_errors")
+        variants.append(
+            {
+                "variant": config["name"],
+                "description": config["description"],
+                "mode": "paper",
+                "max_position_size": round(float(config["max_position_size"]), 8),
+                "risk_unit": round(float(config["risk_unit"]), 8),
+                "metrics": metrics,
+                "evidence_score": score,
+                "eligible": eligible,
+                "guardrail_flags": guardrail_flags,
+                "errors_count": int(backtest.get("errors_count", len(backtest.get("errors") or [])) or 0),
+                "selected": False,
+            }
+        )
+
+    selected_index = 0
+    for index, item in enumerate(variants[1:], start=1):
+        if item["eligible"] and float(item["evidence_score"]) > baseline_score:
+            if float(item["evidence_score"]) > float(variants[selected_index]["evidence_score"]):
+                selected_index = index
+    variants[selected_index]["selected"] = True
+    refinement: dict[str, Any] = {
         "mode": "paper",
         **now_stamps(),
         "interval": interval,
         "universe_count": len(selected_symbols),
-        "symbols_tested": [item["symbol"] for item in symbol_results],
-        "bars_processed": sum(int(item.get("bars_processed", 0)) for item in symbol_results),
-        "strategy": "ema50_ema200_atr_trend_paper",
-        "metrics": metrics,
-        "per_symbol_contribution": per_symbol_contribution,
-        "symbol_results": symbol_results,
-        "errors": errors,
-        "errors_count": len(errors),
+        "symbols_tested": selected_symbols,
+        "strategy": "ema50_ema200_atr_trend_paper_refinement_diagnostic",
+        "baseline_variant": "baseline",
+        "selected_variant": variants[selected_index]["variant"],
+        "selection_policy": {
+            "score": "cagr + 0.03*calmar + 0.02*sharpe",
+            "candidate_must_beat_baseline_score": True,
+            "max_drawdown_worsening_limit": round(float(max_drawdown_worsening_limit), 8),
+            "auto_promote_defaults": False,
+        },
+        "baseline_metrics": baseline_metrics or {},
+        "variants": variants,
+        "errors_count": sum(int(item.get("errors_count", 0)) for item in variants),
     }
-    backtest["summary_zh"] = _build_backtest_summary_zh(backtest)
-    return backtest
+    refinement["summary_zh"] = _build_refinement_summary_zh(refinement)
+    return refinement
 
 
 def build_scan_summary_zh(scan: dict[str, Any]) -> str:
@@ -1236,9 +1416,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-save-state", action="store_true", help="Compute v0.7 state_change without writing --state-file")
     parser.add_argument("--telegram-brief", action="store_true", help="Emit a compact v0.8 Telegram briefing instead of full JSON; scan mode only")
     parser.add_argument("--backtest", action="store_true", help="Run v0.9 paper-only historical backtest instead of current scan/decision")
+    parser.add_argument("--compare-refinements", action="store_true", help="Run v1.0 paper-only evidence-based strategy refinement comparison")
     parser.add_argument("--initial-equity", type=float, default=10_000.0, help="Paper initial equity per symbol for backtest")
     parser.add_argument("--fee-bps", type=float, default=4.0, help="Paper transaction fee in basis points for backtest turnover")
     parser.add_argument("--max-position-size", type=float, default=1.0, help="Max paper long exposure per symbol for backtest")
+    parser.add_argument("--max-drawdown-worsening-limit", type=float, default=0.03, help="Max allowed absolute drawdown worsening for v1.0 refinement candidates")
     return parser
 
 
@@ -1246,6 +1428,31 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     try:
+        if args.compare_refinements:
+            if args.backtest:
+                raise ValueError("choose only one mode: --compare-refinements or --backtest")
+            if args.state_file:
+                raise ValueError("--state-file is for scan state only; omit it for --compare-refinements")
+            if args.telegram_brief:
+                raise ValueError("--telegram-brief is for scan briefings only; omit it for --compare-refinements")
+            if args.all_symbols:
+                symbols = None
+            elif args.symbols:
+                symbols = [part.strip().upper() for part in args.symbols.split(",") if part.strip()]
+            else:
+                symbols = [args.symbol.upper()]
+            refinement = compare_strategy_variants(
+                symbols=symbols,
+                interval=args.interval,
+                limit=args.limit,
+                initial_equity=args.initial_equity,
+                fee_bps=args.fee_bps,
+                base_url=args.base_url,
+                max_drawdown_worsening_limit=args.max_drawdown_worsening_limit,
+            )
+            print(json.dumps({"ok": not bool(refinement["errors_count"]), "refinement": refinement}, ensure_ascii=False, indent=2))
+            return 0 if not refinement["errors_count"] else 1
+
         if args.backtest:
             if args.state_file:
                 raise ValueError("--state-file is for scan state only; omit it for --backtest")
@@ -1264,6 +1471,7 @@ def main(argv: list[str] | None = None) -> int:
                 initial_equity=args.initial_equity,
                 fee_bps=args.fee_bps,
                 max_position_size=args.max_position_size,
+                risk_unit=args.risk_unit,
                 base_url=args.base_url,
             )
             print(json.dumps({"ok": not bool(backtest["errors"]), "backtest": backtest}, ensure_ascii=False, indent=2))

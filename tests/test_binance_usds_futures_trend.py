@@ -699,6 +699,129 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertLess(high_fee["metrics"]["final_equity"], no_fee["metrics"]["final_equity"])
         self.assertLess(high_fee["metrics"]["sharpe"], no_fee["metrics"]["sharpe"])
 
+    def test_backtest_symbol_risk_unit_changes_paper_exposure(self):
+        candles = self._backtest_candles(100, [0.5] * 260)
+
+        baseline = trend.backtest_symbol(
+            candles,
+            symbol="BTCUSDT",
+            interval="1h",
+            initial_equity=10_000,
+            max_position_size=2.0,
+            risk_unit=1.0,
+        )
+        higher_risk_unit = trend.backtest_symbol(
+            candles,
+            symbol="BTCUSDT",
+            interval="1h",
+            initial_equity=10_000,
+            max_position_size=2.0,
+            risk_unit=1.25,
+        )
+
+        baseline_max_position = max(point["position_size"] for point in baseline["equity_curve"])
+        higher_max_position = max(point["position_size"] for point in higher_risk_unit["equity_curve"])
+        self.assertGreater(higher_risk_unit["metrics"]["total_return"], baseline["metrics"]["total_return"])
+        self.assertGreater(higher_max_position, baseline_max_position)
+
+    def test_compare_strategy_variants_reports_evidence_and_guardrails(self):
+        calls = []
+        candle_map = {
+            "BTCUSDT": self._backtest_candles(100, [0.5] * 260),
+            "ETHUSDT": self._backtest_candles(200, [0.4] * 260),
+        }
+
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        setattr(
+            trend,
+            "fetch_klines",
+            lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: calls.append(symbol) or candle_map[symbol],
+        )
+        try:
+            result = trend.compare_strategy_variants(["BTCUSDT", "ETHUSDT"], interval="1h", limit=260)
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
+        self.assertEqual(result["mode"], "paper")
+        self.assertIn("generated_at_utc", result)
+        self.assertIn("generated_at_beijing", result)
+        self.assertEqual([item["variant"] for item in result["variants"]], ["baseline", "trend_hold_bias", "risk_capped"])
+        self.assertEqual(calls, ["BTCUSDT", "ETHUSDT"])
+        self.assertEqual(result["selected_variant"], "trend_hold_bias")
+        self.assertTrue(result["variants"][1]["selected"])
+        self.assertEqual(result["variants"][1]["risk_unit"], 1.15)
+        self.assertGreater(result["variants"][1]["evidence_score"], result["variants"][0]["evidence_score"])
+        self.assertIn("paper only", result["summary_zh"])
+
+    def test_compare_strategy_variants_rejects_short_interval_and_does_not_select_overfit_drawdown(self):
+        with self.assertRaises(ValueError):
+            trend.compare_strategy_variants(["BTCUSDT"], interval="30m", limit=500)
+
+        def fake_backtest_symbol(candles, symbol, interval="1h", initial_equity=10_000, fee_bps=4.0, max_position_size=1.0, risk_unit=1.0):
+            if round(risk_unit, 2) == 1.15:
+                path = [10_000.0, 7_500.0, 12_500.0]
+            elif round(risk_unit, 2) == 0.75:
+                path = [10_000.0, 9_500.0, 10_600.0]
+            else:
+                path = [10_000.0, 9_000.0, 11_000.0]
+            equity_values = []
+            for index in range(260):
+                if index < 130:
+                    value = path[0] + (path[1] - path[0]) * index / 129
+                else:
+                    value = path[1] + (path[2] - path[1]) * (index - 130) / 129
+                equity_values.append(value)
+            return {
+                "mode": "paper",
+                "symbol": symbol,
+                "interval": interval,
+                "bars_processed": len(equity_values),
+                "metrics": {"initial_equity": 10_000.0, "final_equity": equity_values[-1], "win_rate": 0.5, "average_holding_candles": 10.0, "turnover": 2.0},
+                "equity_curve": [{"close_time": index, "equity": value} for index, value in enumerate(equity_values)],
+                "trades": [],
+                "errors": [],
+                "errors_count": 0,
+            }
+
+        original_backtest_symbol = getattr(trend, "backtest_symbol")
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        setattr(trend, "backtest_symbol", fake_backtest_symbol)
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: self._backtest_candles())
+        try:
+            result = trend.compare_strategy_variants(["BTCUSDT"], interval="1h", limit=500, max_drawdown_worsening_limit=0.02)
+        finally:
+            setattr(trend, "backtest_symbol", original_backtest_symbol)
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
+        self.assertEqual(result["selected_variant"], "baseline")
+        overfit = next(item for item in result["variants"] if item["variant"] == "trend_hold_bias")
+        self.assertFalse(overfit["eligible"])
+        self.assertIn("drawdown_guardrail", overfit["guardrail_flags"])
+
+    def test_main_can_emit_strategy_refinement_json_without_orders(self):
+        candle_map = {
+            "BTCUSDT": self._backtest_candles(100, [0.5] * 260),
+            "ETHUSDT": self._backtest_candles(200, [0.4] * 260),
+        }
+
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: candle_map[symbol])
+        try:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = trend.main(["--compare-refinements", "--symbols", "BTCUSDT,ETHUSDT", "--interval", "1h", "--limit", "260"])
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["refinement"]["mode"], "paper")
+        self.assertIn("generated_at_utc", payload["refinement"])
+        self.assertIn("generated_at_beijing", payload["refinement"])
+        self.assertIn("paper only", payload["refinement"]["summary_zh"])
+        self.assertNotRegex(stdout.getvalue().lower(), r"(api_key|secret|signed|live_order|order_id)")
+
     def test_main_can_emit_backtest_json_without_context_or_orders(self):
         original_fetch_klines = getattr(trend, "fetch_klines")
         setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: self._backtest_candles(100, [0.5] * 260))
