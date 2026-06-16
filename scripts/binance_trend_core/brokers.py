@@ -9,6 +9,7 @@ import math
 import os
 import pathlib
 import urllib.parse
+import uuid
 import urllib.request
 from decimal import Decimal, ROUND_DOWN
 from dataclasses import asdict, dataclass, field
@@ -344,6 +345,8 @@ class BinanceTestnetBroker:
     environment: str = "testnet"
     fills: list[dict[str, Any]] = field(default_factory=list)
     positions: dict[str, PortfolioPosition] = field(default_factory=dict)
+    open_orders: list[dict[str, Any]] = field(default_factory=list)
+    open_algo_orders: list[dict[str, Any]] = field(default_factory=list)
     submitted_order_count: int = 0
     accepted_order_count: int = 0
     daily_realized_pnl: float = 0.0
@@ -391,12 +394,19 @@ class BinanceTestnetBroker:
         rules = self.exchange_rules_by_symbol.get(symbol)
         if rules is not None:
             quantity, reference_price, exchange_rule_adjustments = rules.adapt(quantity, reference_price)
+            metadata = {**order.metadata, "reference_price": reference_price}
+            stop_price = _optional_order_price(metadata.get("stop_price"))
+            if stop_price is not None and rules.tick_size is not None:
+                adjusted_stop_price = float(_floor_to_step(Decimal(str(stop_price)), rules.tick_size))
+                metadata["stop_price"] = adjusted_stop_price
+                exchange_rule_adjustments["stop_price_before"] = float(stop_price)
+                exchange_rule_adjustments["stop_price_after"] = adjusted_stop_price
             order = OrderInstruction(
                 symbol=order.symbol,
                 side=order.side,
                 quantity=quantity,
                 order_type=order.order_type,
-                metadata={**order.metadata, "reference_price": reference_price},
+                metadata=metadata,
             )
             if not math.isfinite(quantity):
                 event = self._base_event(order, reference_price if math.isfinite(reference_price) else 0.0, 0.0)
@@ -438,30 +448,52 @@ class BinanceTestnetBroker:
             self.fills.append(event)
             return event
 
+        order_type = order.order_type.upper()
+        conditional_algo = _is_algo_conditional(order)
         params = {
             "symbol": symbol,
             "side": side,
-            "type": order.order_type.upper(),
-            "quantity": _decimal_string(quantity),
-            "newClientOrderId": client_order_id,
+            "type": order_type,
             "timestamp": int(datetime.now(UTC).timestamp() * 1000),
         }
+        if conditional_algo:
+            params["algoType"] = "CONDITIONAL"
+            params["clientAlgoId"] = client_order_id
+        else:
+            params["newClientOrderId"] = client_order_id
+        close_position = _metadata_bool(order.metadata.get("close_position"))
+        stop_price = _optional_order_price(order.metadata.get("stop_price"))
+        if stop_price is not None:
+            params["triggerPrice" if conditional_algo else "stopPrice"] = _decimal_string(stop_price)
+        working_type = str(order.metadata.get("working_type") or order.metadata.get("workingType") or "").upper()
+        if working_type:
+            params["workingType"] = working_type
+        if close_position and order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            params["closePosition"] = "true"
+        else:
+            params["quantity"] = _decimal_string(quantity)
+            if _metadata_bool(order.metadata.get("reduce_only")) or _metadata_bool(order.metadata.get("reduceOnly")):
+                params["reduceOnly"] = "true"
+        order_path = "/fapi/v1/algoOrder" if conditional_algo else "/fapi/v1/order"
         event = self._base_event(order, reference_price, notional)
         event["client_order_id"] = client_order_id
+        if conditional_algo:
+            event["client_algo_id"] = client_order_id
         if exchange_rule_adjustments is not None:
             event["exchange_rule_adjustments"] = exchange_rule_adjustments
-        event["request"] = {"method": "POST", "path": "/fapi/v1/order", "params": redact_sensitive_testnet_fields(params)}
+        event["request"] = {"method": "POST", "path": order_path, "params": redact_sensitive_testnet_fields(params)}
         if self.dry_run:
             event.update({"status": "dry_run", "testnet_dry_run": True, "signed": False, "simulated": True, "real_order_submitted": False})
             self.accepted_order_count += 1
-            self._apply_position(symbol, side, quantity, reference_price)
+            if not _is_unfilled_conditional(order):
+                self._apply_position(symbol, side, quantity, reference_price)
             self.fills.append(event)
             return event
 
         signed_params = self._sign_params(params)
         event.update(
             {
-                "request": {"method": "POST", "path": "/fapi/v1/order", "params": redact_sensitive_testnet_fields(signed_params)},
+                "request": {"method": "POST", "path": order_path, "params": redact_sensitive_testnet_fields(signed_params)},
                 "testnet_dry_run": False,
                 "signed": True,
                 "simulated": False,
@@ -470,7 +502,7 @@ class BinanceTestnetBroker:
             }
         )
         query = urllib.parse.urlencode(signed_params)
-        url = f"{self.base_url}/fapi/v1/order?{query}"
+        url = f"{self.base_url}{order_path}?{query}"
         self.submitted_order_count += 1
         self.fills.append(event)
         try:
@@ -491,7 +523,8 @@ class BinanceTestnetBroker:
                 self._append_order_journal(event)
                 return event
             self.accepted_order_count += 1
-            self._apply_position(symbol, side, quantity, reference_price)
+            if not _is_unfilled_conditional(order):
+                self._apply_position(symbol, side, quantity, reference_price)
             event.update(
                 {
                     "status": "submitted_confirmed",
@@ -502,7 +535,8 @@ class BinanceTestnetBroker:
             self._append_order_journal(event)
             return event
         self.accepted_order_count += 1
-        self._apply_position(symbol, side, quantity, reference_price)
+        if not _is_unfilled_conditional(order):
+            self._apply_position(symbol, side, quantity, reference_price)
         event.update(
             {
                 "status": "submitted",
@@ -532,12 +566,16 @@ class BinanceTestnetBroker:
         account = self._signed_get("/fapi/v2/account")
         positions = self._signed_get("/fapi/v2/positionRisk", symbol_param)
         open_orders = self._signed_get("/fapi/v1/openOrders", symbol_param)
+        # Fail closed: protective orders live on the Algo Order API, so treating
+        # an openAlgoOrders failure as an empty list could duplicate TP/SL orders.
+        open_algo_orders = self._signed_get("/fapi/v1/openAlgoOrders", symbol_param)
         return {
             "environment": self.environment,
             **_now_stamps(),
             "account": redact_sensitive_testnet_fields(account),
             "positions": redact_sensitive_testnet_fields(positions),
             "open_orders": redact_sensitive_testnet_fields(open_orders),
+            "open_algo_orders": redact_sensitive_testnet_fields(open_algo_orders),
         }
 
     def reconcile_open_orders(self, open_orders: list[dict[str, Any]]) -> dict[str, Any]:
@@ -554,8 +592,12 @@ class BinanceTestnetBroker:
         }
 
     def load_positions_from_account_snapshot(self, snapshot: Mapping[str, Any] | None) -> dict[str, PortfolioPosition]:
-        """Seed local reconciliation state from signed testnet positionRisk rows."""
+        """Seed local reconciliation state from signed testnet positionRisk/open-order rows."""
         positions_payload = snapshot.get("positions") if isinstance(snapshot, Mapping) else None
+        open_orders_payload = snapshot.get("open_orders") if isinstance(snapshot, Mapping) else None
+        open_algo_orders_payload = snapshot.get("open_algo_orders") if isinstance(snapshot, Mapping) else None
+        self.open_orders = list(open_orders_payload) if isinstance(open_orders_payload, list) else []
+        self.open_algo_orders = list(open_algo_orders_payload) if isinstance(open_algo_orders_payload, list) else []
         loaded: dict[str, PortfolioPosition] = {}
         rows = positions_payload if isinstance(positions_payload, list) else []
         for item in rows:
@@ -594,8 +636,9 @@ class BinanceTestnetBroker:
         return loaded
 
     def _build_client_order_id(self, symbol: str) -> str:
-        sequence = len(self.fills) + self.submitted_order_count + self.accepted_order_count + 1
-        return f"{self.client_order_id_prefix}-{sequence}"
+        epoch_ms = int(datetime.now(UTC).timestamp() * 1000)
+        entropy = uuid.uuid4().hex[:6]
+        return f"{self.client_order_id_prefix}-{symbol.upper()}-{epoch_ms}-{entropy}"
 
     def _append_order_journal(self, event: dict[str, Any]) -> None:
         if not self.order_journal_path:
@@ -675,6 +718,8 @@ class BinanceTestnetBroker:
             "base_url": self.base_url,
             "dry_run": self.dry_run,
             "positions": {symbol: asdict(position) for symbol, position in self.positions.items()},
+            "open_orders": list(self.open_orders),
+            "open_algo_orders": list(self.open_algo_orders),
             "fills": list(self.fills),
             "submitted_order_count": self.submitted_order_count,
             "accepted_order_count": self.accepted_order_count,
@@ -750,6 +795,32 @@ class BinanceTestnetBroker:
             "instruction": redact_sensitive_testnet_fields(_instruction_record(order)),
         }
 
+
+
+def _metadata_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_order_price(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _is_algo_conditional(order: OrderInstruction) -> bool:
+    return order.order_type.upper() in {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT", "TRAILING_STOP_MARKET"}
+
+
+def _is_unfilled_conditional(order: OrderInstruction) -> bool:
+    return _is_algo_conditional(order)
 
 def _weighted_average(pairs: list[tuple[float, float]]) -> float:
     numerator = sum(quantity * price for quantity, price in pairs)

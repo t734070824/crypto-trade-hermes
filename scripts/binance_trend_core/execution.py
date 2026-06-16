@@ -85,11 +85,10 @@ class PositionReconciliationExecutionEngine:
             "desired_exposure": desired_exposure,
             "delta_exposure": delta,
         }
-        if abs(delta) <= self.min_delta:
-            return ExecutionPlan(instructions=[], metadata={**metadata, "skipped": True, "reason": "target_exposure_already_reached"})
         signal = intent.metadata.get("signal") if isinstance(intent.metadata, dict) else None
-        return ExecutionPlan(
-            instructions=[
+        instructions: list[OrderInstruction] = []
+        if abs(delta) > self.min_delta:
+            instructions.append(
                 OrderInstruction(
                     symbol=intent.symbol,
                     side="BUY" if delta > 0 else "SELL",
@@ -103,9 +102,11 @@ class PositionReconciliationExecutionEngine:
                         "delta_exposure": delta,
                     },
                 )
-            ],
-            metadata=metadata,
-        )
+            )
+        instructions.extend(_protective_orders(intent.symbol, desired_exposure, current_exposure, signal, portfolio_state))
+        if not instructions:
+            return ExecutionPlan(instructions=[], metadata={**metadata, "skipped": True, "reason": "target_exposure_already_reached"})
+        return ExecutionPlan(instructions=instructions, metadata=metadata)
 
 
 def _reference_price_from_signal(signal: Any) -> float:
@@ -133,3 +134,87 @@ def _current_symbol_exposure(portfolio_state: dict[str, Any], symbol: str) -> fl
         if isinstance(item, dict):
             return float(item.get("size") or item.get("positionAmt") or item.get("position_amt") or 0.0)
     return 0.0
+
+
+def _protective_orders(
+    symbol: str,
+    desired_exposure: float,
+    current_exposure: float,
+    signal: Any,
+    portfolio_state: dict[str, Any],
+) -> list[OrderInstruction]:
+    if not isinstance(signal, dict):
+        return []
+    target_exposure = max(float(desired_exposure or 0.0), float(current_exposure or 0.0))
+    if target_exposure <= 0:
+        return []
+    reference_price = _reference_price_from_signal(signal)
+    stop_price = _positive_signal_price(signal.get("trailing_stop"))
+    take_profit_price = _positive_signal_price(signal.get("take_profit_2") or signal.get("take_profit_1"))
+    orders: list[OrderInstruction] = []
+    if stop_price is not None and not _has_open_protection(portfolio_state, symbol, "stop_loss"):
+        orders.append(
+            OrderInstruction(
+                symbol=symbol,
+                side="SELL",
+                quantity=abs(target_exposure),
+                order_type="STOP_MARKET",
+                metadata={
+                    "protective_order": True,
+                    "protection_role": "stop_loss",
+                    "close_position": True,
+                    "working_type": "MARK_PRICE",
+                    "stop_price": stop_price,
+                    "reference_price": reference_price,
+                    "action": "protect_long",
+                },
+            )
+        )
+    if take_profit_price is not None and not _has_open_protection(portfolio_state, symbol, "take_profit"):
+        orders.append(
+            OrderInstruction(
+                symbol=symbol,
+                side="SELL",
+                quantity=abs(target_exposure),
+                order_type="TAKE_PROFIT_MARKET",
+                metadata={
+                    "protective_order": True,
+                    "protection_role": "take_profit",
+                    "close_position": True,
+                    "working_type": "MARK_PRICE",
+                    "stop_price": take_profit_price,
+                    "reference_price": reference_price,
+                    "action": "protect_long",
+                },
+            )
+        )
+    return orders
+
+
+def _positive_signal_price(value: Any) -> float | None:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+def _has_open_protection(portfolio_state: dict[str, Any], symbol: str, role: str) -> bool:
+    symbol = symbol.upper()
+    wanted_types = {"stop_loss": {"STOP", "STOP_MARKET"}, "take_profit": {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}}.get(role, set())
+    rows: list[Any] = []
+    for key in ("open_orders", "openOrders", "open_algo_orders", "openAlgoOrders"):
+        value = portfolio_state.get(key) or []
+        if isinstance(value, dict):
+            value = value.get(symbol) or value.get(symbol.upper()) or []
+        if isinstance(value, list):
+            rows.extend(value)
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("symbol", "")).upper() != symbol:
+            continue
+        order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
+        if order_type in wanted_types and str(item.get("side", "SELL")).upper() == "SELL":
+            return True
+    return False

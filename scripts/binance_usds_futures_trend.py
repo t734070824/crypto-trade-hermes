@@ -327,6 +327,90 @@ def decide(
     }
 
 
+
+def apply_account_risk_sizing_to_signal(
+    signal: dict[str, Any],
+    account_snapshot: dict[str, Any] | None,
+    *,
+    account_risk_fraction: float = 0.01,
+    target_leverage: float = 2.0,
+    max_order_notional: float | None = None,
+    max_symbol_exposure: float | None = None,
+) -> dict[str, Any]:
+    """Size desired exposure from available margin and stop distance.
+
+    The returned ``position_size`` is a desired total contract quantity. The
+    position-reconciliation execution engine later submits only the delta versus
+    the current broker position.
+    """
+    sized = dict(signal)
+    if sized.get("action") != "hold_long":
+        return sized
+    if account_risk_fraction <= 0 or target_leverage <= 0:
+        raise ValueError("account_risk_fraction and target_leverage must be positive")
+    entry_price = _positive_number(sized.get("entry_reference"), "entry_reference")
+    stop_price = _positive_number(sized.get("trailing_stop"), "trailing_stop")
+    stop_distance = entry_price - stop_price
+    if stop_distance <= 0:
+        raise ValueError("trailing_stop must be below entry_reference for long risk sizing")
+    available_balance = _available_balance_from_snapshot(account_snapshot)
+    risk_budget = available_balance * account_risk_fraction
+    qty_by_stop_risk = risk_budget / stop_distance
+    max_notional_by_margin = available_balance * target_leverage
+    constraints = ["stop_distance_risk_budget"]
+    notional_cap = max_notional_by_margin
+    if max_order_notional is not None:
+        notional_cap = min(notional_cap, float(max_order_notional))
+        constraints.append("max_order_notional_cap")
+    if max_symbol_exposure is not None:
+        notional_cap = min(notional_cap, float(max_symbol_exposure))
+        constraints.append("max_symbol_exposure_cap")
+    qty_by_notional_cap = notional_cap / entry_price
+    desired_qty = max(0.0, min(qty_by_stop_risk, qty_by_notional_cap))
+    sized["position_size"] = round(desired_qty, 8)
+    sized["account_risk_sizing"] = {
+        "method": "available_balance_stop_distance_leverage_cap",
+        "available_balance": round(available_balance, 8),
+        "account_risk_fraction": round(float(account_risk_fraction), 8),
+        "risk_budget": round(risk_budget, 8),
+        "entry_reference": round(entry_price, 8),
+        "trailing_stop": round(stop_price, 8),
+        "stop_distance": round(stop_distance, 8),
+        "target_leverage": round(float(target_leverage), 8),
+        "max_notional_by_margin": round(max_notional_by_margin, 8),
+        "effective_notional_cap": round(notional_cap, 8),
+        "qty_by_stop_risk": round(qty_by_stop_risk, 8),
+        "qty_by_notional_cap": round(qty_by_notional_cap, 8),
+        "desired_position_size": round(desired_qty, 8),
+        "constraints_applied": constraints,
+    }
+    return sized
+
+
+def _positive_number(value: Any, field_name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive finite number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{field_name} must be a positive finite number")
+    return parsed
+
+
+def _available_balance_from_snapshot(account_snapshot: dict[str, Any] | None) -> float:
+    account = account_snapshot.get("account") if isinstance(account_snapshot, dict) else None
+    if not isinstance(account, dict):
+        raise ValueError("account snapshot is required for account risk sizing")
+    for key in ("availableBalance", "available_balance", "maxWithdrawAmount"):
+        if key in account:
+            return _positive_number(account[key], key)
+    for asset in account.get("assets") or []:
+        if isinstance(asset, dict) and str(asset.get("asset", "")).upper() == "USDT":
+            for key in ("availableBalance", "maxWithdrawAmount", "walletBalance"):
+                if key in asset:
+                    return _positive_number(asset[key], f"USDT.{key}")
+    raise ValueError("account snapshot missing availableBalance")
+
 def enrich_for_ranking(decision: dict[str, Any], timeframe_agreement_score: float = 1.0) -> dict[str, Any]:
     """Add portfolio-ranking fields to one paper decision."""
     enriched = dict(decision)
@@ -1879,6 +1963,8 @@ def run_testnet_trading_cycle(
     config_version: str = "default",
     base_url: str = BINANCE_FAPI_BASE,
     risk_unit: float = 1.0,
+    account_risk_fraction: float = 0.01,
+    target_leverage: float = 2.0,
     testnet_base_url: str | None = None,
     dry_run: bool = True,
     max_order_notional: float = 1_000.0,
@@ -1954,7 +2040,20 @@ def run_testnet_trading_cycle(
         ),
         broker=broker,
         signal_engine=FunctionSignalEngine(
-            decide_fn=lambda candles, symbol, interval, **kwargs: decide(
+            decide_fn=lambda candles, symbol, interval, **kwargs: apply_account_risk_sizing_to_signal(
+                decide(
+                    candles,
+                    symbol=symbol,
+                    interval=interval,
+                    risk_unit=risk_unit,
+                    market_context=None,
+                ),
+                account_sync_before,
+                account_risk_fraction=account_risk_fraction,
+                target_leverage=target_leverage,
+                max_order_notional=max_order_notional,
+                max_symbol_exposure=max_symbol_exposure,
+            ) if account_sync_before is not None else decide(
                 candles,
                 symbol=symbol,
                 interval=interval,
@@ -1964,7 +2063,7 @@ def run_testnet_trading_cycle(
         ),
         strategy=TrendParticipationStrategy(),
         risk_manager=FunctionRiskManager(),
-        execution_engine=PositionReconciliationExecutionEngine(),
+        execution_engine=PositionReconciliationExecutionEngine(min_delta=0.001),
     )
     if track_order_lifecycle and not dry_run:
         lifecycle_events = []
@@ -1972,7 +2071,11 @@ def run_testnet_trading_cycle(
             client_order_id = fill.get("client_order_id") if isinstance(fill, dict) else None
             symbol = fill.get("symbol") if isinstance(fill, dict) else None
             status = fill.get("status") if isinstance(fill, dict) else None
+            instruction = fill.get("instruction") if isinstance(fill, dict) else None
+            metadata = instruction.get("metadata") if isinstance(instruction, dict) else {}
             if not client_order_id or not symbol or status not in {"submitted", "submitted_confirmed", "submitted_unknown"}:
+                continue
+            if isinstance(metadata, dict) and metadata.get("protective_order"):
                 continue
             lifecycle_events.append(
                 broker.track_order_lifecycle(
@@ -2094,6 +2197,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--testnet-max-symbol-exposure", type=float, default=2_000.0, help="Max testnet symbol exposure before rejection")
     parser.add_argument("--testnet-max-daily-loss", type=float, default=100.0, help="Max testnet daily loss before rejection")
     parser.add_argument("--testnet-max-order-count", type=int, default=10, help="Max testnet accepted order count per cycle")
+    parser.add_argument("--account-risk-fraction", type=float, default=0.01, help="For testnet cycle account sizing: fraction of available balance risked to ATR stop distance")
+    parser.add_argument("--target-leverage", type=float, default=2.0, help="For testnet cycle account sizing: target leverage cap used to derive max notional")
     parser.add_argument("--testnet-kill-switch", action="store_true", help="Reject all testnet execution before signing/submission")
     parser.add_argument("--testnet-risk-config-file", help="Optional JSON testnet risk config; supports max_* limits and kill_switch")
     parser.add_argument("--testnet-order-journal-file", help="Append-only JSONL order journal for signed testnet submissions")
@@ -2268,6 +2373,8 @@ def main(argv: list[str] | None = None) -> int:
                 config_version=args.config_version,
                 base_url=args.base_url,
                 risk_unit=args.risk_unit,
+                account_risk_fraction=args.account_risk_fraction,
+                target_leverage=args.target_leverage,
                 testnet_base_url=args.testnet_base_url,
                 dry_run=not args.testnet_submit_signed,
                 max_order_notional=risk_limits.max_order_notional,

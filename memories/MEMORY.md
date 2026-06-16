@@ -14,4 +14,4 @@ Binance API 密钥值属于敏感信息；当前 profile .env 中变量名为 LA
 §
 crypto-trade-hermes 运行过程中必须记录运行时数据；未来会基于真实运行结果持续评估并进化策略。
 §
-用户强调 crypto-trade-hermes 的定时任务应服务于“用 Hermes Skills 构建 Binance USDS-M 合约实时交易”的总目标；no_agent 脚本型 cron 只能定位为 runtime evidence collector，若要符合 Skill-driven 交易目标，还应有加载 binance-usds-futures-trend Skill 的 agent 型分析/进化任务。
+用户强调 crypto-trade-hermes 的定时任务应服务于“用 Hermes Skills 构建 Binance USDS-M 合约实时交易”的总目标；偏好由一个加载 binance-usds-futures-trend Skill 的 agent 型 cron 处理 testnet 交易全流程，no_agent 脚本型 cron 只能定位为 runtime evidence collector。
