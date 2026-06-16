@@ -4,6 +4,7 @@ import importlib.util
 import inspect
 import io
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -144,6 +145,181 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(instruction.quantity, 1.25)
         self.assertTrue(instruction.metadata["paper_intent"])
 
+    def test_testnet_broker_uses_testnet_base_url_only(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=True,
+        )
+
+        self.assertEqual(broker.environment, "testnet")
+        self.assertIn("testnet.binancefuture.com", broker.base_url)
+        with self.assertRaises(ValueError):
+            brokers.BinanceTestnetBroker(
+                credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+                base_url="https://fapi.binance.com",
+                dry_run=True,
+            )
+        with self.assertRaises(ValueError):
+            brokers.BinanceTestnetBroker(
+                credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+                base_url="https://testnet.binancefuture.com.evil.example",
+                dry_run=True,
+            )
+
+    def test_testnet_broker_fails_closed_when_credentials_missing(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            brokers.resolve_binance_testnet_credentials(env={})
+
+        message = str(ctx.exception)
+        self.assertIn("LALA_KEY", message)
+        self.assertIn("LALA_SECRET", message)
+        self.assertNotIn("api_key", message.lower())
+        self.assertNotIn("secret=", message.lower())
+
+    def test_testnet_broker_dry_run_never_signs_or_submits(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        class ExplodingHttpClient:
+            def request(self, *args, **kwargs):
+                raise AssertionError("dry-run must not submit HTTP requests")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=True,
+            http_client=ExplodingHttpClient(),
+        )
+        broker._sign_params = lambda params: (_ for _ in ()).throw(AssertionError("dry-run must not sign"))
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=0.1,
+                metadata={"reference_price": 100.0},
+            )
+        )
+
+        self.assertEqual(event["environment"], "testnet")
+        self.assertTrue(event["testnet_dry_run"])
+        self.assertFalse(event["real_order_submitted"])
+        self.assertFalse(event["signed"])
+        self.assertEqual(broker.submitted_order_count, 0)
+
+    def test_testnet_runtime_record_redacts_sensitive_fields(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+
+        payload = {
+            "apiKey": "key-value",
+            "secret": "secret-value",
+            "signature": "abc123",
+            "nested": {"X-MBX-APIKEY": "key-value", "orderId": "12345", "clientOrderId": "client-1"},
+        }
+        redacted = brokers.redact_sensitive_testnet_fields(payload)
+        encoded = json.dumps(redacted)
+
+        self.assertNotIn("key-value", encoded)
+        self.assertNotIn("secret-value", encoded)
+        self.assertNotIn("abc123", encoded)
+        self.assertIn("<redacted>", encoded)
+        self.assertEqual(redacted["nested"]["orderId"], "12345")
+
+    def test_testnet_broker_blocks_oversized_order_before_signing(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10.0),
+        )
+        broker._sign_params = lambda params: (_ for _ in ()).throw(AssertionError("risk rejection must happen before signing"))
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=1.0,
+                metadata={"reference_price": 100.0},
+            )
+        )
+
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason"], "max_order_notional_exceeded")
+        self.assertFalse(event["real_order_submitted"])
+
+    def test_testnet_broker_rejects_missing_reference_price_before_signing(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10.0),
+        )
+        broker._sign_params = lambda params: (_ for _ in ()).throw(AssertionError("invalid reference price must reject before signing"))
+
+        event = broker.submit_order(execution.OrderInstruction(symbol="BTCUSDT", side="BUY", quantity=1000.0))
+
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason"], "invalid_reference_price")
+        self.assertFalse(event["real_order_submitted"])
+        self.assertFalse(event["signed"])
+
+    def test_testnet_broker_sanitizes_unknown_signed_submission_failures(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        class LeakyHttpClient:
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                raise RuntimeError(f"boom url={url} key={(headers or {}).get('X-MBX-APIKEY')}")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000.0),
+            http_client=LeakyHttpClient(),
+        )
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=1.0,
+                metadata={"reference_price": 100.0},
+            )
+        )
+        encoded = json.dumps(event)
+
+        self.assertEqual(event["status"], "submitted_unknown")
+        self.assertTrue(event["real_order_submitted"])
+        self.assertTrue(event["attempted_real_order_submitted"])
+        self.assertTrue(event["signed"])
+        self.assertEqual(broker.submitted_order_count, 1)
+        self.assertNotIn("signature=", encoded)
+        self.assertNotIn("X-MBX-APIKEY", encoded)
+        self.assertNotIn("boom url=", encoded)
+
+    def test_testnet_broker_kill_switch_blocks_all_execution(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(kill_switch=True),
+        )
+
+        event = broker.submit_order(execution.OrderInstruction(symbol="BTCUSDT", side="BUY", quantity=0.1))
+
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason"], "kill_switch_enabled")
+        self.assertFalse(event["real_order_submitted"])
+
     def test_shared_trading_cycle_records_portfolio_state_and_runtime_evidence(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
         execution = importlib.import_module("scripts.binance_trend_core.execution")
@@ -273,6 +449,88 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertFalse(cycle["runtime_record_saved"])
         self.assertFalse(runtime_path.exists())
         self.assertGreaterEqual(cycle["runtime_record"]["execution_events"]["simulated_fills_count"], 1)
+
+    def test_cli_can_run_testnet_dry_run_cycle_with_shared_loop_and_no_secret_output(self):
+        def make_candles(start, step):
+            candles = []
+            price = float(start)
+            for _ in range(240):
+                open_price = price
+                close_price = price + step
+                high = max(open_price, close_price) + 0.7
+                low = min(open_price, close_price) - 0.5
+                candles.append({"open": open_price, "high": high, "low": low, "close": close_price})
+                price = close_price
+            return candles
+
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        original_env = {name: os.environ.get(name) for name in ("LALA_KEY", "LALA_SECRET")}
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: make_candles(100, 1.0))
+        os.environ["LALA_KEY"] = "test-key-value"
+        os.environ["LALA_SECRET"] = "test-secret-value"
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                runtime_path = pathlib.Path(tmpdir) / "testnet-cycle.jsonl"
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc = trend.main([
+                        "--run-testnet-cycle",
+                        "--symbols", "BTCUSDT",
+                        "--interval", "1h",
+                        "--limit", "240",
+                        "--runtime-record-file", str(runtime_path),
+                        "--no-save-runtime-record",
+                        "--testnet-dry-run",
+                        "--testnet-max-order-notional", "1000000",
+                    ])
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+            for name, value in original_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.assertEqual(rc, 0)
+        output = stdout.getvalue()
+        self.assertNotIn("test-key-value", output)
+        self.assertNotIn("test-secret-value", output)
+        payload = json.loads(output)
+        self.assertTrue(payload["ok"])
+        cycle = payload["testnet_cycle"]
+        self.assertEqual(cycle["environment"], "testnet")
+        self.assertEqual(cycle["runtime_record"]["environment"], "testnet")
+        self.assertFalse(cycle["real_orders_submitted"])
+        self.assertFalse(cycle["runtime_record_saved"])
+        self.assertFalse(runtime_path.exists())
+        self.assertTrue(cycle["fills"][0]["testnet_dry_run"])
+        self.assertIn("testnet.binancefuture.com", cycle["portfolio_state"]["base_url"])
+
+    def test_cli_testnet_cycle_rejects_short_interval_before_broker_execution(self):
+        original_env = {name: os.environ.get(name) for name in ("LALA_KEY", "LALA_SECRET")}
+        os.environ["LALA_KEY"] = "test-key-value"
+        os.environ["LALA_SECRET"] = "test-secret-value"
+        try:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = trend.main([
+                    "--run-testnet-cycle",
+                    "--symbols", "BTCUSDT",
+                    "--interval", "30m",
+                    "--testnet-dry-run",
+                ])
+        finally:
+            for name, value in original_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.assertEqual(rc, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertIn("short interval", payload["error"])
+        self.assertNotIn("test-key-value", stdout.getvalue())
+        self.assertNotIn("test-secret-value", stdout.getvalue())
 
     def test_runtime_evidence_loader_rejects_records_without_schema_environment_or_timestamps(self):
         evolution = importlib.import_module("scripts.binance_trend_core.evolution")

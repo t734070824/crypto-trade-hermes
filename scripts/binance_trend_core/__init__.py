@@ -1,11 +1,20 @@
 """Core realtime trading interfaces for Binance USDS-M trend system.
 
-v1.4 only defines stable boundaries and lightweight wrappers. It does not
-submit signed Binance orders; broker-specific behavior must stay isolated in
+v1.7 includes a Binance futures testnet broker adapter. Live/mainnet execution
+remains unimplemented; broker-specific behavior must stay isolated in
 BrokerAdapter implementations.
 """
 
-from .brokers import BrokerAdapter, PaperBroker, RejectingBrokerAdapter
+from .brokers import (
+    BinanceTestnetBroker,
+    BinanceTestnetCredentials,
+    BrokerAdapter,
+    PaperBroker,
+    RejectingBrokerAdapter,
+    TestnetRiskLimits,
+    redact_sensitive_testnet_fields,
+    resolve_binance_testnet_credentials,
+)
 from .evolution import build_runtime_replay_dataset, compare_runtime_strategy_variants, load_runtime_records
 from .execution import ExecutionEngine, ExecutionPlan, OrderInstruction, PaperIntentExecutionEngine
 from .loop import TradingCycleConfig, run_trading_cycle
@@ -18,6 +27,8 @@ from .strategy import TrendParticipationStrategy, Strategy
 from .types import MarketDataRequest, StrategyIntent
 
 __all__ = [
+    "BinanceTestnetBroker",
+    "BinanceTestnetCredentials",
     "BrokerAdapter",
     "ExecutionEngine",
     "ExecutionPlan",
@@ -40,8 +51,11 @@ __all__ = [
     "StrategyIntent",
     "TrendParticipationStrategy",
     "TradingCycleConfig",
+    "TestnetRiskLimits",
     "build_runtime_replay_dataset",
     "compare_runtime_strategy_variants",
     "load_runtime_records",
+    "redact_sensitive_testnet_fields",
+    "resolve_binance_testnet_credentials",
     "run_trading_cycle",
 ]

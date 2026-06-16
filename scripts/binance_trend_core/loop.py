@@ -1,7 +1,8 @@
 """Shared trading loop for paper/testnet/live adapter orchestration.
 
-v1.5 keeps the loop side-effect boundary at BrokerAdapter. The included
-PaperBroker simulates fills; signed testnet/live adapters are not implemented.
+PaperBroker simulates fills. BinanceTestnetBroker can use the same loop while
+keeping signed testnet execution isolated behind the broker adapter. Live remains
+unimplemented.
 """
 
 from __future__ import annotations

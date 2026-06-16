@@ -1851,9 +1851,113 @@ def run_paper_trading_cycle(
         risk_manager=FunctionRiskManager(),
         execution_engine=PaperIntentExecutionEngine(),
     )
+    return _attach_cycle_runtime_record_receipt(
+        cycle,
+        runtime_record_file=runtime_record_file,
+        save_runtime_record=save_runtime_record,
+        change_mode="paper",
+    )
+
+
+def run_testnet_trading_cycle(
+    symbols: Iterable[str],
+    interval: str = "1h",
+    limit: int = 240,
+    runtime_record_file: str | os.PathLike[str] | None = None,
+    save_runtime_record: bool = True,
+    strategy_version: str = "ema50_ema200_atr_trend_testnet",
+    config_version: str = "default",
+    base_url: str = BINANCE_FAPI_BASE,
+    risk_unit: float = 1.0,
+    testnet_base_url: str | None = None,
+    dry_run: bool = True,
+    max_order_notional: float = 1_000.0,
+    max_symbol_exposure: float = 2_000.0,
+    max_daily_loss: float = 100.0,
+    max_order_count: int = 10,
+    kill_switch: bool = False,
+) -> dict[str, Any]:
+    """Run one shared trading cycle with Binance USDS-M futures testnet adapter.
+
+    Defaults to dry-run: it builds auditable testnet execution events but does not
+    sign or submit HTTP requests unless the caller explicitly disables dry-run.
+    """
+    try:
+        from scripts.binance_trend_core.brokers import BinanceTestnetBroker, TestnetRiskLimits, resolve_binance_testnet_credentials
+        from scripts.binance_trend_core.execution import PaperIntentExecutionEngine
+        from scripts.binance_trend_core.loop import TradingCycleConfig, run_trading_cycle
+        from scripts.binance_trend_core.risk import FunctionRiskManager
+        from scripts.binance_trend_core.signals import FunctionSignalEngine
+        from scripts.binance_trend_core.strategy import TrendParticipationStrategy
+    except ModuleNotFoundError:
+        from binance_trend_core.brokers import BinanceTestnetBroker, TestnetRiskLimits, resolve_binance_testnet_credentials
+        from binance_trend_core.execution import PaperIntentExecutionEngine
+        from binance_trend_core.loop import TradingCycleConfig, run_trading_cycle
+        from binance_trend_core.risk import FunctionRiskManager
+        from binance_trend_core.signals import FunctionSignalEngine
+        from binance_trend_core.strategy import TrendParticipationStrategy
+
+    selected_symbols = [validate_symbol(symbol) for symbol in symbols]
+    interval = validate_interval(interval)
+    candles_by_symbol = {
+        symbol: fetch_klines(symbol, interval, limit, base_url)
+        for symbol in selected_symbols
+    }
+    broker_kwargs: dict[str, Any] = {
+        "credentials": resolve_binance_testnet_credentials(),
+        "dry_run": dry_run,
+        "risk_limits": TestnetRiskLimits(
+            max_order_notional=max_order_notional,
+            max_symbol_exposure=max_symbol_exposure,
+            max_daily_loss=max_daily_loss,
+            max_order_count=max_order_count,
+            kill_switch=kill_switch,
+        ),
+    }
+    if testnet_base_url:
+        broker_kwargs["base_url"] = testnet_base_url
+    broker = BinanceTestnetBroker(**broker_kwargs)
+    cycle = run_trading_cycle(
+        TradingCycleConfig(
+            symbols=selected_symbols,
+            interval=interval,
+            limit=limit,
+            candles_by_symbol=candles_by_symbol,
+            strategy_version=strategy_version,
+            config_version=config_version,
+        ),
+        broker=broker,
+        signal_engine=FunctionSignalEngine(
+            decide_fn=lambda candles, symbol, interval, **kwargs: decide(
+                candles,
+                symbol=symbol,
+                interval=interval,
+                risk_unit=risk_unit,
+                market_context=None,
+            )
+        ),
+        strategy=TrendParticipationStrategy(),
+        risk_manager=FunctionRiskManager(),
+        execution_engine=PaperIntentExecutionEngine(),
+    )
+    return _attach_cycle_runtime_record_receipt(
+        cycle,
+        runtime_record_file=runtime_record_file,
+        save_runtime_record=save_runtime_record,
+        change_mode="testnet",
+    )
+
+
+def _attach_cycle_runtime_record_receipt(
+    cycle: dict[str, Any],
+    *,
+    runtime_record_file: str | os.PathLike[str] | None,
+    save_runtime_record: bool,
+    change_mode: str,
+) -> dict[str, Any]:
     cycle["runtime_record_saved"] = False
     cycle["runtime_record_change"] = {
-        "mode": "paper",
+        "mode": change_mode,
         **now_stamps(),
         "schema_version": cycle["runtime_record"].get("schema_version"),
         "environment": cycle.get("environment"),
@@ -1911,13 +2015,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backtest", action="store_true", help="Run v0.9 paper-only historical backtest instead of current scan/decision")
     parser.add_argument("--compare-refinements", action="store_true", help="Run v1.0 paper-only evidence-based strategy refinement comparison")
     parser.add_argument("--run-paper-cycle", action="store_true", help="Run v1.5 shared trading loop with PaperBroker simulated fills")
+    parser.add_argument("--run-testnet-cycle", action="store_true", help="Run v1.7 shared trading loop with Binance futures testnet adapter")
     parser.add_argument("--replay-runtime-evidence", action="store_true", help="Run v1.6 strategy evolution replay from recorded runtime evidence JSONL")
     parser.add_argument("--initial-equity", type=float, default=10_000.0, help="Paper initial equity per symbol for backtest/cycle")
     parser.add_argument("--fee-bps", type=float, default=4.0, help="Paper transaction fee in basis points for backtest turnover")
     parser.add_argument("--max-position-size", type=float, default=1.0, help="Max paper long exposure per symbol for backtest")
     parser.add_argument("--max-drawdown-worsening-limit", type=float, default=0.03, help="Max allowed absolute drawdown worsening for v1.0 refinement candidates")
     parser.add_argument("--runtime-record-file", help="Optional v1.3 append-only runtime evidence JSONL path; scan mode only")
-    parser.add_argument("--runtime-environment", default="paper", choices=["paper"], help="Runtime evidence environment; v1.3 supports paper only")
+    parser.add_argument("--runtime-environment", default="paper", choices=["paper"], help="Runtime evidence environment for scan evidence; scan supports paper only")
+    parser.add_argument("--testnet-base-url", help="Override Binance Futures testnet base URL for tests; must stay on testnet host")
+    parser.add_argument("--testnet-dry-run", action="store_true", help="For --run-testnet-cycle, build testnet events without signing/submitting; default safe behavior")
+    parser.add_argument("--testnet-submit-signed", action="store_true", help="For --run-testnet-cycle, submit signed testnet orders; never mainnet/live")
+    parser.add_argument("--testnet-max-order-notional", type=float, default=1_000.0, help="Max testnet order notional before rejection")
+    parser.add_argument("--testnet-max-symbol-exposure", type=float, default=2_000.0, help="Max testnet symbol exposure before rejection")
+    parser.add_argument("--testnet-max-daily-loss", type=float, default=100.0, help="Max testnet daily loss before rejection")
+    parser.add_argument("--testnet-max-order-count", type=int, default=10, help="Max testnet accepted order count per cycle")
+    parser.add_argument("--testnet-kill-switch", action="store_true", help="Reject all testnet execution before signing/submission")
     parser.add_argument("--strategy-version", default="ema50_ema200_atr_trend_paper", help="Strategy version label stored in v1.3 runtime evidence")
     parser.add_argument("--config-version", default="default", help="Config version label stored in v1.3 runtime evidence")
     parser.add_argument("--no-save-runtime-record", action="store_true", help="Build runtime evidence without appending --runtime-record-file")
@@ -1928,9 +2041,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     try:
-        selected_modes = [bool(args.compare_refinements), bool(args.backtest), bool(args.run_paper_cycle), bool(args.replay_runtime_evidence)]
+        selected_modes = [bool(args.compare_refinements), bool(args.backtest), bool(args.run_paper_cycle), bool(args.run_testnet_cycle), bool(args.replay_runtime_evidence)]
         if sum(selected_modes) > 1:
-            raise ValueError("choose only one mode: --compare-refinements, --backtest, --run-paper-cycle, or --replay-runtime-evidence")
+            raise ValueError("choose only one mode: --compare-refinements, --backtest, --run-paper-cycle, --run-testnet-cycle, or --replay-runtime-evidence")
         if args.replay_runtime_evidence:
             if not args.runtime_record_file:
                 raise ValueError("--replay-runtime-evidence requires --runtime-record-file")
@@ -2014,7 +2127,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.intervals:
                 raise ValueError("--run-paper-cycle uses one --interval; omit --intervals")
             if args.runtime_environment != "paper":
-                raise ValueError("--run-paper-cycle currently supports --runtime-environment paper only")
+                raise ValueError("--run-paper-cycle supports --runtime-environment paper only")
             if args.all_symbols:
                 symbols = list(DEFAULT_SYMBOLS)
             elif args.symbols:
@@ -2035,6 +2148,46 @@ def main(argv: list[str] | None = None) -> int:
                 fee_bps=args.fee_bps,
             )
             print(json.dumps({"ok": not bool(cycle["errors"]), "paper_cycle": cycle}, ensure_ascii=False, indent=2))
+            return 0 if not cycle["errors"] else 1
+
+        if args.run_testnet_cycle:
+            if args.state_file:
+                raise ValueError("--state-file is for scan state only; omit it for --run-testnet-cycle")
+            if args.lifecycle_file:
+                raise ValueError("--lifecycle-file is for scan lifecycle only; omit it for --run-testnet-cycle")
+            if args.telegram_brief:
+                raise ValueError("--telegram-brief is for scan briefings only; omit it for --run-testnet-cycle")
+            if args.intervals:
+                raise ValueError("--run-testnet-cycle uses one --interval; omit --intervals")
+            if args.runtime_environment not in {"paper", "testnet"}:
+                raise ValueError("unsupported --runtime-environment for --run-testnet-cycle")
+            if args.testnet_dry_run and args.testnet_submit_signed:
+                raise ValueError("choose only one: --testnet-dry-run or --testnet-submit-signed")
+            if args.all_symbols:
+                symbols = list(DEFAULT_SYMBOLS)
+            elif args.symbols:
+                symbols = [part.strip().upper() for part in args.symbols.split(",") if part.strip()]
+            else:
+                symbols = [args.symbol.upper()]
+            cycle = run_testnet_trading_cycle(
+                symbols=symbols,
+                interval=args.interval,
+                limit=args.limit,
+                runtime_record_file=args.runtime_record_file,
+                save_runtime_record=not args.no_save_runtime_record,
+                strategy_version=args.strategy_version,
+                config_version=args.config_version,
+                base_url=args.base_url,
+                risk_unit=args.risk_unit,
+                testnet_base_url=args.testnet_base_url,
+                dry_run=not args.testnet_submit_signed,
+                max_order_notional=args.testnet_max_order_notional,
+                max_symbol_exposure=args.testnet_max_symbol_exposure,
+                max_daily_loss=args.testnet_max_daily_loss,
+                max_order_count=args.testnet_max_order_count,
+                kill_switch=args.testnet_kill_switch,
+            )
+            print(json.dumps({"ok": not bool(cycle["errors"]), "testnet_cycle": cycle}, ensure_ascii=False, indent=2))
             return 0 if not cycle["errors"] else 1
 
         if args.all_symbols or args.symbols:

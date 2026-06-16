@@ -211,11 +211,16 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 **Goal:** 基于 recorded runtime evidence replay/comparison 候选策略，禁止凭感觉或漂移样本调参。
 
-### v1.7 — Binance Futures Testnet Adapter 🔒
+### v1.7 — Binance Futures Testnet Adapter ✅
 
-**Status:** planned but locked behind v1.3-v1.6 evidence and explicit user authorization.
+**Status:** implemented in current v1.7 change set: `BinanceTestnetBroker`, credential resolver, testnet-only endpoint guard, dry-run default, signed-testnet separation, risk gates, runtime evidence redaction, and CLI `--run-testnet-cycle`.
 
 **Goal:** 只在 paper/shared loop 稳定后接 Binance futures testnet adapter；仍不接 live。
+
+**Safety boundary:**
+- Default testnet cycle is dry-run and does not sign or submit HTTP orders.
+- Signed submission requires explicit `--testnet-submit-signed` and still only targets Binance futures testnet host.
+- Mainnet/live adapter remains unimplemented and unauthorized.
 
 ### v1.8 — Live Readiness Gates and Audit 🔒
 

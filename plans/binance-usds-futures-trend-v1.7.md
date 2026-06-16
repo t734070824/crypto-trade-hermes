@@ -2,9 +2,25 @@
 
 Created: UTC 2026-06-15 15:44:10 / 北京时间（UTC+8）2026-06-15 23:44:10
 
+## Status
+
+Implemented: UTC 2026-06-16 01:35:05 / 北京时间（UTC+8）2026-06-16 09:35:05
+
 ## Goal
 
 在长期 paper 证据可接受后，实现 Binance USDS-M futures testnet adapter，但仍与 paper 共享同一套 trading loop。
+
+## Implemented Scope
+
+- Added `BinanceTestnetBroker` behind explicit `--run-testnet-cycle` CLI mode.
+- Enforces Binance futures testnet host exactly: `https://testnet.binancefuture.com`; mainnet and lookalike hosts fail closed.
+- Resolves credentials from `LALA_KEY` / `LALA_SECRET` and never prints values.
+- Defaults to dry-run (`--testnet-dry-run` / no signed submit) so no signing or HTTP order submission occurs unless `--testnet-submit-signed` is explicitly supplied.
+- Added fail-closed testnet risk gates: max order notional, max symbol exposure, max daily loss, max order count, kill switch.
+- Signed-path HTTP exceptions are recorded as `submitted_unknown` with sanitized error metadata; raw signed URLs, signatures, and API-key headers must not enter runtime evidence.
+- Testnet broker rejects missing, zero, negative, or non-finite `reference_price` / `entry_reference` before signing, except global kill/order-count/loss gates that reject earlier.
+- Runtime evidence marks `environment=testnet`, preserves UTC / 北京时间（UTC+8） timestamps, and redacts sensitive request/response fields.
+- Paper and testnet reuse `run_trading_cycle`; strategy, risk manager, execution planner, runtime record shape, and interval validation stay shared.
 
 ## Prerequisites
 
