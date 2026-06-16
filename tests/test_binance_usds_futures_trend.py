@@ -1196,6 +1196,542 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertIn(f"origClientOrderId={event['client_order_id']}", broker.http_client.calls[1][1])
         self.assertTrue(event["client_order_id"].startswith("testcid-BTCUSDT-"))
 
+    def test_trading_cycle_prioritizes_missing_take_profit_repairs_before_new_addons_when_order_budget_is_tight(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        portfolio = importlib.import_module("scripts.binance_trend_core.portfolio")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        def signal_for(symbol):
+            base = {"ETHUSDT": 1800.0, "SOLUSDT": 75.0, "BNBUSDT": 615.0}[symbol]
+            return {
+                "symbol": symbol,
+                "interval": "1h",
+                "action": "hold_long",
+                "position_size": {"ETHUSDT": 0.2, "SOLUSDT": 2.0, "BNBUSDT": 0.11}[symbol],
+                "entry_reference": base,
+                "close": base,
+                "trailing_stop": base * 0.98,
+                "take_profit_1": base * 1.01,
+                "take_profit_2": base * 1.02,
+                "reason": "trend",
+            }
+
+        class StaticSignalEngine:
+            def generate_signal(self, candles, *, symbol, interval):
+                return signal_for(symbol)
+
+        class SignalStrategy:
+            def generate_intent(self, signal):
+                return types.StrategyIntent(
+                    symbol=signal["symbol"],
+                    desired_exposure=float(signal["position_size"]),
+                    action="hold_long",
+                    reason="trend",
+                    metadata={"signal": signal},
+                )
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials("key", "secret"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000, max_symbol_exposure=10_000, max_daily_loss=100, max_order_count=2),
+        )
+        broker.positions["BNBUSDT"] = portfolio.PortfolioPosition(symbol="BNBUSDT", size=0.11, entry_price=615.0)
+        broker.open_algo_orders = [
+            {"symbol": "BNBUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": True, "triggerPrice": "610", "algoId": "sl-1"}
+        ]
+
+        result = loop.run_trading_cycle(
+            loop.TradingCycleConfig(
+                symbols=["ETHUSDT", "SOLUSDT", "BNBUSDT"],
+                interval="1h",
+                candles_by_symbol={"ETHUSDT": [{}], "SOLUSDT": [{}], "BNBUSDT": [{}]},
+            ),
+            broker=broker,
+            signal_engine=StaticSignalEngine(),
+            strategy=SignalStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PositionReconciliationExecutionEngine(),
+        )
+
+        dry_run_bnb_tps = [
+            fill for fill in result["fills"]
+            if fill.get("symbol") == "BNBUSDT" and fill.get("order_type") == "TAKE_PROFIT_MARKET" and fill.get("status") == "dry_run"
+        ]
+        rejected_bnb_tps = [
+            fill for fill in result["fills"]
+            if fill.get("symbol") == "BNBUSDT" and fill.get("order_type") == "TAKE_PROFIT_MARKET" and fill.get("status") == "rejected"
+        ]
+
+        self.assertEqual(len(dry_run_bnb_tps), 2)
+        self.assertEqual(rejected_bnb_tps, [])
+
+    def test_trading_cycle_preserves_new_entry_protection_sequence_after_existing_repairs(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        def signal_for(symbol):
+            base = {"ETHUSDT": 1800.0, "SOLUSDT": 75.0}[symbol]
+            return {
+                "symbol": symbol,
+                "interval": "1h",
+                "action": "hold_long",
+                "position_size": {"ETHUSDT": 0.2, "SOLUSDT": 2.0}[symbol],
+                "entry_reference": base,
+                "close": base,
+                "trailing_stop": base * 0.98,
+                "take_profit_1": base * 1.01,
+                "take_profit_2": base * 1.02,
+                "reason": "trend",
+            }
+
+        class StaticSignalEngine:
+            def generate_signal(self, candles, *, symbol, interval):
+                return signal_for(symbol)
+
+        class SignalStrategy:
+            def generate_intent(self, signal):
+                return types.StrategyIntent(
+                    symbol=signal["symbol"],
+                    desired_exposure=float(signal["position_size"]),
+                    action="hold_long",
+                    reason="trend",
+                    metadata={"signal": signal},
+                )
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials("key", "secret"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000, max_symbol_exposure=10_000, max_daily_loss=100, max_order_count=4),
+        )
+
+        result = loop.run_trading_cycle(
+            loop.TradingCycleConfig(
+                symbols=["ETHUSDT", "SOLUSDT"],
+                interval="1h",
+                candles_by_symbol={"ETHUSDT": [{}], "SOLUSDT": [{}]},
+            ),
+            broker=broker,
+            signal_engine=StaticSignalEngine(),
+            strategy=SignalStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PositionReconciliationExecutionEngine(),
+        )
+
+        accepted = [(fill.get("symbol"), fill.get("order_type")) for fill in result["fills"] if fill.get("status") == "dry_run"]
+        self.assertEqual(
+            accepted,
+            [
+                ("ETHUSDT", "MARKET"),
+                ("ETHUSDT", "STOP_MARKET"),
+                ("ETHUSDT", "TAKE_PROFIT_MARKET"),
+                ("ETHUSDT", "TAKE_PROFIT_MARKET"),
+            ],
+        )
+        self.assertFalse(any(fill.get("symbol") == "SOLUSDT" and fill.get("status") == "dry_run" for fill in result["fills"]))
+
+    def test_trading_cycle_skips_new_entry_when_budget_cannot_cover_its_protection_group_after_repairs(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        portfolio = importlib.import_module("scripts.binance_trend_core.portfolio")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        def signal_for(symbol):
+            base = {"BNBUSDT": 615.0, "ETHUSDT": 1800.0}[symbol]
+            return {
+                "symbol": symbol,
+                "interval": "1h",
+                "action": "hold_long",
+                "position_size": {"BNBUSDT": 0.11, "ETHUSDT": 0.2}[symbol],
+                "entry_reference": base,
+                "close": base,
+                "trailing_stop": base * 0.98,
+                "take_profit_1": base * 1.01,
+                "take_profit_2": base * 1.02,
+                "reason": "trend",
+            }
+
+        class StaticSignalEngine:
+            def generate_signal(self, candles, *, symbol, interval):
+                return signal_for(symbol)
+
+        class SignalStrategy:
+            def generate_intent(self, signal):
+                return types.StrategyIntent(
+                    symbol=signal["symbol"],
+                    desired_exposure=float(signal["position_size"]),
+                    action="hold_long",
+                    reason="trend",
+                    metadata={"signal": signal},
+                )
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials("key", "secret"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000, max_symbol_exposure=10_000, max_daily_loss=100, max_order_count=2),
+        )
+        broker.positions["BNBUSDT"] = portfolio.PortfolioPosition(symbol="BNBUSDT", size=0.11, entry_price=615.0)
+        broker.open_algo_orders = [
+            {"symbol": "BNBUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": True, "triggerPrice": "610", "algoId": "sl-1"},
+            {"symbol": "BNBUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True, "origQty": "0.055", "triggerPrice": "621.15", "algoId": "tp-1"},
+        ]
+
+        result = loop.run_trading_cycle(
+            loop.TradingCycleConfig(
+                symbols=["BNBUSDT", "ETHUSDT"],
+                interval="1h",
+                candles_by_symbol={"BNBUSDT": [{}], "ETHUSDT": [{}]},
+            ),
+            broker=broker,
+            signal_engine=StaticSignalEngine(),
+            strategy=SignalStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PositionReconciliationExecutionEngine(),
+        )
+
+        accepted = [(fill.get("symbol"), fill.get("order_type"), fill.get("status")) for fill in result["fills"] if fill.get("status") == "dry_run"]
+        skipped_eth = [fill for fill in result["fills"] if fill.get("symbol") == "ETHUSDT" and fill.get("status") == "skipped"]
+        self.assertEqual(accepted, [("BNBUSDT", "TAKE_PROFIT_MARKET", "dry_run")])
+        self.assertEqual(len(skipped_eth), 4)
+        self.assertTrue(all(fill.get("reason") == "insufficient_order_budget_for_atomic_entry_protection_group" for fill in skipped_eth))
+
+    def test_trading_cycle_prioritizes_existing_position_repairs_before_same_symbol_addon_when_budget_is_tight(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        portfolio = importlib.import_module("scripts.binance_trend_core.portfolio")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        signal = {
+            "symbol": "BNBUSDT",
+            "interval": "1h",
+            "action": "hold_long",
+            "position_size": 0.2,
+            "entry_reference": 615.0,
+            "close": 615.0,
+            "trailing_stop": 602.7,
+            "take_profit_1": 621.15,
+            "take_profit_2": 627.3,
+            "reason": "trend add-on",
+        }
+
+        class StaticSignalEngine:
+            def generate_signal(self, candles, *, symbol, interval):
+                return signal
+
+        class SignalStrategy:
+            def generate_intent(self, signal):
+                return types.StrategyIntent(
+                    symbol=signal["symbol"],
+                    desired_exposure=float(signal["position_size"]),
+                    action="hold_long",
+                    reason="trend add-on",
+                    metadata={"signal": signal},
+                )
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials("key", "secret"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000, max_symbol_exposure=10_000, max_daily_loss=100, max_order_count=1),
+        )
+        broker.positions["BNBUSDT"] = portfolio.PortfolioPosition(symbol="BNBUSDT", size=0.1, entry_price=615.0)
+        broker.open_algo_orders = [
+            {"symbol": "BNBUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": True, "triggerPrice": "610", "algoId": "sl-1"}
+        ]
+
+        result = loop.run_trading_cycle(
+            loop.TradingCycleConfig(symbols=["BNBUSDT"], interval="1h", candles_by_symbol={"BNBUSDT": [{}]}),
+            broker=broker,
+            signal_engine=StaticSignalEngine(),
+            strategy=SignalStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PositionReconciliationExecutionEngine(),
+        )
+
+        accepted = [(fill.get("side"), fill.get("order_type"), fill.get("status")) for fill in result["fills"] if fill.get("status") == "dry_run"]
+        self.assertEqual(accepted, [("SELL", "TAKE_PROFIT_MARKET", "dry_run")])
+        self.assertFalse(any(fill.get("side") == "BUY" and fill.get("status") == "dry_run" for fill in result["fills"]))
+
+    def test_trading_cycle_skips_stale_atomic_new_entry_when_recheck_state_reaches_target(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        portfolio = importlib.import_module("scripts.binance_trend_core.portfolio")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        signal = {
+            "symbol": "ETHUSDT",
+            "interval": "1h",
+            "action": "hold_long",
+            "position_size": 0.2,
+            "entry_reference": 1800.0,
+            "close": 1800.0,
+            "trailing_stop": 1764.0,
+            "take_profit_1": 1818.0,
+            "take_profit_2": 1836.0,
+            "reason": "trend",
+        }
+
+        class StaticSignalEngine:
+            def generate_signal(self, candles, *, symbol, interval):
+                return signal
+
+        class SignalStrategy:
+            def generate_intent(self, signal):
+                return types.StrategyIntent(
+                    symbol=signal["symbol"],
+                    desired_exposure=float(signal["position_size"]),
+                    action="hold_long",
+                    reason="trend",
+                    metadata={"signal": signal},
+                )
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials("key", "secret"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000, max_symbol_exposure=10_000, max_daily_loss=100, max_order_count=4),
+        )
+        original_get_account_state = broker.get_account_state
+        calls = {"count": 0}
+
+        def get_account_state_with_external_fill():
+            calls["count"] += 1
+            if calls["count"] >= 2:
+                broker.positions["ETHUSDT"] = portfolio.PortfolioPosition(symbol="ETHUSDT", size=0.2, entry_price=1800.0)
+                broker.open_algo_orders = [
+                    {"symbol": "ETHUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": True, "triggerPrice": "1764", "algoId": "sl-1"},
+                    {"symbol": "ETHUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True, "origQty": "0.1", "triggerPrice": "1818", "algoId": "tp-1"},
+                    {"symbol": "ETHUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True, "origQty": "0.1", "triggerPrice": "1836", "algoId": "tp-2"},
+                ]
+            return original_get_account_state()
+
+        broker.get_account_state = get_account_state_with_external_fill
+
+        result = loop.run_trading_cycle(
+            loop.TradingCycleConfig(symbols=["ETHUSDT"], interval="1h", candles_by_symbol={"ETHUSDT": [{}]}),
+            broker=broker,
+            signal_engine=StaticSignalEngine(),
+            strategy=SignalStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PositionReconciliationExecutionEngine(),
+        )
+
+        self.assertFalse(any(fill.get("status") == "dry_run" for fill in result["fills"]))
+        self.assertTrue(all(fill.get("status") == "skipped" and fill.get("reason") == "stale_atomic_entry_group_no_longer_needed" for fill in result["fills"]))
+
+    def test_trading_cycle_filters_duplicate_protections_from_atomic_addon_replan(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        portfolio = importlib.import_module("scripts.binance_trend_core.portfolio")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        signal = {
+            "symbol": "BNBUSDT",
+            "interval": "1h",
+            "action": "hold_long",
+            "position_size": 0.2,
+            "entry_reference": 615.0,
+            "close": 615.0,
+            "trailing_stop": 602.7,
+            "take_profit_1": 621.15,
+            "take_profit_2": 627.3,
+            "reason": "trend add-on",
+        }
+
+        class StaticSignalEngine:
+            def generate_signal(self, candles, *, symbol, interval):
+                return signal
+
+        class SignalStrategy:
+            def generate_intent(self, signal):
+                return types.StrategyIntent(
+                    symbol=signal["symbol"],
+                    desired_exposure=float(signal["position_size"]),
+                    action="hold_long",
+                    reason="trend add-on",
+                    metadata={"signal": signal},
+                )
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials("key", "secret"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000, max_symbol_exposure=10_000, max_daily_loss=100, max_order_count=10),
+        )
+        broker.positions["BNBUSDT"] = portfolio.PortfolioPosition(symbol="BNBUSDT", size=0.1, entry_price=615.0)
+
+        result = loop.run_trading_cycle(
+            loop.TradingCycleConfig(symbols=["BNBUSDT"], interval="1h", candles_by_symbol={"BNBUSDT": [{}]}),
+            broker=broker,
+            signal_engine=StaticSignalEngine(),
+            strategy=SignalStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PositionReconciliationExecutionEngine(),
+        )
+
+        dry_run_orders = [
+            (fill.get("side"), fill.get("order_type"), fill.get("status"))
+            for fill in result["fills"]
+            if fill.get("status") == "dry_run"
+        ]
+        self.assertEqual(
+            dry_run_orders,
+            [
+                ("SELL", "STOP_MARKET", "dry_run"),
+                ("SELL", "TAKE_PROFIT_MARKET", "dry_run"),
+                ("SELL", "TAKE_PROFIT_MARKET", "dry_run"),
+                ("BUY", "MARKET", "dry_run"),
+            ],
+        )
+
+    def test_trading_cycle_skips_stale_atomic_addon_when_recheck_state_reaches_target(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        portfolio = importlib.import_module("scripts.binance_trend_core.portfolio")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        signal = {
+            "symbol": "BNBUSDT",
+            "interval": "1h",
+            "action": "hold_long",
+            "position_size": 0.2,
+            "entry_reference": 615.0,
+            "close": 615.0,
+            "trailing_stop": 602.7,
+            "take_profit_1": 621.15,
+            "take_profit_2": 627.3,
+            "reason": "trend add-on",
+        }
+
+        class StaticSignalEngine:
+            def generate_signal(self, candles, *, symbol, interval):
+                return signal
+
+        class SignalStrategy:
+            def generate_intent(self, signal):
+                return types.StrategyIntent(
+                    symbol=signal["symbol"],
+                    desired_exposure=float(signal["position_size"]),
+                    action="hold_long",
+                    reason="trend add-on",
+                    metadata={"signal": signal},
+                )
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials("key", "secret"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000, max_symbol_exposure=10_000, max_daily_loss=100, max_order_count=4),
+        )
+        broker.positions["BNBUSDT"] = portfolio.PortfolioPosition(symbol="BNBUSDT", size=0.1, entry_price=615.0)
+        broker.open_algo_orders = [
+            {"symbol": "BNBUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": True, "triggerPrice": "602.7", "algoId": "sl-1"},
+            {"symbol": "BNBUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True, "origQty": "0.1", "triggerPrice": "621.15", "algoId": "tp-1"},
+            {"symbol": "BNBUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True, "origQty": "0.1", "triggerPrice": "627.3", "algoId": "tp-2"},
+        ]
+        original_get_account_state = broker.get_account_state
+        calls = {"count": 0}
+
+        def get_account_state_with_external_addon_fill():
+            calls["count"] += 1
+            if calls["count"] >= 2:
+                broker.positions["BNBUSDT"] = portfolio.PortfolioPosition(symbol="BNBUSDT", size=0.2, entry_price=615.0)
+                broker.open_algo_orders = [
+                    {"symbol": "BNBUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": True, "triggerPrice": "602.7", "algoId": "sl-1"},
+                    {"symbol": "BNBUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True, "origQty": "0.1", "triggerPrice": "621.15", "algoId": "tp-1"},
+                    {"symbol": "BNBUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True, "origQty": "0.1", "triggerPrice": "627.3", "algoId": "tp-2"},
+                    {"symbol": "BNBUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True, "origQty": "0.1", "triggerPrice": "621.15", "algoId": "tp-3"},
+                    {"symbol": "BNBUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": True, "origQty": "0.1", "triggerPrice": "627.3", "algoId": "tp-4"},
+                ]
+            return original_get_account_state()
+
+        broker.get_account_state = get_account_state_with_external_addon_fill
+
+        result = loop.run_trading_cycle(
+            loop.TradingCycleConfig(symbols=["BNBUSDT"], interval="1h", candles_by_symbol={"BNBUSDT": [{}]}),
+            broker=broker,
+            signal_engine=StaticSignalEngine(),
+            strategy=SignalStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PositionReconciliationExecutionEngine(),
+        )
+
+        self.assertFalse(any(fill.get("side") == "BUY" and fill.get("status") == "dry_run" for fill in result["fills"]))
+        self.assertTrue(any(fill.get("status") == "skipped" and fill.get("reason") == "stale_atomic_entry_group_no_longer_needed" for fill in result["fills"]))
+
+    def test_trading_cycle_prioritizes_existing_position_reduction_before_protective_repairs(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        portfolio = importlib.import_module("scripts.binance_trend_core.portfolio")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        def signal_for(symbol):
+            base = {"BNBUSDT": 615.0, "ETHUSDT": 1800.0}[symbol]
+            return {
+                "symbol": symbol,
+                "interval": "1h",
+                "action": "hold_long" if symbol == "BNBUSDT" else "flat",
+                "position_size": 0.11 if symbol == "BNBUSDT" else 0.0,
+                "entry_reference": base,
+                "close": base,
+                "trailing_stop": base * 0.98,
+                "take_profit_1": base * 1.01,
+                "take_profit_2": base * 1.02,
+                "reason": "trend" if symbol == "BNBUSDT" else "risk reduction",
+            }
+
+        class StaticSignalEngine:
+            def generate_signal(self, candles, *, symbol, interval):
+                return signal_for(symbol)
+
+        class SignalStrategy:
+            def generate_intent(self, signal):
+                return types.StrategyIntent(
+                    symbol=signal["symbol"],
+                    desired_exposure=float(signal["position_size"]),
+                    action=str(signal["action"]),
+                    reason=str(signal["reason"]),
+                    metadata={"signal": signal},
+                )
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials("key", "secret"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000, max_symbol_exposure=10_000, max_daily_loss=100, max_order_count=1),
+        )
+        broker.positions["BNBUSDT"] = portfolio.PortfolioPosition(symbol="BNBUSDT", size=0.11, entry_price=615.0)
+        broker.positions["ETHUSDT"] = portfolio.PortfolioPosition(symbol="ETHUSDT", size=0.2, entry_price=1800.0)
+
+        result = loop.run_trading_cycle(
+            loop.TradingCycleConfig(
+                symbols=["BNBUSDT", "ETHUSDT"],
+                interval="1h",
+                candles_by_symbol={"BNBUSDT": [{}], "ETHUSDT": [{}]},
+            ),
+            broker=broker,
+            signal_engine=StaticSignalEngine(),
+            strategy=SignalStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PositionReconciliationExecutionEngine(),
+        )
+
+        accepted = [(fill.get("symbol"), fill.get("side"), fill.get("order_type")) for fill in result["fills"] if fill.get("status") == "dry_run"]
+        self.assertEqual(accepted, [("ETHUSDT", "SELL", "MARKET")])
+        self.assertFalse(any(fill.get("symbol") == "BNBUSDT" and fill.get("status") == "dry_run" for fill in result["fills"]))
+
     def test_testnet_risk_limits_load_from_config_env_file_and_sanitize_summary(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
         with tempfile.TemporaryDirectory() as tmpdir:
