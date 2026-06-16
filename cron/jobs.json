@@ -13,11 +13,11 @@
       "no_agent": true,
       "context_from": null,
       "schedule": {
-        "kind": "interval",
-        "minutes": 60,
-        "display": "every 60m"
+        "kind": "cron",
+        "expr": "1 * * * *",
+        "display": "1 * * * *"
       },
-      "schedule_display": "every 60m",
+      "schedule_display": "1 * * * *",
       "repeat": {
         "times": null,
         "completed": 1
@@ -27,7 +27,7 @@
       "paused_at": null,
       "paused_reason": null,
       "created_at": "2026-06-16T10:28:23.299240+08:00",
-      "next_run_at": "2026-06-16T14:20:08.147401+08:00",
+      "next_run_at": "2026-06-16T14:01:00+08:00",
       "last_run_at": "2026-06-16T10:29:09.043986+08:00",
       "last_status": "ok",
       "last_error": null,
@@ -58,11 +58,11 @@
       "no_agent": false,
       "context_from": null,
       "schedule": {
-        "kind": "interval",
-        "minutes": 1440,
-        "display": "every 1440m"
+        "kind": "cron",
+        "expr": "5 0 * * *",
+        "display": "5 0 * * *"
       },
-      "schedule_display": "every 1440m",
+      "schedule_display": "5 0 * * *",
       "repeat": {
         "times": null,
         "completed": 0
@@ -72,7 +72,7 @@
       "paused_at": null,
       "paused_reason": null,
       "created_at": "2026-06-16T12:04:41.578159+08:00",
-      "next_run_at": "2026-06-17T12:09:12.775031+08:00",
+      "next_run_at": "2026-06-17T00:05:00+08:00",
       "last_run_at": null,
       "last_status": null,
       "last_error": null,
@@ -87,5 +87,5 @@
       "profile": null
     }
   ],
-  "updated_at": "2026-06-16T13:20:08.149070+08:00"
+  "updated_at": "2026-06-16T13:38:14.412997+08:00"
 }

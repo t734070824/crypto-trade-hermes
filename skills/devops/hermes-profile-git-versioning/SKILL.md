@@ -130,6 +130,12 @@ git commit -m "chore: update profile state"
 git push
 ```
 
+Cron-specific cleanup before committing `cron/jobs.json`:
+- `cronjob create/update/run/list` may rewrite scheduler runtime fields (`repeat.completed`, `next_run_at`, `last_run_at`, `last_status`, root `updated_at`) while you are working. Treat unrelated changes to pre-existing jobs as runtime noise; normalize or revert them before staging unless the user explicitly asked to preserve the new runtime state.
+- For newly-created jobs, commit the intended durable config: `id`, `name`, `prompt`, `skills`, schedule, `no_agent`, `deliver`, toolsets, script/workdir/profile. Reset first-run runtime state (`repeat.completed: 0`, `last_run_at: null`, `last_status: null`, `last_error: null`, `last_delivery_error: null`) if you triggered the job only for verification.
+- Avoid committing newly-added explicit destination metadata (`origin.chat_id`, `chat_name`, thread IDs) unless the repo already tracks that exact metadata or the user explicitly wants delivery routing persisted. Prefer generic `deliver: "telegram"`/`origin` behavior when sufficient.
+- If an independent reviewer flags cron runtime noise, clean the diff and re-run review; approval applies to the exact diff that will be pushed.
+
 Config note: in the crypto-trade-hermes profile, `config.yaml` is explicitly allowlisted and should be committed/pushed when intentionally changed, while `.env`, logs, databases, sessions, caches, pid/lock files, and live gateway state remain ignored. If unexpected files appear, inspect with `git status --short --ignored` and `git check-ignore -v <path>`; fix `.gitignore` or ask before committing. The user's default for git flows is to push after committing.
 
 If Git identity is missing, set repository-local identity, not global, unless the user requests a global identity.
