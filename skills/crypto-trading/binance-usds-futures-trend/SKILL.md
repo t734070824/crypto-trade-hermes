@@ -175,9 +175,10 @@ scripts/binance_usds_futures_trend.py --replay-runtime-evidence --runtime-record
 
 Operational cron pattern:
 
-- Use `no_agent=true` only for deterministic collectors/watchdogs whose script is the whole job, such as hourly testnet dry-run evidence capture. Empty `skills: []` is expected in this mode because no LLM reasoning runs.
-- Use a separate agent cron (`no_agent=false`) with this Skill loaded for periodic analysis/evolution reports over the collected JSONL evidence, e.g. 24h/72h signal stability, risk rejections, error rate, and readiness for signed testnet.
-- Do not conflate the collector with the evaluator: the hourly collector should stay boring and reproducible; the analyzer can reason over evidence and produce recommendations.
+- Prefer a single agent cron (`no_agent=false`) with this Skill loaded when the scheduled workflow must own the full testnet operation: credential presence check, signed account preflight, position/open-order reconciliation, gated signed testnet cycle, lifecycle/fill evidence, post-cycle account snapshot, and Chinese Telegram summary with explicit UTC and 北京时间（UTC+8） labels.
+- Current startup signed-testnet scope is multi-symbol but still conservative unless the user explicitly changes it: run a BTC group (`BTCUSDT`, `--risk-unit 0.001`, `--testnet-max-order-count 1`) plus an Alt group (`ETHUSDT,SOLUSDT,BNBUSDT`, `--risk-unit 0.1`, `--testnet-max-order-count 2`), both on `--interval 1h` with `--base-url https://testnet.binancefuture.com`, `--testnet-max-order-notional 200`, `--testnet-max-symbol-exposure 250`, `--testnet-max-daily-loss 10`, account sync, lifecycle tracking, and testnet-only endpoint guard.
+- Use `no_agent=true` only for deterministic collectors/watchdogs whose script is the whole job and no reasoning is wanted. Empty `skills: []` is expected in this mode because no LLM reasoning runs.
+- Split collector/analyzer jobs only when reproducibility, cost, or isolation materially benefits from the split; do not split merely by habit when the user expects one agent-type task to handle the operational loop.
 
 Telegram diagnostic brief wrapper:
 
@@ -361,8 +362,9 @@ Confirm:
 26. **Fail-open exchange/order numbers.** Testnet broker must reject non-finite quantities and any exchangeInfo-adapted quantity/reference price that becomes invalid before signing; never allow `nan`, zero, or negative order parameters into signed POST URLs.
 27. **Conflating evidence collection with strategy evaluation.** A `no_agent=true` cron with `skills: []` is appropriate for deterministic runtime evidence collection, but it will not analyze whether the strategy is improving. Pair it with a separate agent-mode analyzer cron using this Skill when the user asks for 24h/72h evidence interpretation or promotion decisions.
 28. **Treating order acknowledgement as a fill.** Signed testnet submit success only proves Binance acknowledged an order. Use `track_order_lifecycle` / `--testnet-track-order-lifecycle` to query `/fapi/v1/order` and `/fapi/v1/userTrades`, then compute lifecycle state, fills, fees, realized/net PnL, and slippage from exchange-confirmed data.
-29. **Mistaking reconciliation no-ops for failed operation.** In the startup single-agent signed testnet cron, a successful cycle with `desired_orders=[]` and `real_orders_submitted=false` can be correct when signed preflight/account sync shows an existing BTCUSDT position already equals `desired_exposure` (currently `risk_unit=0.001`). Report it as duplicate-add prevention via position reconciliation, then verify with a post-cycle signed snapshot.
+29. **Mistaking reconciliation no-ops for failed operation.** In the startup single-agent signed testnet cron, a successful cycle with `desired_orders=[]` and `real_orders_submitted=false` can be correct when signed preflight/account sync shows existing positions already equal desired exposure. Report it as duplicate-add prevention via position reconciliation, then verify with a post-cycle signed snapshot.
 30. **Pasting raw cycle JSON into Telegram reports.** For signed testnet cron output, parse JSON and summarize only safe fields: success, testnet-only environment, real-order-submitted flag, order/lifecycle counts, non-zero positions, open-order count, runtime record path, risk limits, and UTC/北京时间（UTC+8） timestamps. Never paste full raw JSON or signed request details.
+31. **Expanding symbols without checking exchange minimums.** Binance Futures Testnet applies per-symbol `minQty`, `stepSize`, and `MIN_NOTIONAL`. A universal `risk_unit=0.001` works for BTC startup exposure but can make ETH/SOL/BNB/XRP orders reject as too small. Before adding recurring signed symbols, dry-run against `exchangeInfo`; group symbols by compatible `risk_unit` and keep `--testnet-max-order-notional` / `--testnet-max-order-count` tight.
 
 ## References
 
@@ -389,6 +391,7 @@ Historical workflow notes are intentionally kept out of the main operational pat
 - `references/session-v1.7-testnet-adapter.md` — implementation workflow for the Binance futures testnet adapter, dry-run default, endpoint guard, and risk gates.
 - `references/session-v1.10-agent-cron-testnet-operations.md` — preference and workflow notes for a single agent-type cron owning testnet operational reasoning, plus signed-testnet gating and cron runtime-noise hygiene.
 - `references/session-v1.11-agent-testnet-cron-preflight-and-summary.md` — signed testnet cron runbook detail: read-only account preflight, post-cycle snapshot verification, position-reconciliation interpretation, and safe Chinese summary fields.
+- `references/session-v1.12-agent-testnet-cron-json-summary-wrapper.md` — reusable wrapper pattern for preflight → signed cycle → JSON parsing → post-cycle snapshot → safe Chinese report without raw cycle JSON.
 
 Tracked plans:
 
