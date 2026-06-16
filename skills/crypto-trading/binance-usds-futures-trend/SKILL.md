@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when developing or operating the crypto-trade-hermes Binance USDS-M futures trend Skill. Current code provides paper-only signal, lifecycle, backtest, and diagnostic tools from free >=1h data; future work must evolve it into a real-time trading engine where paper/testnet/live share strategy, state, risk, and execution interfaces.
-version: 1.4.0
+version: 1.5.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -24,7 +24,7 @@ The intended architecture is **Skill-driven real-time trading**:
 - only the broker/fill adapter and environment configuration should change;
 - paper mode is a safety/testing adapter, not a separate report-style scanner product.
 
-Current implementation status: the existing CLI is still **paper-only**. It can generate trend signals, multi-symbol rankings, paper allocations, lifecycle diagnostics, runtime evidence records, backtests, refinement comparisons, and Telegram briefs. v1.4 adds a lightweight `scripts/binance_trend_core/` package with shared Protocol/dataclass boundaries for future realtime trading. It does **not** place signed Binance orders. Treat existing scan/lifecycle/runtime-recording code as reusable signal, state, and evidence modules while the project is refactored toward a shared real-time trading engine.
+Current implementation status: the CLI is still **paper-only**, but v1.5 adds the first shared trading loop wired to `PaperBroker` simulated fills. It can generate trend signals, multi-symbol rankings, paper allocations, lifecycle diagnostics, runtime evidence records, backtests, refinement comparisons, Telegram briefs, and a `--run-paper-cycle` path that runs signal → strategy → risk → execution → broker → runtime evidence on one loop. It does **not** place signed Binance orders. Treat existing scan/lifecycle/runtime-recording code as reusable signal, state, and evidence modules while the project is refactored toward a shared real-time trading engine.
 
 ## User Constraints
 
@@ -92,6 +92,7 @@ scripts/binance_usds_futures_trend.py
 Current paper-only capabilities:
 
 - lightweight core realtime interface package under `scripts/binance_trend_core/`;
+- v1.5 shared paper trading loop via `scripts.binance_trend_core.loop.run_trading_cycle` and `PaperBroker` simulated fills;
 - single-symbol trend decision from free K-lines;
 - full-universe or selected-symbol scan;
 - multi-timeframe confirmation, usually `1h,4h,1d`;
@@ -107,7 +108,7 @@ Current paper-only capabilities:
 Current safety boundary:
 
 - output mode is `paper`;
-- no signed endpoint is required for current scanner/backtest commands;
+- no signed endpoint is required for current scanner/backtest/shared paper-cycle commands;
 - no real order, testnet order, or live order is submitted by this Skill today.
 
 ## Recommended Commands
@@ -135,6 +136,12 @@ No-write lifecycle/runtime dry run for selected symbols:
 
 ```bash
 scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 3 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl --no-save-state --no-save-lifecycle --no-save-runtime-record
+```
+
+Shared paper trading cycle with simulated fills and no runtime write:
+
+```bash
+scripts/binance_usds_futures_trend.py --run-paper-cycle --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl --no-save-runtime-record
 ```
 
 Historical paper backtest:
@@ -196,6 +203,7 @@ Current outputs are diagnostic contracts for paper mode:
 - `paper_state` / `state_change`: persisted scan snapshot and diff;
 - `paper_lifecycle` / `lifecycle_change`: paper lifecycle state and intent changes;
 - `runtime_record`: append-only paper runtime evidence schema for future strategy evolution;
+- `paper_cycle`: v1.5 shared loop output containing signals, intents, desired orders, simulated fills, portfolio state, and runtime evidence;
 - `backtest`: paper historical performance diagnostics;
 - `refinement`: paper-only baseline/candidate comparison;
 - `summary_zh` or `--telegram-brief`: compact Chinese summaries with UTC and 北京时间（UTC+8） labels.
@@ -236,7 +244,7 @@ Current priority is documentation and architecture alignment, then implementatio
 2. Reframe the scanner as `SignalEngine`, not the whole trading engine.
 3. Design shared realtime interfaces: `Strategy`, `RiskManager`, `PortfolioState`, `LifecycleManager`, `ExecutionEngine`, `BrokerAdapter`.
 4. Design the runtime data schema before implementing the first trading loop, including signals, decisions, risk checks, fills, state transitions, errors, and performance snapshots.
-5. Implement `PaperBroker` and run the same trading loop against simulated fills while recording runtime evidence.
+5. Use `PaperBroker` and the shared `run_trading_cycle` loop to run simulated fills while recording runtime evidence.
 6. Add Binance futures testnet adapter using signed endpoints and isolated testnet credentials/config.
 7. Add live adapter only after testnet validation, explicit risk caps, kill switch, audit logs, runtime evidence review, and user approval.
 8. Keep Telegram output as observability around the real trading loop, not as the source of trading state.
@@ -272,6 +280,7 @@ For code or behavior edits, additionally run:
 ```bash
 python3 -m unittest tests/test_binance_usds_futures_trend.py -v
 scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 3 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --no-save-state --no-save-lifecycle
+scripts/binance_usds_futures_trend.py --run-paper-cycle --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl --no-save-runtime-record
 ```
 
 Confirm:
@@ -295,10 +304,11 @@ Confirm:
 7. **Overstating diagnostics.** Paper scans, backtests, and refinement comparisons are evidence and diagnostics, not live performance proof.
 8. **Letting Telegram briefs become the state machine.** Telegram output is observability; canonical state belongs in `PortfolioState` / lifecycle files / future execution logs.
 9. **Comparing strategy variants on drifting live samples.** Fetch each symbol sample once and reuse it across baseline/candidates so differences are strategy-driven.
-10. **Skipping independent review before push.** This repo requires an independent agent review before every push.
-11. **Forgetting timezone labels.** Any time-related output or report must explicitly label UTC or 北京时间（UTC+8）.
-12. **Mixing environments.** Future paper, testnet, and live adapters must isolate credentials, balances, order IDs, fills, and state files while sharing core interfaces.
-13. **Failing to preserve runtime evidence.** Strategy evolution must be based on recorded run data, not subjective impressions from Telegram summaries or isolated backtests.
+10. **Treating `PaperBroker` fills as live execution.** v1.5 fills are simulated; they prove loop plumbing and runtime evidence only.
+11. **Skipping independent review before push.** This repo requires an independent agent review before every push.
+12. **Forgetting timezone labels.** Any time-related output or report must explicitly label UTC or 北京时间（UTC+8）.
+13. **Mixing environments.** Future paper, testnet, and live adapters must isolate credentials, balances, order IDs, fills, and state files while sharing core interfaces.
+14. **Failing to preserve runtime evidence.** Strategy evolution must be based on recorded run data, not subjective impressions from Telegram summaries or isolated backtests.
 
 ## References
 
@@ -318,6 +328,8 @@ Historical workflow notes are intentionally kept out of the main operational pat
 - `references/session-v1.2-realtime-architecture-correction.md` — correction toward shared real-time trading architecture.
 - `references/session-v1.3-runtime-data-strategy-evolution.md` — runtime data capture requirements for evidence-based strategy evolution.
 - `references/session-v1.3-runtime-recorder-implementation.md` — implementation and verification workflow for the paper runtime JSONL recorder.
+- `references/session-v1.4-core-interface-extraction.md` — implementation and verification workflow for extracting shared realtime core interfaces while preserving paper-only CLI behavior.
+- `references/session-v1.5-shared-paper-loop.md` — implementation and verification workflow for the shared trading loop and PaperBroker simulated fills.
 
 Tracked plans:
 

@@ -5,8 +5,9 @@ submit signed Binance orders; broker-specific behavior must stay isolated in
 BrokerAdapter implementations.
 """
 
-from .brokers import BrokerAdapter, RejectingBrokerAdapter
+from .brokers import BrokerAdapter, PaperBroker, RejectingBrokerAdapter
 from .execution import ExecutionEngine, ExecutionPlan, OrderInstruction, PaperIntentExecutionEngine
+from .loop import TradingCycleConfig, run_trading_cycle
 from .market_data import FunctionMarketData, MarketData
 from .portfolio import PortfolioPosition, PortfolioState
 from .risk import FunctionRiskManager, RiskManager
@@ -26,6 +27,7 @@ __all__ = [
     "MarketData",
     "MarketDataRequest",
     "OrderInstruction",
+    "PaperBroker",
     "PaperIntentExecutionEngine",
     "PortfolioPosition",
     "PortfolioState",
@@ -36,4 +38,6 @@ __all__ = [
     "Strategy",
     "StrategyIntent",
     "TrendParticipationStrategy",
+    "TradingCycleConfig",
+    "run_trading_cycle",
 ]

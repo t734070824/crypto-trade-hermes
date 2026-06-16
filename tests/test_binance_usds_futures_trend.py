@@ -31,6 +31,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             "scripts.binance_trend_core.execution",
             "scripts.binance_trend_core.brokers",
             "scripts.binance_trend_core.runtime",
+            "scripts.binance_trend_core.loop",
         ]
         for module_name in module_names:
             with self.subTest(module=module_name):
@@ -106,6 +107,171 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertIn("portfolio_allocation", payload["scan"])
         self.assertIn("paper_lifecycle", payload["scan"])
         self.assertEqual(payload["scan"]["paper_lifecycle"]["positions_by_symbol"]["BTCUSDT"]["last_intent"], "entry")
+
+    def test_paper_broker_submit_order_creates_simulated_fill_without_network(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        broker = brokers.PaperBroker(initial_equity=10_000.0, fee_bps=4.0, slippage_bps=2.0)
+        fill = broker.submit_order(execution.OrderInstruction(symbol="BTCUSDT", side="BUY", quantity=0.5, metadata={"reference_price": 100.0}))
+
+        self.assertEqual(fill["environment"], "paper")
+        self.assertEqual(fill["symbol"], "BTCUSDT")
+        self.assertEqual(fill["side"], "BUY")
+        self.assertEqual(fill["quantity"], 0.5)
+        self.assertTrue(fill["simulated"])
+        self.assertFalse(fill["real_order_submitted"])
+        self.assertGreater(fill["fill_price"], 100.0)
+        state = broker.get_account_state()
+        self.assertEqual(state["positions"]["BTCUSDT"]["size"], 0.5)
+        self.assertEqual(len(state["fills"]), 1)
+        self.assertNotRegex(json.dumps(state).lower(), r"(api_key|secret|signature|signed|live_order)")
+
+    def test_paper_execution_engine_turns_intents_into_broker_instructions(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PaperIntentExecutionEngine()
+        intent = types.StrategyIntent(symbol="ETHUSDT", desired_exposure=1.25, action="hold_long", reason="trend")
+
+        plan = engine.plan_orders(intent, {"approved": True}, {"positions_by_symbol": {}})
+
+        self.assertEqual(len(plan.instructions), 1)
+        instruction = plan.instructions[0]
+        self.assertEqual(instruction.symbol, "ETHUSDT")
+        self.assertEqual(instruction.side, "BUY")
+        self.assertEqual(instruction.quantity, 1.25)
+        self.assertTrue(instruction.metadata["paper_intent"])
+
+    def test_shared_trading_cycle_records_portfolio_state_and_runtime_evidence(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        signals = importlib.import_module("scripts.binance_trend_core.signals")
+        strategy = importlib.import_module("scripts.binance_trend_core.strategy")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+
+        candles = [{"open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0} for _ in range(240)]
+        broker = brokers.PaperBroker(initial_equity=10_000.0)
+        cycle = loop.run_trading_cycle(
+            loop.TradingCycleConfig(symbols=["BTCUSDT"], interval="1h", candles_by_symbol={"BTCUSDT": candles}),
+            broker=broker,
+            signal_engine=signals.FunctionSignalEngine(
+                decide_fn=lambda candles, symbol, interval, **kwargs: {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "action": "hold_long",
+                    "position_size": 0.75,
+                    "entry_reference": 101.0,
+                    "reason": "unit trend",
+                }
+            ),
+            strategy=strategy.TrendParticipationStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PaperIntentExecutionEngine(),
+        )
+
+        self.assertEqual(cycle["environment"], "paper")
+        self.assertEqual(cycle["mode"], "paper")
+        self.assertFalse(cycle["real_orders_submitted"])
+        self.assertEqual(cycle["portfolio_state"]["positions"]["BTCUSDT"]["size"], 0.75)
+        self.assertEqual(cycle["runtime_record"]["environment"], "paper")
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["simulated_fills_count"], 1)
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["real_orders_submitted"], False)
+
+    def test_shared_trading_cycle_can_use_fake_testnet_adapter_without_changing_loop(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        signals = importlib.import_module("scripts.binance_trend_core.signals")
+        strategy = importlib.import_module("scripts.binance_trend_core.strategy")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+
+        class FakeTestnetBroker:
+            environment = "testnet"
+            def __init__(self):
+                self.instructions = []
+            def submit_order(self, instruction):
+                self.instructions.append(instruction)
+                return {"environment": "testnet", "symbol": instruction.symbol, "simulated": True, "real_order_submitted": False}
+            def cancel_order(self, order_id):
+                return {"environment": "testnet", "order_id": order_id, "cancelled": True}
+            def get_account_state(self):
+                return {"environment": "testnet", "positions": {}, "fills": []}
+
+        broker = FakeTestnetBroker()
+        cycle = loop.run_trading_cycle(
+            loop.TradingCycleConfig(symbols=["BTCUSDT"], interval="1h", candles_by_symbol={"BTCUSDT": [{"close": 100.0}] * 240}),
+            broker=broker,
+            signal_engine=signals.FunctionSignalEngine(decide_fn=lambda candles, symbol, interval, **kwargs: {"symbol": symbol, "interval": interval, "action": "hold_long", "position_size": 0.25, "reason": "shared loop"}),
+            strategy=strategy.TrendParticipationStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PaperIntentExecutionEngine(),
+        )
+
+        self.assertEqual(cycle["environment"], "testnet")
+        self.assertEqual(len(broker.instructions), 1)
+        self.assertFalse(cycle["real_orders_submitted"])
+
+    def test_shared_trading_cycle_rejects_short_intervals_before_broker_execution(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        signals = importlib.import_module("scripts.binance_trend_core.signals")
+        strategy = importlib.import_module("scripts.binance_trend_core.strategy")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        broker = brokers.PaperBroker()
+        with self.assertRaises(ValueError):
+            loop.run_trading_cycle(
+                loop.TradingCycleConfig(symbols=["BTCUSDT"], interval="30m", candles_by_symbol={"BTCUSDT": [{"close": 100.0}] * 240}),
+                broker=broker,
+                signal_engine=signals.FunctionSignalEngine(decide_fn=trend.decide),
+                strategy=strategy.TrendParticipationStrategy(),
+                risk_manager=risk.FunctionRiskManager(),
+                execution_engine=execution.PaperIntentExecutionEngine(),
+            )
+        self.assertEqual(broker.get_account_state()["fills"], [])
+
+    def test_cli_can_run_no_write_paper_cycle_with_runtime_record(self):
+        def make_candles(start, step):
+            candles = []
+            price = float(start)
+            for _ in range(240):
+                open_price = price
+                close_price = price + step
+                high = max(open_price, close_price) + 0.7
+                low = min(open_price, close_price) - 0.5
+                candles.append({"open": open_price, "high": high, "low": low, "close": close_price})
+                price = close_price
+            return candles
+
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        setattr(trend, "fetch_klines", lambda symbol, interval, limit, base_url=trend.BINANCE_FAPI_BASE: make_candles(100, 1.0))
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                runtime_path = pathlib.Path(tmpdir) / "paper-cycle.jsonl"
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc = trend.main([
+                        "--run-paper-cycle",
+                        "--symbols", "BTCUSDT",
+                        "--interval", "1h",
+                        "--limit", "240",
+                        "--runtime-record-file", str(runtime_path),
+                        "--no-save-runtime-record",
+                    ])
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["ok"])
+        cycle = payload["paper_cycle"]
+        self.assertEqual(cycle["environment"], "paper")
+        self.assertFalse(cycle["real_orders_submitted"])
+        self.assertFalse(cycle["runtime_record_saved"])
+        self.assertFalse(runtime_path.exists())
+        self.assertGreaterEqual(cycle["runtime_record"]["execution_events"]["simulated_fills_count"], 1)
 
     def test_rejects_short_intervals_below_one_hour(self):
         for interval in ["1m", "5m", "10m", "15m", "30m"]:

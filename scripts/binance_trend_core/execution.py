@@ -42,13 +42,21 @@ class PaperIntentExecutionEngine:
             side = "BUY"
         if side == "NONE":
             return ExecutionPlan(instructions=[], metadata={"intent": intent, "portfolio_state": portfolio_state})
+        signal = intent.metadata.get("signal") if isinstance(intent.metadata, dict) else None
+        reference_price = 1.0
+        if isinstance(signal, dict):
+            reference_price = float(signal.get("entry_reference") or signal.get("close") or reference_price)
         return ExecutionPlan(
             instructions=[
                 OrderInstruction(
                     symbol=intent.symbol,
                     side=side,
                     quantity=abs(intent.desired_exposure),
-                    metadata={"paper_intent": True, "action": intent.action},
+                    metadata={
+                        "paper_intent": True,
+                        "action": intent.action,
+                        "reference_price": reference_price,
+                    },
                 )
             ],
             metadata={"intent": intent, "portfolio_state": portfolio_state},
