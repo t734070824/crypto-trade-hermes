@@ -400,6 +400,7 @@ Historical workflow notes are intentionally kept out of the main operational pat
 - `references/session-v1.15-testnet-open-algo-and-account-risk-sizing.md` — durable lessons for open-algo TP/SL reconciliation, fail-closed protection checks, account-risk sizing, and post-run signed verification.
 - `references/session-v1.14-agent-cron-wrapper-safe-summary.md` — reusable single-agent cron wrapper pattern: signed preflight, sequential BTC/Alt signed cycles, runtime-evolution replay, post-snapshot verification, evidence file checks, and Chinese Telegram-safe summaries without raw JSON.
 - `references/session-v1.17-submitted-unknown-and-safe-cron-summary.md` — handling `submitted_unknown` signed requests as attempted but not exchange-confirmed, plus safe reporting and command-building pitfalls.
+- `references/session-v1.18-single-agent-testnet-cron-json-harness.md` — reusable Python harness pattern for a scheduled single-agent signed testnet cron: signed preflight, sequential BTC/Alt cycles, runtime replay, post snapshot, safe Chinese summary, and fail-closed protection reporting.
 
 Tracked plans:
 
