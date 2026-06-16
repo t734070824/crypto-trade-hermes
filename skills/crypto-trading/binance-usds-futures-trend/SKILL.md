@@ -78,6 +78,7 @@ Future work should converge on these components:
 9. `RuntimeRecorder` — records run inputs, signals, decisions, risk checks, orders, fills, state transitions, errors, and performance snapshots for later evaluation.
 10. `StrategyEvolution` — compares future strategy variants against recorded runtime evidence before promoting changes.
 11. `Observability` — compact Telegram reports and logs around the same trading loop, not a separate decision path.
+12. `PostRunSummary` — summarize signed testnet runs from runtime JSONL, order journals, replay JSON, and a fresh signed snapshot when CLI stdout is truncated or too verbose.
 
 Architectural invariant: paper/testnet/live must share strategy, risk, lifecycle, state, execution orchestration, and runtime data schema. Divergence belongs only inside broker adapters and environment config.
 
@@ -106,7 +107,8 @@ Current paper/testnet capabilities:
 - optional append-only runtime evidence records for strategy evolution;
 - historical paper backtest metrics;
 - evidence-based refinement comparison on identical fetched candle samples;
-- compact Telegram diagnostic brief via wrapper script.
+- compact Telegram diagnostic brief via wrapper script;
+- post-run reconstruction from runtime JSONL + order journals + signed snapshots when terminal stdout is too large to trust directly.
 
 Current safety boundary:
 
@@ -180,6 +182,7 @@ Operational cron pattern:
 - Current startup signed-testnet scope is multi-symbol but still conservative unless the user explicitly changes it: run a BTC group (`BTCUSDT`, legacy/default `--risk-unit 0.001`, `--account-risk-fraction 0.003`, `--target-leverage 2`, `--testnet-max-order-count 3`) plus an Alt group (`ETHUSDT,SOLUSDT,BNBUSDT`, legacy/default `--risk-unit 0.1`, `--account-risk-fraction 0.003`, `--target-leverage 2`, `--testnet-max-order-count 6`), both on `--interval 1h` with `--base-url https://testnet.binancefuture.com`, `--testnet-max-order-notional 200`, `--testnet-max-symbol-exposure 70`, `--testnet-max-daily-loss 10`, account sync, lifecycle tracking, open-algo TP/SL reconciliation, and testnet-only endpoint guard. Treat fixed `risk_unit` as compatibility/floor behavior; prefer account-risk sizing from equity, leverage target, exchange rules, current remote position, and exposure/daily-loss caps.
 - Use `no_agent=true` only for deterministic collectors/watchdogs whose script is the whole job and no reasoning is wanted. Empty `skills: []` is expected in this mode because no LLM reasoning runs.
 - Split collector/analyzer jobs only when reproducibility, cost, or isolation materially benefits from the split; do not split merely by habit when the user expects one agent-type task to handle the operational loop.
+- Add/maintain a daily agent-mode runtime replay diagnostic cron when requested: load this Skill, run every 24h, execute `--replay-runtime-evidence` against the testnet runtime JSONL, optionally summarize the order journal, and report whether evidence/lifecycle/protection issues need human intervention. It must be read-only and explicitly prohibit signed cycles, order placement, order cancellation, raw signed request output, and secret disclosure.
 
 Telegram diagnostic brief wrapper:
 
@@ -337,6 +340,7 @@ Confirm:
 1. **Defaulting to split cron workflows when an agent loop should own the process.** If the user asks why one agent-type scheduled task cannot handle the whole testnet workflow, treat that as a design correction: prefer a single agent cron with this Skill loaded when the job needs to gather evidence, inspect state, reconcile positions/orders, decide whether signed testnet is safe, run the cycle, interpret failures, and report next actions. Use separate `no_agent=true` collectors only when deterministic evidence capture must be isolated from LLM reasoning; otherwise avoid over-fragmenting the operational loop into collector/analyzer/promoter jobs.
 2. **Trying signed testnet before credential validation and position reconciliation.** Before enabling recurring signed testnet operation, run a small explicit signed probe/cycle, verify Binance Futures Testnet credentials against signed endpoints, sync remote positions/account state, and confirm actual order/fill lifecycle evidence. A dry-run success plus locally present `LALA_KEY`/`LALA_SECRET` is not sufficient to enable signed cron.
 3. **Committing scheduler runtime noise.** Hermes cron may rewrite fields such as `completed`, `next_run_at`, `last_run_at`, and `updated_at` in `cron/jobs.json` while you are working. Treat those as runtime noise unless the task intentionally changes cron definitions; restore/exclude them before review, commit, and push.
+4. **Trusting truncated stdout for signed testnet results.** Large cycle outputs can be truncated in terminal capture. Rebuild the final report from runtime JSONL, order journals, replay diagnostics, and a fresh signed post-cycle snapshot instead of depending on stdout alone.
 4. **Building a paper scanner instead of a trading engine.** Paper is an execution adapter for the future trading loop, not the architecture itself.
 5. **Confusing safety with divergence.** Safety should come from adapter isolation, testnet-first validation, kill switches, strict risk caps, and explicit live gates — not from building a paper-only system that cannot become live.
 6. **Using short intervals.** The user rejects intervals below `1h`; enforce this in CLI, code, tests, docs, and cron schedules.
@@ -369,6 +373,7 @@ Confirm:
 32. **Pasting raw cycle JSON into Telegram reports.** For signed testnet cron output, parse JSON and summarize only safe fields: success, testnet-only environment, real-order-submitted flag, order/lifecycle counts, non-zero positions, open-order/open-algo counts, runtime record path, risk limits, and UTC/北京时间（UTC+8） timestamps. Never paste full raw JSON or signed request details.
 33. **Expanding symbols without checking exchange minimums.** Binance Futures Testnet applies per-symbol `minQty`, `stepSize`, and `MIN_NOTIONAL`. A universal `risk_unit=0.001` works for BTC startup exposure but can make ETH/SOL/BNB/XRP orders reject as too small. Before adding recurring signed symbols, dry-run against `exchangeInfo`; group symbols by compatible `risk_unit` and keep `--testnet-max-order-notional` / `--testnet-max-order-count` tight.
 34. **Overstating protection reconciliation.** A “保护单失配” can mean missing TP/SL, wrong side/type, unsafe close-only semantics, stale trigger prices, or duplicate stale groups. The current repair path handles missing protection by adding absent `STOP_MARKET` / layered `TAKE_PROFIT_MARKET` algo orders, and replaces an existing stop only when the newly computed trailing stop moves upward. It still does not broadly deduplicate stale TP groups or loosen stops. See `references/session-v1.16-protection-mismatch-and-bnb-repair.md`.
+35. **Letting replay diagnostics mutate trading state.** Daily runtime replay diagnostics should be agent-mode for interpretation, but read-only in behavior: run `--replay-runtime-evidence`, inspect runtime/order journals safely, and report blockers/anomalies. Do not run signed testnet cycles, place/cancel orders, or expose raw signed payloads from a replay diagnostic job.
 
 ## References
 
@@ -401,6 +406,8 @@ Historical workflow notes are intentionally kept out of the main operational pat
 - `references/session-v1.14-agent-cron-wrapper-safe-summary.md` — reusable single-agent cron wrapper pattern: signed preflight, sequential BTC/Alt signed cycles, runtime-evolution replay, post-snapshot verification, evidence file checks, and Chinese Telegram-safe summaries without raw JSON.
 - `references/session-v1.17-submitted-unknown-and-safe-cron-summary.md` — handling `submitted_unknown` signed requests as attempted but not exchange-confirmed, plus safe reporting and command-building pitfalls.
 - `references/session-v1.18-single-agent-testnet-cron-json-harness.md` — reusable Python harness pattern for a scheduled single-agent signed testnet cron: signed preflight, sequential BTC/Alt cycles, runtime replay, post snapshot, safe Chinese summary, and fail-closed protection reporting.
+- `references/session-v1.19-pause-and-reset-testnet-state.md` — operational reset workflow: pause mutating cron jobs, archive runtime/order journals with manifest hashes and UTC/北京时间（UTC+8） timestamps, clear local ignored evidence files, and avoid confusing local reset with exchange position state.
+- `references/session-v1.20-testnet-post-run-summary-and-journal-summarization.md` — reconstruct signed testnet outcomes from runtime JSONL, order journals, replay JSON, and a fresh signed snapshot when CLI stdout is truncated.
 
 Tracked plans:
 
