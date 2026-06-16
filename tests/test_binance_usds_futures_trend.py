@@ -264,6 +264,66 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertFalse(event["signed"])
         self.assertEqual(broker.submitted_order_count, 0)
 
+    def test_testnet_broker_rejects_invalid_algo_cancel_before_signing(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        class ExplodingHttpClient:
+            def request(self, *args, **kwargs):
+                raise AssertionError("invalid cancel must not submit HTTP requests")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            http_client=ExplodingHttpClient(),
+        )
+        broker._sign_params = lambda params: (_ for _ in ()).throw(AssertionError("invalid cancel must reject before signing"))
+
+        missing_symbol = broker.cancel_order("123")
+        missing_id = broker.submit_order(
+            execution.OrderInstruction(symbol="BTCUSDT", side="SELL", quantity=0.0, order_type="CANCEL_ALGO_ORDER", metadata={})
+        )
+
+        self.assertEqual(missing_symbol["status"], "rejected")
+        self.assertEqual(missing_symbol["reason"], "cancel_symbol_required")
+        self.assertFalse(missing_symbol["real_order_submitted"])
+        self.assertFalse(missing_symbol["signed"])
+        self.assertEqual(missing_id["status"], "rejected")
+        self.assertEqual(missing_id["reason"], "cancel_algo_identifier_required")
+        self.assertFalse(missing_id["real_order_submitted"])
+        self.assertFalse(missing_id["signed"])
+
+    def test_testnet_broker_rejects_algo_cancel_when_global_risk_gate_trips(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        class ExplodingHttpClient:
+            def request(self, *args, **kwargs):
+                raise AssertionError("risk-rejected cancel must not submit HTTP requests")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            risk_limits=brokers.TestnetRiskLimits(kill_switch=True),
+            http_client=ExplodingHttpClient(),
+        )
+        broker._sign_params = lambda params: (_ for _ in ()).throw(AssertionError("risk-rejected cancel must reject before signing"))
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="BTCUSDT",
+                side="SELL",
+                quantity=0.0,
+                order_type="CANCEL_ALGO_ORDER",
+                metadata={"cancel_algo_id": "123"},
+            )
+        )
+
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason"], "kill_switch_enabled")
+        self.assertFalse(event["real_order_submitted"])
+        self.assertFalse(event["signed"])
+
     def test_testnet_runtime_record_redacts_sensitive_fields(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
 
@@ -354,6 +414,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertTrue(event["attempted_real_order_submitted"])
         self.assertTrue(event["signed"])
         self.assertEqual(broker.submitted_order_count, 1)
+        self.assertEqual(broker.accepted_order_count, 0)
         self.assertNotIn("signature=", encoded)
         self.assertNotIn("X-MBX-APIKEY", encoded)
         self.assertNotIn("boom url=", encoded)
@@ -525,8 +586,8 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
                 "positions": [{"symbol": "BTCUSDT", "positionAmt": "0.001", "entryPrice": "66000"}],
                 "open_orders": [],
                 "open_algo_orders": [
-                    {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "algoStatus": "NEW"},
-                    {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "algoStatus": "NEW"},
+                    {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "algoStatus": "NEW", "closePosition": "true", "triggerPrice": "65430"},
+                    {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "algoStatus": "NEW", "reduceOnly": "true", "origQty": "0.001", "triggerPrice": "67553"},
                 ],
             }
         )
@@ -553,14 +614,14 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(plan.instructions, [])
         self.assertEqual(plan.metadata.get("reason"), "target_exposure_already_reached")
 
-    def test_position_reconciliation_adds_stop_and_take_profit_protection_for_existing_long(self):
+    def test_position_reconciliation_adds_stop_and_layered_take_profit_protection_for_existing_long(self):
         execution = importlib.import_module("scripts.binance_trend_core.execution")
         types = importlib.import_module("scripts.binance_trend_core.types")
 
         engine = execution.PositionReconciliationExecutionEngine()
         intent = types.StrategyIntent(
             symbol="BTCUSDT",
-            desired_exposure=0.01,
+            desired_exposure=0.02,
             action="hold_long",
             reason="trend",
             metadata={
@@ -576,23 +637,128 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         plan = engine.plan_orders(
             intent,
             {"approved": True},
-            {"positions": {"BTCUSDT": {"size": 0.01}}, "open_orders": []},
+            {"positions": {"BTCUSDT": {"size": 0.02}}, "open_orders": [], "open_algo_orders": []},
         )
 
-        self.assertEqual([item.order_type for item in plan.instructions], ["STOP_MARKET", "TAKE_PROFIT_MARKET"])
-        stop_order, take_profit_order = plan.instructions
+        self.assertEqual([item.order_type for item in plan.instructions], ["STOP_MARKET", "TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET"])
+        stop_order, take_profit_1, take_profit_2 = plan.instructions
         self.assertEqual(stop_order.side, "SELL")
-        self.assertEqual(take_profit_order.side, "SELL")
-        self.assertEqual(stop_order.quantity, 0.01)
-        self.assertEqual(take_profit_order.quantity, 0.01)
+        self.assertEqual(take_profit_1.side, "SELL")
+        self.assertEqual(take_profit_2.side, "SELL")
+        self.assertEqual(stop_order.quantity, 0.02)
+        self.assertEqual(take_profit_1.quantity, 0.01)
+        self.assertEqual(take_profit_2.quantity, 0.01)
         self.assertTrue(stop_order.metadata["protective_order"])
-        self.assertTrue(take_profit_order.metadata["protective_order"])
+        self.assertTrue(take_profit_1.metadata["protective_order"])
+        self.assertTrue(take_profit_2.metadata["protective_order"])
         self.assertEqual(stop_order.metadata["protection_role"], "stop_loss")
-        self.assertEqual(take_profit_order.metadata["protection_role"], "take_profit")
+        self.assertEqual(take_profit_1.metadata["protection_role"], "take_profit_1")
+        self.assertEqual(take_profit_2.metadata["protection_role"], "take_profit_2")
         self.assertEqual(stop_order.metadata["stop_price"], 90.0)
-        self.assertEqual(take_profit_order.metadata["stop_price"], 140.0)
+        self.assertEqual(take_profit_1.metadata["stop_price"], 120.0)
+        self.assertEqual(take_profit_2.metadata["stop_price"], 140.0)
         self.assertTrue(stop_order.metadata["close_position"])
-        self.assertTrue(take_profit_order.metadata["close_position"])
+        self.assertTrue(take_profit_1.metadata["reduce_only"])
+        self.assertTrue(take_profit_2.metadata["reduce_only"])
+        self.assertNotIn("close_position", take_profit_1.metadata)
+        self.assertNotIn("close_position", take_profit_2.metadata)
+
+    def test_position_reconciliation_adds_only_missing_take_profit_layer(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        intent = types.StrategyIntent(
+            symbol="BTCUSDT",
+            desired_exposure=0.02,
+            action="hold_long",
+            reason="trend",
+            metadata={"signal": {"entry_reference": 100.0, "trailing_stop": 90.0, "take_profit_1": 120.0, "take_profit_2": 140.0}},
+        )
+
+        plan = engine.plan_orders(
+            intent,
+            {"approved": True},
+            {
+                "positions": {"BTCUSDT": {"size": 0.02}},
+                "open_algo_orders": [
+                    {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "triggerPrice": "90", "closePosition": "true"},
+                    {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "triggerPrice": "120", "reduceOnly": "true", "origQty": "0.01"},
+                ],
+            },
+        )
+
+        self.assertEqual([item.order_type for item in plan.instructions], ["TAKE_PROFIT_MARKET"])
+        self.assertEqual(plan.instructions[0].metadata["protection_role"], "take_profit_2")
+        self.assertEqual(plan.instructions[0].quantity, 0.01)
+        self.assertEqual(plan.instructions[0].metadata["stop_price"], 140.0)
+
+    def test_position_reconciliation_tops_up_undercovered_take_profit_layers(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        intent = types.StrategyIntent(
+            symbol="BTCUSDT",
+            desired_exposure=0.02,
+            action="hold_long",
+            reason="trend",
+            metadata={"signal": {"entry_reference": 100.0, "trailing_stop": 90.0, "take_profit_1": 120.0, "take_profit_2": 140.0}},
+        )
+
+        plan = engine.plan_orders(
+            intent,
+            {"approved": True},
+            {
+                "positions": {"BTCUSDT": {"size": 0.02}},
+                "open_algo_orders": [
+                    {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "triggerPrice": "90", "closePosition": "true"},
+                    {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "triggerPrice": "120", "reduceOnly": "true", "origQty": "0.005"},
+                    {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "triggerPrice": "140", "reduceOnly": "true", "origQty": "0.005"},
+                ],
+            },
+        )
+
+        self.assertEqual([item.order_type for item in plan.instructions], ["TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET"])
+        self.assertEqual([item.metadata["protection_role"] for item in plan.instructions], ["take_profit_1", "take_profit_2"])
+        self.assertEqual([item.metadata["stop_price"] for item in plan.instructions], [120.0, 140.0])
+        self.assertEqual([item.quantity for item in plan.instructions], [0.005, 0.005])
+
+    def test_position_reconciliation_replaces_stop_only_when_trailing_stop_moves_up(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+        engine = execution.PositionReconciliationExecutionEngine()
+        portfolio_state = {
+            "positions": {"BTCUSDT": {"size": 0.02}},
+            "open_algo_orders": [
+                {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "triggerPrice": "90", "algoId": 11, "clientAlgoId": "old-stop", "closePosition": "true"},
+                {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "triggerPrice": "120", "clientAlgoId": "tp1", "reduceOnly": "true", "origQty": "0.01"},
+                {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "triggerPrice": "140", "clientAlgoId": "tp2", "reduceOnly": "true", "origQty": "0.01"},
+            ],
+        }
+
+        up_intent = types.StrategyIntent(
+            symbol="BTCUSDT",
+            desired_exposure=0.02,
+            action="hold_long",
+            reason="trend",
+            metadata={"signal": {"entry_reference": 100.0, "trailing_stop": 95.0, "take_profit_1": 120.0, "take_profit_2": 140.0}},
+        )
+        up_plan = engine.plan_orders(up_intent, {"approved": True}, portfolio_state)
+
+        self.assertEqual([item.order_type for item in up_plan.instructions], ["STOP_MARKET"])
+        self.assertEqual(up_plan.instructions[0].metadata["stop_price"], 95.0)
+        self.assertEqual(up_plan.instructions[0].metadata["trailing_stop_replacement"], True)
+
+        down_intent = types.StrategyIntent(
+            symbol="BTCUSDT",
+            desired_exposure=0.02,
+            action="hold_long",
+            reason="trend",
+            metadata={"signal": {"entry_reference": 100.0, "trailing_stop": 88.0, "take_profit_1": 120.0, "take_profit_2": 140.0}},
+        )
+        down_plan = engine.plan_orders(down_intent, {"approved": True}, portfolio_state)
+        self.assertEqual(down_plan.instructions, [])
 
     def test_testnet_broker_encodes_close_position_conditional_protection_without_quantity(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
@@ -649,7 +815,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertNotIn("quantity", params)
         self.assertNotIn("reduceOnly", params)
 
-    def test_account_risk_sizing_uses_available_balance_stop_distance_and_caps(self):
+    def test_account_risk_sizing_uses_available_balance_stop_distance_and_equity_fraction_caps(self):
         signal = {
             "symbol": "BTCUSDT",
             "action": "hold_long",
@@ -657,24 +823,91 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             "trailing_stop": 90.0,
             "position_size": 999.0,
         }
-        account_snapshot = {"account": {"availableBalance": "5000"}}
+        account_snapshot = {"account": {"availableBalance": "5000", "walletBalance": "10000"}}
 
         sized = trend.apply_account_risk_sizing_to_signal(
             signal,
             account_snapshot,
             account_risk_fraction=0.01,
             target_leverage=2.0,
-            max_order_notional=200.0,
-            max_symbol_exposure=150.0,
+            max_order_notional=2000.0,
+            max_symbol_exposure_fraction=0.10,
         )
 
-        self.assertEqual(sized["position_size"], 1.5)
+        self.assertEqual(sized["position_size"], 10.0)
         sizing = sized["account_risk_sizing"]
         self.assertEqual(sizing["available_balance"], 5000.0)
-        self.assertEqual(sizing["risk_budget"], 50.0)
+        self.assertEqual(sizing["account_equity"], 10000.0)
+        self.assertEqual(sizing["risk_budget"], 100.0)
         self.assertEqual(sizing["stop_distance"], 10.0)
+        self.assertEqual(sizing["max_symbol_exposure_fraction"], 0.1)
+        self.assertEqual(sizing["max_symbol_exposure_from_fraction"], 1000.0)
         self.assertIn("max_order_notional_cap", sizing["constraints_applied"])
-        self.assertIn("max_symbol_exposure_cap", sizing["constraints_applied"])
+        self.assertIn("max_symbol_exposure_fraction_cap", sizing["constraints_applied"])
+
+    def test_account_risk_sizing_rejects_non_positive_exposure_fraction(self):
+        signal = {"symbol": "BTCUSDT", "action": "hold_long", "entry_reference": 100.0, "trailing_stop": 90.0}
+        with self.assertRaises(ValueError):
+            trend.apply_account_risk_sizing_to_signal(
+                signal,
+                {"account": {"availableBalance": "5000"}},
+                max_symbol_exposure_fraction=0.0,
+            )
+
+    def test_verify_position_protection_requires_safe_long_close_or_reduce_only_orders(self):
+        unsafe = trend.verify_position_protection(
+            {
+                "positions": [
+                    {"symbol": "BTCUSDT", "positionAmt": "0.02"},
+                    {"symbol": "ETHUSDT", "positionAmt": "-0.5"},
+                ],
+                "open_algo_orders": [
+                    {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "triggerPrice": "90"},
+                    {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "BUY", "triggerPrice": "120", "reduceOnly": "true"},
+                ],
+            }
+        )
+        self.assertFalse(unsafe["all_positions_protected"])
+        self.assertEqual(unsafe["unprotected_symbols"], ["BTCUSDT"])
+        self.assertEqual(unsafe["ignored_short_symbols"], ["ETHUSDT"])
+        self.assertIn("missing_stop_loss", unsafe["symbols"]["BTCUSDT"]["issues"])
+        self.assertIn("missing_take_profit", unsafe["symbols"]["BTCUSDT"]["issues"])
+
+        partial = trend.verify_position_protection(
+            {
+                "positions": [{"symbol": "BTCUSDT", "positionAmt": "0.02"}],
+                "open_algo_orders": [
+                    {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true", "triggerPrice": "90"},
+                    {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": "true", "origQty": "0.01", "triggerPrice": "120"},
+                ],
+            }
+        )
+        self.assertFalse(partial["all_positions_protected"])
+        self.assertEqual(partial["unprotected_symbols"], ["BTCUSDT"])
+        self.assertIn("missing_take_profit", partial["symbols"]["BTCUSDT"]["issues"])
+
+        missing_quantity = trend.verify_position_protection(
+            {
+                "positions": [{"symbol": "BTCUSDT", "positionAmt": "0.02"}],
+                "open_algo_orders": [
+                    {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true", "triggerPrice": "90"},
+                    {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": "true", "triggerPrice": "120"},
+                ],
+            }
+        )
+        self.assertFalse(missing_quantity["all_positions_protected"])
+        self.assertIn("missing_take_profit", missing_quantity["symbols"]["BTCUSDT"]["issues"])
+
+        safe = trend.verify_position_protection(
+            {
+                "positions": [{"symbol": "BTCUSDT", "positionAmt": "0.02"}],
+                "open_algo_orders": [
+                    {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true", "triggerPrice": "90"},
+                    {"symbol": "BTCUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": "true", "origQty": "0.02", "triggerPrice": "120"},
+                ],
+            }
+        )
+        self.assertTrue(safe["all_positions_protected"])
 
     def test_testnet_broker_fetches_exchange_info_rules_from_testnet_endpoint(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
@@ -971,16 +1204,19 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             self.assertTrue(any("/fapi/v1/exchangeInfo" in call[1] for call in client.calls))
             self.assertTrue(any(call[0] == "POST" and ("/fapi/v1/order" in call[1] or "/fapi/v1/algoOrder" in call[1]) for call in client.calls))
             rows = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(len(rows), 3)
-            self.assertEqual([row["status"] for row in rows], ["submitted", "submitted", "submitted"])
+            self.assertEqual(len(rows), 4)
+            self.assertEqual([row["status"] for row in rows], ["submitted", "submitted", "submitted", "submitted"])
             self.assertEqual(rows[0]["order_type"], "MARKET")
-            self.assertEqual([row["order_type"] for row in rows[1:]], ["STOP_MARKET", "TAKE_PROFIT_MARKET"])
+            self.assertEqual([row["order_type"] for row in rows[1:]], ["STOP_MARKET", "TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET"])
             self.assertEqual(rows[1]["request"]["path"], "/fapi/v1/algoOrder")
             self.assertEqual(rows[2]["request"]["path"], "/fapi/v1/algoOrder")
+            self.assertEqual(rows[3]["request"]["path"], "/fapi/v1/algoOrder")
             self.assertEqual(rows[1]["request"]["params"]["closePosition"], "true")
-            self.assertEqual(rows[2]["request"]["params"]["closePosition"], "true")
+            self.assertEqual(rows[2]["request"]["params"]["reduceOnly"], "true")
+            self.assertEqual(rows[3]["request"]["params"]["reduceOnly"], "true")
             self.assertIn("triggerPrice", rows[1]["request"]["params"])
             self.assertIn("triggerPrice", rows[2]["request"]["params"])
+            self.assertIn("triggerPrice", rows[3]["request"]["params"])
             self.assertIn("client_order_id", rows[0])
             self.assertIn("exchange_rule_adjustments", rows[0])
             self.assertNotIn("signature", json.dumps(rows))
@@ -1034,9 +1270,58 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertFalse(any("type=MARKET" in call[1] for call in order_posts))
         self.assertEqual(
             [item["order_type"] for item in cycle["runtime_record"]["execution_events"]["desired_orders"]],
-            ["STOP_MARKET", "TAKE_PROFIT_MARKET"],
+            ["STOP_MARKET", "TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET"],
         )
-        self.assertEqual(cycle["runtime_record"]["execution_events"]["simulated_fills_count"], 2)
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["simulated_fills_count"], 3)
+
+    def test_run_testnet_trading_cycle_reports_unprotected_position_when_post_sync_lacks_tp_sl(self):
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if "/fapi/v1/exchangeInfo" in url:
+                    return {"symbols": [{"symbol": "BTCUSDT", "filters": [{"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"}]}]}
+                if "/fapi/v2/account" in url:
+                    return {"assets": [{"asset": "USDT", "availableBalance": "1000"}]}
+                if "/fapi/v2/positionRisk" in url:
+                    return [{"symbol": "BTCUSDT", "positionAmt": "0.5", "entryPrice": "100.0"}]
+                if "/fapi/v1/openOrders" in url:
+                    return []
+                if "/fapi/v1/openAlgoOrders" in url:
+                    return []
+                if method == "POST" and "/fapi/v1/algoOrder" in url:
+                    params = dict(item.split("=", 1) for item in url.split("?", 1)[1].split("&"))
+                    client_id = params.get("clientAlgoId")
+                    return {"algoId": 124, "clientAlgoId": client_id, "status": "NEW"}
+                raise AssertionError(url)
+
+        def fake_fetch_klines(symbol, interval, limit, base_url):
+            return [
+                {"open": 100.0 + idx, "high": 101.0 + idx, "low": 99.0 + idx, "close": 100.5 + idx}
+                for idx in range(240)
+            ]
+
+        client = FakeHttpClient()
+        with mock.patch.dict(os.environ, {"LALA_KEY": "k", "LALA_SECRET": "s"}), mock.patch.object(trend, "fetch_klines", fake_fetch_klines):
+            cycle = trend.run_testnet_trading_cycle(
+                ["BTCUSDT"],
+                interval="1h",
+                limit=240,
+                save_runtime_record=False,
+                dry_run=False,
+                testnet_http_client=client,
+                sync_account_state=True,
+                account_risk_fraction=0.003,
+            )
+
+        protection = cycle["testnet_account_sync"]["protection_verification"]
+        self.assertFalse(protection["all_positions_protected"])
+        self.assertEqual(protection["unprotected_symbols"], ["BTCUSDT"])
+        self.assertIn("missing_stop_loss", protection["symbols"]["BTCUSDT"]["issues"])
+        self.assertIn("missing_take_profit", protection["symbols"]["BTCUSDT"]["issues"])
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["testnet_account_sync"]["unprotected_symbols"], ["BTCUSDT"])
 
     def test_run_testnet_trading_cycle_can_attach_signed_account_sync_report(self):
         class FakeHttpClient:
@@ -1228,6 +1513,55 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(cycle["runtime_record"]["execution_events"]["testnet_order_lifecycle"]["tracked_order_count"], 1)
         self.assertTrue(any("/fapi/v1/userTrades" in call[1] for call in client.calls))
 
+    def test_run_testnet_trading_cycle_does_not_promote_submitted_unknown_to_lifecycle(self):
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if "/fapi/v1/exchangeInfo" in url:
+                    return {"symbols": [{"symbol": "BTCUSDT", "filters": [{"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"}]}]}
+                if "/fapi/v2/account" in url:
+                    return {"assets": [{"asset": "USDT", "walletBalance": "1000"}]}
+                if "/fapi/v2/positionRisk" in url:
+                    return [{"symbol": "BTCUSDT", "positionAmt": "0.0"}]
+                if "/fapi/v1/openOrders" in url or "/fapi/v1/openAlgoOrders" in url:
+                    return []
+                if method == "POST" and "/fapi/v1/order" in url:
+                    raise RuntimeError("submission outcome unknown")
+                if method == "GET" and "/fapi/v1/order" in url:
+                    raise RuntimeError("confirmation failed")
+                if "/fapi/v1/userTrades" in url:
+                    raise AssertionError("submitted_unknown orders must not fetch fills")
+                raise AssertionError(url)
+
+        def fake_fetch_klines(symbol, interval, limit, base_url):
+            return [
+                {"open": 100.0 + idx, "high": 101.0 + idx, "low": 99.0 + idx, "close": 100.5 + idx}
+                for idx in range(240)
+            ]
+
+        client = FakeHttpClient()
+        with mock.patch.dict(os.environ, {"LALA_KEY": "k", "LALA_SECRET": "s"}), mock.patch.object(trend, "fetch_klines", fake_fetch_klines):
+            cycle = trend.run_testnet_trading_cycle(
+                ["BTCUSDT"],
+                interval="1h",
+                limit=240,
+                save_runtime_record=False,
+                dry_run=False,
+                testnet_http_client=client,
+                track_order_lifecycle=True,
+            )
+
+        self.assertEqual(cycle["errors"], [])
+        self.assertGreaterEqual(len(cycle["fills"]), 1)
+        self.assertEqual({fill["status"] for fill in cycle["fills"]}, {"submitted_unknown"})
+        self.assertEqual(cycle["testnet_order_lifecycle"], [])
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["testnet_order_lifecycle"]["tracked_order_count"], 0)
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["testnet_order_lifecycle"]["filled_order_count"], 0)
+        self.assertFalse(any("/fapi/v1/userTrades" in call[1] for call in client.calls))
+
     def test_cli_loads_testnet_risk_config_file_and_emits_sanitized_summary(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = pathlib.Path(tmpdir) / "risk.json"
@@ -1236,6 +1570,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
                     {
                         "max_order_notional": 12.5,
                         "max_symbol_exposure": 33,
+                        "max_symbol_exposure_fraction": 0.2,
                         "max_daily_loss": 5,
                         "max_order_count": 2,
                         "kill_switch": True,
@@ -1270,6 +1605,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         called_kwargs = run_cycle.call_args.kwargs
         self.assertEqual(called_kwargs["max_order_notional"], 12.5)
+        self.assertEqual(called_kwargs["max_symbol_exposure_fraction"], 0.2)
         self.assertTrue(called_kwargs["kill_switch"])
         rendered = stdout.getvalue()
         self.assertIn('"testnet_risk_limits"', rendered)

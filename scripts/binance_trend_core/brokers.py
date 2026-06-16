@@ -363,6 +363,14 @@ class BinanceTestnetBroker:
     def submit_order(self, instruction: OrderInstruction | dict[str, Any]) -> dict[str, Any]:
         order = _coerce_instruction(instruction)
         symbol = order.symbol.upper()
+        order_type = order.order_type.upper()
+        if order_type == "CANCEL_ALGO_ORDER":
+            return self.cancel_algo_order(
+                symbol=symbol,
+                algo_id=order.metadata.get("cancel_algo_id"),
+                client_algo_id=order.metadata.get("cancel_client_algo_id"),
+                instruction=order,
+            )
         side = order.side.upper()
         if side not in {"BUY", "SELL"}:
             raise ValueError(f"unsupported testnet side: {order.side}")
@@ -547,7 +555,61 @@ class BinanceTestnetBroker:
         return event
 
     def cancel_order(self, order_id: str) -> dict[str, Any]:
-        return {"environment": self.environment, "order_id": order_id, "cancelled": False, "reason": "cancel not implemented in v1.7 testnet adapter skeleton"}
+        order = OrderInstruction(symbol="UNKNOWN", side="SELL", quantity=0.0, order_type="CANCEL_ALGO_ORDER", metadata={"cancel_algo_id": order_id})
+        event = self._base_event(order, 0.0, 0.0)
+        event.update({"status": "rejected", "reason": "cancel_symbol_required", "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run})
+        self.fills.append(event)
+        return event
+
+    def cancel_algo_order(self, *, symbol: str, algo_id: Any = None, client_algo_id: Any = None, instruction: OrderInstruction | None = None) -> dict[str, Any]:
+        normalized_symbol = str(symbol or "").upper()
+        order = instruction or OrderInstruction(symbol=normalized_symbol or "UNKNOWN", side="SELL", quantity=0.0, order_type="CANCEL_ALGO_ORDER", metadata={})
+        event = self._base_event(order, 0.0, 0.0)
+        has_algo_id = algo_id not in (None, "")
+        has_client_algo_id = client_algo_id not in (None, "")
+        if not normalized_symbol:
+            event.update({"status": "rejected", "reason": "cancel_symbol_required", "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run})
+            self.fills.append(event)
+            return event
+        if not has_algo_id and not has_client_algo_id:
+            event.update({"status": "rejected", "reason": "cancel_algo_identifier_required", "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run})
+            self.fills.append(event)
+            return event
+        global_rejection = self._global_risk_rejection()
+        if global_rejection:
+            event.update({"status": "rejected", "reason": global_rejection, "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run})
+            self.fills.append(event)
+            return event
+        params: dict[str, Any] = {"symbol": normalized_symbol, "timestamp": int(datetime.now(UTC).timestamp() * 1000)}
+        if has_algo_id:
+            params["algoId"] = str(algo_id)
+        if has_client_algo_id:
+            params["clientAlgoId"] = str(client_algo_id)
+        event.update(
+            {
+                "status": "dry_run" if self.dry_run else "submitted",
+                "testnet_dry_run": self.dry_run,
+                "signed": not self.dry_run,
+                "simulated": self.dry_run,
+                "real_order_submitted": not self.dry_run,
+                "request": {"method": "DELETE", "path": "/fapi/v1/algoOrder", "params": redact_sensitive_testnet_fields(params)},
+            }
+        )
+        if self.dry_run:
+            self.fills.append(event)
+            return event
+        signed_params = self._sign_params(params)
+        event["request"] = {"method": "DELETE", "path": "/fapi/v1/algoOrder", "params": redact_sensitive_testnet_fields(signed_params)}
+        query = urllib.parse.urlencode(signed_params)
+        url = f"{self.base_url}/fapi/v1/algoOrder?{query}"
+        self.fills.append(event)
+        try:
+            response_payload = self.http_client.request("DELETE", url, headers={"X-MBX-APIKEY": self.credentials.api_key})
+            event["response"] = redact_sensitive_testnet_fields(response_payload)
+        except Exception as exc:
+            event.update({"status": "submitted_unknown", "error": "signed_testnet_cancel_failed_sanitized", "error_type": exc.__class__.__name__, "response": None})
+        self._append_order_journal(event)
+        return event
 
     def refresh_exchange_rules(self, symbols: list[str] | tuple[str, ...] | set[str] | None = None) -> dict[str, SymbolExchangeRules]:
         wanted = {item.upper() for item in symbols} if symbols is not None else None

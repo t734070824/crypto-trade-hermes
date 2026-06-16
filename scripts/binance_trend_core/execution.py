@@ -150,45 +150,77 @@ def _protective_orders(
         return []
     reference_price = _reference_price_from_signal(signal)
     stop_price = _positive_signal_price(signal.get("trailing_stop"))
-    take_profit_price = _positive_signal_price(signal.get("take_profit_2") or signal.get("take_profit_1"))
+    take_profit_1 = _positive_signal_price(signal.get("take_profit_1"))
+    take_profit_2 = _positive_signal_price(signal.get("take_profit_2"))
     orders: list[OrderInstruction] = []
-    if stop_price is not None and not _has_open_protection(portfolio_state, symbol, "stop_loss"):
-        orders.append(
-            OrderInstruction(
-                symbol=symbol,
-                side="SELL",
-                quantity=abs(target_exposure),
-                order_type="STOP_MARKET",
-                metadata={
-                    "protective_order": True,
-                    "protection_role": "stop_loss",
-                    "close_position": True,
-                    "working_type": "MARK_PRICE",
-                    "stop_price": stop_price,
-                    "reference_price": reference_price,
-                    "action": "protect_long",
-                },
-            )
-        )
-    if take_profit_price is not None and not _has_open_protection(portfolio_state, symbol, "take_profit"):
-        orders.append(
-            OrderInstruction(
-                symbol=symbol,
-                side="SELL",
-                quantity=abs(target_exposure),
-                order_type="TAKE_PROFIT_MARKET",
-                metadata={
-                    "protective_order": True,
-                    "protection_role": "take_profit",
-                    "close_position": True,
-                    "working_type": "MARK_PRICE",
-                    "stop_price": take_profit_price,
-                    "reference_price": reference_price,
-                    "action": "protect_long",
-                },
-            )
-        )
+    existing_stop = _find_open_protection(portfolio_state, symbol, "stop_loss", target_exposure=target_exposure)
+    if stop_price is not None:
+        existing_stop_price = _positive_signal_price((existing_stop or {}).get("triggerPrice") or (existing_stop or {}).get("stopPrice"))
+        if existing_stop is None:
+            orders.append(_stop_loss_instruction(symbol, target_exposure, reference_price, stop_price, trailing_replacement=False))
+        elif existing_stop_price is not None and stop_price > existing_stop_price:
+            # Fail-closed: submit the tighter stop without cancelling the older, lower stop in
+            # the same blind instruction plan.  This can leave duplicate stop protection, but
+            # never creates a naked long position if the replacement is rejected or unknown.
+            orders.append(_stop_loss_instruction(symbol, target_exposure, reference_price, stop_price, trailing_replacement=True))
+    existing_tp_coverage = _existing_take_profit_coverage(portfolio_state, symbol, target_exposure)
+    remaining_tp_exposure = max(0.0, target_exposure - existing_tp_coverage)
+    if remaining_tp_exposure > 0:
+        if take_profit_1 is None and take_profit_2 is not None:
+            coverage = _take_profit_coverage_at_price(portfolio_state, symbol, take_profit_2, target_exposure)
+            qty = min(max(0.0, target_exposure - coverage), remaining_tp_exposure)
+            if qty > 0:
+                orders.append(_take_profit_instruction(symbol, qty, reference_price, take_profit_2, "take_profit_2"))
+        else:
+            configured_layers = [("take_profit_1", take_profit_1), ("take_profit_2", take_profit_2)]
+            configured_layers = [(role, price) for role, price in configured_layers if price is not None]
+            per_layer_qty = target_exposure / max(1, len(configured_layers))
+            for role, price in configured_layers:
+                coverage = _take_profit_coverage_at_price(portfolio_state, symbol, price, per_layer_qty)
+                qty = min(max(0.0, per_layer_qty - coverage), remaining_tp_exposure)
+                if qty > 0:
+                    orders.append(_take_profit_instruction(symbol, qty, reference_price, price, role))
+                    remaining_tp_exposure = max(0.0, remaining_tp_exposure - qty)
+                if remaining_tp_exposure <= 0:
+                    break
     return orders
+
+
+def _stop_loss_instruction(symbol: str, target_exposure: float, reference_price: float, stop_price: float, *, trailing_replacement: bool) -> OrderInstruction:
+    return OrderInstruction(
+        symbol=symbol,
+        side="SELL",
+        quantity=abs(target_exposure),
+        order_type="STOP_MARKET",
+        metadata={
+            "protective_order": True,
+            "protection_role": "stop_loss",
+            "close_position": True,
+            "working_type": "MARK_PRICE",
+            "stop_price": stop_price,
+            "reference_price": reference_price,
+            "action": "protect_long",
+            "trailing_stop_replacement": trailing_replacement,
+        },
+    )
+
+
+def _take_profit_instruction(symbol: str, quantity: float, reference_price: float, take_profit_price: float, role: str) -> OrderInstruction:
+    return OrderInstruction(
+        symbol=symbol,
+        side="SELL",
+        quantity=abs(quantity),
+        order_type="TAKE_PROFIT_MARKET",
+        metadata={
+            "protective_order": True,
+            "protection_role": role,
+            "reduce_only": True,
+            "working_type": "MARK_PRICE",
+            "stop_price": take_profit_price,
+            "reference_price": reference_price,
+            "action": "protect_long",
+        },
+    )
 
 
 def _positive_signal_price(value: Any) -> float | None:
@@ -199,9 +231,8 @@ def _positive_signal_price(value: Any) -> float | None:
     return price if price > 0 else None
 
 
-def _has_open_protection(portfolio_state: dict[str, Any], symbol: str, role: str) -> bool:
+def _protection_rows(portfolio_state: dict[str, Any], symbol: str) -> list[Any]:
     symbol = symbol.upper()
-    wanted_types = {"stop_loss": {"STOP", "STOP_MARKET"}, "take_profit": {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}}.get(role, set())
     rows: list[Any] = []
     for key in ("open_orders", "openOrders", "open_algo_orders", "openAlgoOrders"):
         value = portfolio_state.get(key) or []
@@ -209,12 +240,96 @@ def _has_open_protection(portfolio_state: dict[str, Any], symbol: str, role: str
             value = value.get(symbol) or value.get(symbol.upper()) or []
         if isinstance(value, list):
             rows.extend(value)
-    for item in rows:
+    return rows
+
+
+def _find_open_protection(portfolio_state: dict[str, Any], symbol: str, role: str, *, target_exposure: float | None = None) -> dict[str, Any] | None:
+    symbol = symbol.upper()
+    wanted_types = {"stop_loss": {"STOP", "STOP_MARKET"}, "take_profit": {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}}.get(role, set())
+    for item in _protection_rows(portfolio_state, symbol):
         if not isinstance(item, dict):
             continue
         if str(item.get("symbol", "")).upper() != symbol:
             continue
         order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
-        if order_type in wanted_types and str(item.get("side", "SELL")).upper() == "SELL":
+        if order_type in wanted_types and _is_safe_long_protection(item, role, target_exposure=target_exposure):
+            return item
+    return None
+
+
+def _has_open_protection(portfolio_state: dict[str, Any], symbol: str, role: str, *, target_exposure: float | None = None) -> bool:
+    return _find_open_protection(portfolio_state, symbol, role, target_exposure=target_exposure) is not None
+
+
+def _has_matching_take_profit(portfolio_state: dict[str, Any], symbol: str, trigger_price: float, *, target_exposure: float | None = None) -> bool:
+    symbol = symbol.upper()
+    for item in _protection_rows(portfolio_state, symbol):
+        if not isinstance(item, dict) or str(item.get("symbol", "")).upper() != symbol:
+            continue
+        order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
+        if order_type not in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"} or not _is_safe_long_protection(item, "take_profit", target_exposure=target_exposure):
+            continue
+        existing_price = _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))
+        if existing_price is not None and abs(existing_price - trigger_price) <= max(1e-8, abs(trigger_price) * 0.0001):
             return True
     return False
+
+
+def _existing_take_profit_coverage(portfolio_state: dict[str, Any], symbol: str, target_exposure: float) -> float:
+    symbol = symbol.upper()
+    coverage = 0.0
+    for item in _protection_rows(portfolio_state, symbol):
+        if not isinstance(item, dict) or str(item.get("symbol", "")).upper() != symbol:
+            continue
+        order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
+        quantity = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
+        if order_type not in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"} or quantity is None:
+            continue
+        if not _is_safe_long_protection(item, "take_profit", target_exposure=quantity):
+            continue
+        coverage += min(quantity, target_exposure)
+    return min(coverage, target_exposure)
+
+
+def _take_profit_coverage_at_price(portfolio_state: dict[str, Any], symbol: str, trigger_price: float, layer_target_exposure: float) -> float:
+    symbol = symbol.upper()
+    coverage = 0.0
+    for item in _protection_rows(portfolio_state, symbol):
+        if not isinstance(item, dict) or str(item.get("symbol", "")).upper() != symbol:
+            continue
+        order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
+        quantity = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
+        if order_type not in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"} or quantity is None:
+            continue
+        if not _is_safe_long_protection(item, "take_profit", target_exposure=quantity):
+            continue
+        existing_price = _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))
+        if existing_price is None or abs(existing_price - trigger_price) > max(1e-8, abs(trigger_price) * 0.0001):
+            continue
+        coverage += min(quantity, layer_target_exposure)
+    return min(coverage, layer_target_exposure)
+
+
+def _is_safe_long_protection(item: dict[str, Any], role: str, *, target_exposure: float | None = None) -> bool:
+    if str(item.get("side", "")).upper() != "SELL":
+        return False
+    close_position = _truthy(item.get("closePosition") or item.get("close_position"))
+    reduce_only = _truthy(item.get("reduceOnly") or item.get("reduce_only"))
+    if role == "stop_loss":
+        return close_position or (reduce_only and _quantity_covers(item, target_exposure))
+    if role == "take_profit":
+        return reduce_only and _quantity_covers(item, target_exposure)
+    return False
+
+
+def _quantity_covers(item: dict[str, Any], target_exposure: float | None) -> bool:
+    if target_exposure is None or target_exposure <= 0:
+        return False
+    quantity = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
+    return quantity is not None and quantity >= target_exposure * 0.999
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}

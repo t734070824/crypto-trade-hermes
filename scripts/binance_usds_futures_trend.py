@@ -336,6 +336,7 @@ def apply_account_risk_sizing_to_signal(
     target_leverage: float = 2.0,
     max_order_notional: float | None = None,
     max_symbol_exposure: float | None = None,
+    max_symbol_exposure_fraction: float | None = None,
 ) -> dict[str, Any]:
     """Size desired exposure from available margin and stop distance.
 
@@ -353,8 +354,8 @@ def apply_account_risk_sizing_to_signal(
     stop_distance = entry_price - stop_price
     if stop_distance <= 0:
         raise ValueError("trailing_stop must be below entry_reference for long risk sizing")
-    available_balance = _available_balance_from_snapshot(account_snapshot)
-    risk_budget = available_balance * account_risk_fraction
+    available_balance, account_equity = _account_balances_from_snapshot(account_snapshot)
+    risk_budget = account_equity * account_risk_fraction
     qty_by_stop_risk = risk_budget / stop_distance
     max_notional_by_margin = available_balance * target_leverage
     constraints = ["stop_distance_risk_budget"]
@@ -365,12 +366,21 @@ def apply_account_risk_sizing_to_signal(
     if max_symbol_exposure is not None:
         notional_cap = min(notional_cap, float(max_symbol_exposure))
         constraints.append("max_symbol_exposure_cap")
+    max_symbol_exposure_from_fraction = None
+    if max_symbol_exposure_fraction is not None:
+        fraction = float(max_symbol_exposure_fraction)
+        if not math.isfinite(fraction) or fraction <= 0:
+            raise ValueError("max_symbol_exposure_fraction must be a finite positive number")
+        max_symbol_exposure_from_fraction = account_equity * fraction
+        notional_cap = min(notional_cap, max_symbol_exposure_from_fraction)
+        constraints.append("max_symbol_exposure_fraction_cap")
     qty_by_notional_cap = notional_cap / entry_price
     desired_qty = max(0.0, min(qty_by_stop_risk, qty_by_notional_cap))
     sized["position_size"] = round(desired_qty, 8)
     sized["account_risk_sizing"] = {
         "method": "available_balance_stop_distance_leverage_cap",
         "available_balance": round(available_balance, 8),
+        "account_equity": round(account_equity, 8),
         "account_risk_fraction": round(float(account_risk_fraction), 8),
         "risk_budget": round(risk_budget, 8),
         "entry_reference": round(entry_price, 8),
@@ -379,6 +389,8 @@ def apply_account_risk_sizing_to_signal(
         "target_leverage": round(float(target_leverage), 8),
         "max_notional_by_margin": round(max_notional_by_margin, 8),
         "effective_notional_cap": round(notional_cap, 8),
+        "max_symbol_exposure_fraction": None if max_symbol_exposure_fraction is None else round(float(max_symbol_exposure_fraction), 8),
+        "max_symbol_exposure_from_fraction": None if max_symbol_exposure_from_fraction is None else round(max_symbol_exposure_from_fraction, 8),
         "qty_by_stop_risk": round(qty_by_stop_risk, 8),
         "qty_by_notional_cap": round(qty_by_notional_cap, 8),
         "desired_position_size": round(desired_qty, 8),
@@ -397,19 +409,38 @@ def _positive_number(value: Any, field_name: str) -> float:
     return parsed
 
 
-def _available_balance_from_snapshot(account_snapshot: dict[str, Any] | None) -> float:
+def _account_balances_from_snapshot(account_snapshot: dict[str, Any] | None) -> tuple[float, float]:
     account = account_snapshot.get("account") if isinstance(account_snapshot, dict) else None
     if not isinstance(account, dict):
         raise ValueError("account snapshot is required for account risk sizing")
-    for key in ("availableBalance", "available_balance", "maxWithdrawAmount"):
-        if key in account:
-            return _positive_number(account[key], key)
+
+    available_value = _first_positive_number(account, ("availableBalance", "available_balance", "maxWithdrawAmount"))
+    equity_value = _first_positive_number(account, ("walletBalance", "totalWalletBalance", "totalMarginBalance", "equity"))
     for asset in account.get("assets") or []:
         if isinstance(asset, dict) and str(asset.get("asset", "")).upper() == "USDT":
-            for key in ("availableBalance", "maxWithdrawAmount", "walletBalance"):
-                if key in asset:
-                    return _positive_number(asset[key], f"USDT.{key}")
-    raise ValueError("account snapshot missing availableBalance")
+            if available_value is None:
+                available_value = _first_positive_number(asset, ("availableBalance", "maxWithdrawAmount"))
+            if equity_value is None:
+                equity_value = _first_positive_number(asset, ("walletBalance", "marginBalance", "crossWalletBalance", "equity"))
+    if available_value is None:
+        available_value = equity_value
+    if available_value is None:
+        raise ValueError("account snapshot missing availableBalance or wallet/equity balance")
+    if equity_value is None:
+        equity_value = available_value
+    return available_value, equity_value
+
+
+def _available_balance_from_snapshot(account_snapshot: dict[str, Any] | None) -> float:
+    available_balance, _account_equity = _account_balances_from_snapshot(account_snapshot)
+    return available_balance
+
+
+def _first_positive_number(source: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if key in source:
+            return _positive_number(source[key], key)
+    return None
 
 def enrich_for_ranking(decision: dict[str, Any], timeframe_agreement_score: float = 1.0) -> dict[str, Any]:
     """Add portfolio-ranking fields to one paper decision."""
@@ -1953,6 +1984,104 @@ def run_paper_trading_cycle(
     )
 
 
+def verify_position_protection(account_snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Verify every non-zero long testnet position has safe SL and TP protection."""
+    positions = account_snapshot.get("positions", []) if isinstance(account_snapshot, dict) else []
+    open_orders = account_snapshot.get("open_orders", []) if isinstance(account_snapshot, dict) else []
+    open_algo_orders = account_snapshot.get("open_algo_orders", []) if isinstance(account_snapshot, dict) else []
+    order_rows = []
+    if isinstance(open_orders, list):
+        order_rows.extend(open_orders)
+    if isinstance(open_algo_orders, list):
+        order_rows.extend(open_algo_orders)
+    by_symbol: dict[str, dict[str, Any]] = {}
+    ignored_short_symbols: list[str] = []
+    for item in positions if isinstance(positions, list) else []:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        try:
+            amount = float(item.get("positionAmt") or item.get("position_amt") or item.get("size") or 0.0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if abs(amount) <= 1e-12:
+            continue
+        if amount < 0:
+            ignored_short_symbols.append(symbol)
+            continue
+        has_stop = False
+        take_profit_coverage = 0.0
+        target_exposure = abs(amount)
+        for order in order_rows:
+            if not isinstance(order, dict) or str(order.get("symbol") or "").upper() != symbol:
+                continue
+            order_type = str(order.get("type") or order.get("origType") or order.get("orderType") or "").upper()
+            if order_type in {"STOP", "STOP_MARKET"} and _is_safe_long_snapshot_protection(order, "stop_loss", target_exposure):
+                has_stop = True
+            if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"} and _is_safe_long_snapshot_take_profit(order):
+                quantity = _optional_positive_number(order.get("origQty") or order.get("quantity") or order.get("executedQty"))
+                if quantity is not None:
+                    take_profit_coverage += min(quantity, target_exposure)
+        has_take_profit = take_profit_coverage >= target_exposure * 0.999
+        issues = []
+        if not has_stop:
+            issues.append("missing_stop_loss")
+        if not has_take_profit:
+            issues.append("missing_take_profit")
+        by_symbol[symbol] = {
+            "position_amt": amount,
+            "has_stop_loss": has_stop,
+            "has_take_profit": has_take_profit,
+            "protected": not issues,
+            "issues": issues,
+        }
+    unprotected = [symbol for symbol, item in by_symbol.items() if not item.get("protected")]
+    return {
+        "all_positions_protected": not unprotected,
+        "unprotected_symbols": unprotected,
+        "ignored_short_symbols": ignored_short_symbols,
+        "symbols": by_symbol,
+    }
+
+
+def _is_safe_long_snapshot_protection(order: dict[str, Any], role: str, target_exposure: float) -> bool:
+    if str(order.get("side") or "").upper() != "SELL":
+        return False
+    close_position = _boolish(order.get("closePosition") or order.get("close_position"))
+    reduce_only = _boolish(order.get("reduceOnly") or order.get("reduce_only"))
+    quantity = _optional_positive_number(order.get("origQty") or order.get("quantity") or order.get("executedQty"))
+    covers_position = quantity is not None and quantity >= target_exposure * 0.999
+    if role == "stop_loss":
+        return close_position or (reduce_only and covers_position)
+    if role == "take_profit":
+        return _is_safe_long_snapshot_take_profit(order) and covers_position
+    return False
+
+
+def _is_safe_long_snapshot_take_profit(order: dict[str, Any]) -> bool:
+    if str(order.get("side") or "").upper() != "SELL":
+        return False
+    if not _boolish(order.get("reduceOnly") or order.get("reduce_only")):
+        return False
+    return _optional_positive_number(order.get("origQty") or order.get("quantity") or order.get("executedQty")) is not None
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_positive_number(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
 def run_testnet_trading_cycle(
     symbols: Iterable[str],
     interval: str = "1h",
@@ -1969,6 +2098,7 @@ def run_testnet_trading_cycle(
     dry_run: bool = True,
     max_order_notional: float = 1_000.0,
     max_symbol_exposure: float = 2_000.0,
+    max_symbol_exposure_fraction: float | None = None,
     max_daily_loss: float = 100.0,
     max_order_count: int = 10,
     kill_switch: bool = False,
@@ -2053,6 +2183,7 @@ def run_testnet_trading_cycle(
                 target_leverage=target_leverage,
                 max_order_notional=max_order_notional,
                 max_symbol_exposure=max_symbol_exposure,
+                max_symbol_exposure_fraction=max_symbol_exposure_fraction,
             ) if account_sync_before is not None else decide(
                 candles,
                 symbol=symbol,
@@ -2073,7 +2204,7 @@ def run_testnet_trading_cycle(
             status = fill.get("status") if isinstance(fill, dict) else None
             instruction = fill.get("instruction") if isinstance(fill, dict) else None
             metadata = instruction.get("metadata") if isinstance(instruction, dict) else {}
-            if not client_order_id or not symbol or status not in {"submitted", "submitted_confirmed", "submitted_unknown"}:
+            if not client_order_id or not symbol or status not in {"submitted", "submitted_confirmed"}:
                 continue
             if isinstance(metadata, dict) and metadata.get("protective_order"):
                 continue
@@ -2094,11 +2225,13 @@ def run_testnet_trading_cycle(
         account_sync_after = broker.fetch_signed_account_snapshot()
         open_orders = account_sync_after.get("open_orders", []) if isinstance(account_sync_after, dict) else []
         reconciliation = broker.reconcile_open_orders(open_orders if isinstance(open_orders, list) else [])
+        protection_verification = verify_position_protection(account_sync_after)
         cycle["testnet_account_sync"] = {
             "environment": "testnet",
             "before": account_sync_before,
             "after": account_sync_after,
             "reconciliation": reconciliation,
+            "protection_verification": protection_verification,
         }
         cycle["runtime_record"].setdefault("execution_events", {})["testnet_account_sync"] = {
             "before_open_orders_count": len(account_sync_before.get("open_orders", [])) if isinstance(account_sync_before, dict) else 0,
@@ -2106,6 +2239,8 @@ def run_testnet_trading_cycle(
             "unknown_local_count": reconciliation.get("unknown_local_count", 0),
             "matched_open_order_client_ids": reconciliation.get("matched_open_order_client_ids", []),
             "missing_unknown_client_ids": reconciliation.get("missing_unknown_client_ids", []),
+            "all_positions_protected": protection_verification.get("all_positions_protected", False),
+            "unprotected_symbols": protection_verification.get("unprotected_symbols", []),
         }
     return _attach_cycle_runtime_record_receipt(
         cycle,
@@ -2195,9 +2330,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--testnet-submit-signed", action="store_true", help="For --run-testnet-cycle, submit signed testnet orders; never mainnet/live")
     parser.add_argument("--testnet-max-order-notional", type=float, default=1_000.0, help="Max testnet order notional before rejection")
     parser.add_argument("--testnet-max-symbol-exposure", type=float, default=2_000.0, help="Max testnet symbol exposure before rejection")
+    parser.add_argument("--testnet-max-symbol-exposure-fraction", type=float, help="Account-equity fraction cap for desired testnet symbol exposure, e.g. 0.10")
     parser.add_argument("--testnet-max-daily-loss", type=float, default=100.0, help="Max testnet daily loss before rejection")
     parser.add_argument("--testnet-max-order-count", type=int, default=10, help="Max testnet accepted order count per cycle")
-    parser.add_argument("--account-risk-fraction", type=float, default=0.01, help="For testnet cycle account sizing: fraction of available balance risked to ATR stop distance")
+    parser.add_argument("--account-risk-fraction", type=float, default=0.01, help="For testnet cycle account sizing: fraction of account equity risked to ATR stop distance")
     parser.add_argument("--target-leverage", type=float, default=2.0, help="For testnet cycle account sizing: target leverage cap used to derive max notional")
     parser.add_argument("--testnet-kill-switch", action="store_true", help="Reject all testnet execution before signing/submission")
     parser.add_argument("--testnet-risk-config-file", help="Optional JSON testnet risk config; supports max_* limits and kill_switch")
@@ -2353,11 +2489,14 @@ def main(argv: list[str] | None = None) -> int:
                 "max_order_count": args.testnet_max_order_count,
                 "kill_switch": args.testnet_kill_switch,
             }
+            max_symbol_exposure_fraction = args.testnet_max_symbol_exposure_fraction
             if args.testnet_risk_config_file:
                 loaded_risk_config = json.loads(Path(args.testnet_risk_config_file).read_text(encoding="utf-8"))
                 if not isinstance(loaded_risk_config, dict):
                     raise ValueError("--testnet-risk-config-file must contain a JSON object")
                 risk_config.update(loaded_risk_config)
+                if "max_symbol_exposure_fraction" in loaded_risk_config:
+                    max_symbol_exposure_fraction = float(loaded_risk_config["max_symbol_exposure_fraction"])
             risk_limits = TestnetRiskLimits.from_config(
                 risk_config,
                 kill_switch_env="BINANCE_TESTNET_KILL_SWITCH",
@@ -2379,6 +2518,7 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=not args.testnet_submit_signed,
                 max_order_notional=risk_limits.max_order_notional,
                 max_symbol_exposure=risk_limits.max_symbol_exposure,
+                max_symbol_exposure_fraction=max_symbol_exposure_fraction,
                 max_daily_loss=risk_limits.max_daily_loss,
                 max_order_count=risk_limits.max_order_count,
                 kill_switch=risk_limits.kill_switch,
