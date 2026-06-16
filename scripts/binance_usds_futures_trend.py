@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import os
+import re
 import tempfile
 import urllib.parse
 import urllib.request
@@ -30,6 +31,15 @@ _SHORT_INTERVALS = {"1m", "3m", "5m", "10m", "15m", "30m"}
 _ALLOWED_INTERVALS = {"1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
 _PUBLIC_FACTOR_PERIODS = {"1h", "2h", "4h", "6h", "12h", "1d"}
 BEIJING = timezone(timedelta(hours=8), name="UTC+8")
+
+
+def sanitize_error_message(message: Any) -> str:
+    """Redact credentials/signatures from structured CLI error messages."""
+    text = str(message)
+    text = re.sub(r"(?i)(signature=)[^&\s\"']+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)(X-MBX-APIKEY\s*[=:]\s*)[^&\s\"']+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)((?:api[_-]?key|secret|signature)\s*[=:]\s*)[^&\s\"']+", r"\1<redacted>", text)
+    return text
 
 
 def validate_interval(interval: str) -> str:
@@ -1889,14 +1899,14 @@ def run_testnet_trading_cycle(
     """
     try:
         from scripts.binance_trend_core.brokers import BinanceTestnetBroker, TestnetRiskLimits, resolve_binance_testnet_credentials
-        from scripts.binance_trend_core.execution import PaperIntentExecutionEngine
+        from scripts.binance_trend_core.execution import PositionReconciliationExecutionEngine
         from scripts.binance_trend_core.loop import TradingCycleConfig, run_trading_cycle
         from scripts.binance_trend_core.risk import FunctionRiskManager
         from scripts.binance_trend_core.signals import FunctionSignalEngine
         from scripts.binance_trend_core.strategy import TrendParticipationStrategy
     except ModuleNotFoundError:
         from binance_trend_core.brokers import BinanceTestnetBroker, TestnetRiskLimits, resolve_binance_testnet_credentials
-        from binance_trend_core.execution import PaperIntentExecutionEngine
+        from binance_trend_core.execution import PositionReconciliationExecutionEngine
         from binance_trend_core.loop import TradingCycleConfig, run_trading_cycle
         from binance_trend_core.risk import FunctionRiskManager
         from binance_trend_core.signals import FunctionSignalEngine
@@ -1930,7 +1940,9 @@ def run_testnet_trading_cycle(
     broker = BinanceTestnetBroker(**broker_kwargs)
     if refresh_exchange_rules:
         broker.refresh_exchange_rules(selected_symbols)
-    account_sync_before = broker.fetch_signed_account_snapshot(selected_symbols[0]) if sync_account_state and selected_symbols else None
+    account_sync_before = broker.fetch_signed_account_snapshot() if (sync_account_state or not dry_run) and selected_symbols else None
+    if account_sync_before is not None:
+        broker.load_positions_from_account_snapshot(account_sync_before)
     cycle = run_trading_cycle(
         TradingCycleConfig(
             symbols=selected_symbols,
@@ -1952,7 +1964,7 @@ def run_testnet_trading_cycle(
         ),
         strategy=TrendParticipationStrategy(),
         risk_manager=FunctionRiskManager(),
-        execution_engine=PaperIntentExecutionEngine(),
+        execution_engine=PositionReconciliationExecutionEngine(),
     )
     if track_order_lifecycle and not dry_run:
         lifecycle_events = []
@@ -1976,7 +1988,7 @@ def run_testnet_trading_cycle(
             "net_pnl": round(sum(float(event.get("fills_summary", {}).get("net_pnl", 0.0)) for event in lifecycle_events), 8),
         }
     if sync_account_state and selected_symbols:
-        account_sync_after = broker.fetch_signed_account_snapshot(selected_symbols[0])
+        account_sync_after = broker.fetch_signed_account_snapshot()
         open_orders = account_sync_after.get("open_orders", []) if isinstance(account_sync_after, dict) else []
         reconciliation = broker.reconcile_open_orders(open_orders if isinstance(open_orders, list) else [])
         cycle["testnet_account_sync"] = {
@@ -2322,7 +2334,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         decision = decide(candles, args.symbol, args.interval, args.risk_unit, market_context)
     except Exception as exc:  # CLI should return structured failure for cron/logging.
-        print(json.dumps({"ok": False, "error": str(exc), **now_stamps()}, ensure_ascii=False, indent=2))
+        print(json.dumps({"ok": False, "error": sanitize_error_message(exc), **now_stamps()}, ensure_ascii=False, indent=2))
         return 1
     print(json.dumps({"ok": True, "decision": decision}, ensure_ascii=False, indent=2))
     return 0

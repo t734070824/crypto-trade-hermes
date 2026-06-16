@@ -21,6 +21,22 @@ spec.loader.exec_module(trend)
 
 
 class BinanceUsdsFuturesTrendTests(unittest.TestCase):
+    def test_cli_top_level_error_redacts_signed_query_and_sensitive_fields(self):
+        def leaky_fetch_klines(*args, **kwargs):
+            raise RuntimeError('boom https://testnet.binancefuture.com/fapi/v2/account?timestamp=1&signature=abc123 X-MBX-APIKEY=my-key secret=my-secret')
+
+        stdout = io.StringIO()
+        with mock.patch.object(trend, "fetch_klines", leaky_fetch_klines), contextlib.redirect_stdout(stdout):
+            rc = trend.main(["--symbol", "BTCUSDT", "--interval", "1h"])
+
+        self.assertEqual(rc, 1)
+        payload = json.loads(stdout.getvalue())
+        encoded = json.dumps(payload)
+        self.assertNotIn("abc123", encoded)
+        self.assertNotIn("my-key", encoded)
+        self.assertNotIn("my-secret", encoded)
+        self.assertIn("<redacted>", encoded)
+
     def test_core_realtime_interface_modules_are_importable(self):
         module_names = [
             "scripts.binance_trend_core",
@@ -145,6 +161,43 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(instruction.side, "BUY")
         self.assertEqual(instruction.quantity, 1.25)
         self.assertTrue(instruction.metadata["paper_intent"])
+
+    def test_position_reconciliation_execution_engine_plans_only_delta(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        intent = types.StrategyIntent(
+            symbol="SOLUSDT",
+            desired_exposure=1.0,
+            action="hold_long",
+            reason="trend",
+            metadata={"signal": {"entry_reference": 75.0}},
+        )
+
+        plan = engine.plan_orders(intent, {"approved": True}, {"positions": {"SOLUSDT": {"size": 0.7}}})
+
+        self.assertEqual(len(plan.instructions), 1)
+        instruction = plan.instructions[0]
+        self.assertEqual(instruction.side, "BUY")
+        self.assertAlmostEqual(instruction.quantity, 0.3)
+        self.assertTrue(instruction.metadata["position_reconciliation"])
+        self.assertEqual(instruction.metadata["current_exposure"], 0.7)
+        self.assertEqual(instruction.metadata["desired_exposure"], 1.0)
+        self.assertEqual(instruction.metadata["reference_price"], 75.0)
+
+    def test_position_reconciliation_execution_engine_skips_when_target_reached(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        intent = types.StrategyIntent(symbol="SOLUSDT", desired_exposure=1.0, action="hold_long", reason="trend")
+
+        plan = engine.plan_orders(intent, {"approved": True}, {"positions": {"SOLUSDT": {"size": 1.0}}})
+
+        self.assertEqual(plan.instructions, [])
+        self.assertTrue(plan.metadata["skipped"])
+        self.assertEqual(plan.metadata["reason"], "target_exposure_already_reached")
 
     def test_testnet_broker_uses_testnet_base_url_only(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
@@ -692,6 +745,12 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
                             }
                         ]
                     }
+                if "/fapi/v2/account" in url:
+                    return {"assets": [{"asset": "USDT", "walletBalance": "1000"}]}
+                if "/fapi/v2/positionRisk" in url:
+                    return [{"symbol": "BTCUSDT", "positionAmt": "0.0"}]
+                if "/fapi/v1/openOrders" in url:
+                    return []
                 if method == "POST" and "/fapi/v1/order" in url:
                     params = dict(item.split("=", 1) for item in url.split("?", 1)[1].split("&"))
                     return {"orderId": 555, "clientOrderId": params["newClientOrderId"], "status": "NEW"}
@@ -726,6 +785,48 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             self.assertIn("client_order_id", rows[0])
             self.assertIn("exchange_rule_adjustments", rows[0])
             self.assertNotIn("signature", json.dumps(rows[0]))
+
+    def test_run_testnet_trading_cycle_uses_remote_position_to_avoid_repeated_full_target_order(self):
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if "/fapi/v1/exchangeInfo" in url:
+                    return {"symbols": [{"symbol": "BTCUSDT", "filters": [{"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"}]}]}
+                if "/fapi/v2/account" in url:
+                    return {"assets": [{"asset": "USDT", "walletBalance": "1000"}]}
+                if "/fapi/v2/positionRisk" in url:
+                    return [{"symbol": "BTCUSDT", "positionAmt": "0.5", "entryPrice": "100.0"}]
+                if "/fapi/v1/openOrders" in url:
+                    return []
+                if method == "POST" and "/fapi/v1/order" in url:
+                    raise AssertionError("should not submit a repeated full target order when remote target is already reached")
+                raise AssertionError(url)
+
+        def fake_fetch_klines(symbol, interval, limit, base_url):
+            return [
+                {"open": 100.0 + idx, "high": 101.0 + idx, "low": 99.0 + idx, "close": 100.5 + idx}
+                for idx in range(240)
+            ]
+
+        client = FakeHttpClient()
+        with mock.patch.dict(os.environ, {"LALA_KEY": "k", "LALA_SECRET": "s"}), mock.patch.object(trend, "fetch_klines", fake_fetch_klines):
+            cycle = trend.run_testnet_trading_cycle(
+                ["BTCUSDT"],
+                interval="1h",
+                limit=240,
+                save_runtime_record=False,
+                dry_run=False,
+                testnet_http_client=client,
+                sync_account_state=True,
+            )
+
+        self.assertEqual(cycle["errors"], [])
+        self.assertFalse(any(call[0] == "POST" and "/fapi/v1/order" in call[1] for call in client.calls))
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["desired_orders"], [])
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["simulated_fills_count"], 0)
 
     def test_run_testnet_trading_cycle_can_attach_signed_account_sync_report(self):
         class FakeHttpClient:
@@ -869,6 +970,12 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
                 self.calls.append((method, url))
                 if "/fapi/v1/exchangeInfo" in url:
                     return {"symbols": [{"symbol": "BTCUSDT", "filters": [{"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"}]}]}
+                if "/fapi/v2/account" in url:
+                    return {"assets": [{"asset": "USDT", "walletBalance": "1000"}]}
+                if "/fapi/v2/positionRisk" in url:
+                    return [{"symbol": "BTCUSDT", "positionAmt": "0.0"}]
+                if "/fapi/v1/openOrders" in url:
+                    return []
                 if method == "POST" and "/fapi/v1/order" in url:
                     params = dict(item.split("=", 1) for item in url.split("?", 1)[1].split("&"))
                     return {"orderId": 42, "clientOrderId": params["newClientOrderId"], "status": "NEW"}

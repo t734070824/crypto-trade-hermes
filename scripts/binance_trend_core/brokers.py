@@ -553,6 +553,46 @@ class BinanceTestnetBroker:
             "missing_unknown_client_ids": missing,
         }
 
+    def load_positions_from_account_snapshot(self, snapshot: Mapping[str, Any] | None) -> dict[str, PortfolioPosition]:
+        """Seed local reconciliation state from signed testnet positionRisk rows."""
+        positions_payload = snapshot.get("positions") if isinstance(snapshot, Mapping) else None
+        loaded: dict[str, PortfolioPosition] = {}
+        rows = positions_payload if isinstance(positions_payload, list) else []
+        for item in rows:
+            if not isinstance(item, Mapping):
+                continue
+            symbol = str(item.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            try:
+                size = float(item.get("positionAmt") or item.get("position_amt") or item.get("size") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if abs(size) < 1e-12:
+                size = 0.0
+            try:
+                entry_price_raw = item.get("entryPrice") or item.get("entry_price")
+                entry_price = float(entry_price_raw) if entry_price_raw not in (None, "") else None
+            except (TypeError, ValueError):
+                entry_price = None
+            try:
+                unrealized_pnl = float(item.get("unRealizedProfit") or item.get("unrealized_pnl") or 0.0)
+            except (TypeError, ValueError):
+                unrealized_pnl = 0.0
+            if size == 0.0:
+                self.positions.pop(symbol, None)
+                continue
+            position = PortfolioPosition(
+                symbol=symbol,
+                size=round(size, 8),
+                entry_price=entry_price,
+                unrealized_pnl=round(unrealized_pnl, 8),
+                metadata={"source": "signed_testnet_positionRisk", "environment": "testnet"},
+            )
+            self.positions[symbol] = position
+            loaded[symbol] = position
+        return loaded
+
     def _build_client_order_id(self, symbol: str) -> str:
         sequence = len(self.fills) + self.submitted_order_count + self.accepted_order_count + 1
         return f"{self.client_order_id_prefix}-{sequence}"

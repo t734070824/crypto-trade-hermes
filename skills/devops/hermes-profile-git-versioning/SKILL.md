@@ -131,6 +131,7 @@ git push
 ```
 
 Cron-specific cleanup before committing `cron/jobs.json`:
+- When the user asks for wall-clock-aligned schedules (e.g. “每小时 01 分钟”, “北京时间每天 00:05”, “整点运行”), use a cron expression (`1 * * * *`, `5 0 * * *`) rather than interval syntax (`every 60m`, `every 1440m`). Interval schedules anchor to creation/last-run time and drift away from natural clock boundaries. After updating, verify `next_run_at` includes the expected timezone/offset before committing.
 - `cronjob create/update/run/list` may rewrite scheduler runtime fields (`repeat.completed`, `next_run_at`, `last_run_at`, `last_status`, root `updated_at`) while you are working. Treat unrelated changes to pre-existing jobs as runtime noise; normalize or revert them before staging unless the user explicitly asked to preserve the new runtime state.
 - For newly-created jobs, commit the intended durable config: `id`, `name`, `prompt`, `skills`, schedule, `no_agent`, `deliver`, toolsets, script/workdir/profile. Reset first-run runtime state (`repeat.completed: 0`, `last_run_at: null`, `last_status: null`, `last_error: null`, `last_delivery_error: null`) if you triggered the job only for verification.
 - Avoid committing newly-added explicit destination metadata (`origin.chat_id`, `chat_name`, thread IDs) unless the repo already tracks that exact metadata or the user explicitly wants delivery routing persisted. Prefer generic `deliver: "telegram"`/`origin` behavior when sufficient.
