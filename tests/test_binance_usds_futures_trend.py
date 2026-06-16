@@ -773,6 +773,137 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(cycle["runtime_record"]["execution_events"]["testnet_account_sync"]["after_open_orders_count"], 1)
         self.assertNotIn("signature=", json.dumps(sync))
 
+    def test_testnet_broker_tracks_filled_order_lifecycle_with_trade_pnl_and_slippage(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if "/fapi/v1/order" in url:
+                    self.assert_not_used = None
+                    return {
+                        "symbol": "BTCUSDT",
+                        "orderId": 42,
+                        "clientOrderId": "cid-filled",
+                        "side": "BUY",
+                        "status": "FILLED",
+                        "executedQty": "0.020",
+                        "avgPrice": "101.00",
+                    }
+                if "/fapi/v1/userTrades" in url:
+                    return [
+                        {"symbol": "BTCUSDT", "orderId": 42, "side": "BUY", "price": "101.00", "qty": "0.010", "realizedPnl": "1.50", "commission": "0.0404"},
+                        {"symbol": "BTCUSDT", "orderId": 42, "side": "BUY", "price": "101.00", "qty": "0.010", "realizedPnl": "1.50", "commission": "0.0404"},
+                    ]
+                raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = pathlib.Path(tmpdir) / "orders.jsonl"
+            client = FakeHttpClient()
+            broker = brokers.BinanceTestnetBroker(
+                credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+                dry_run=False,
+                http_client=client,
+                order_journal_path=str(journal_path),
+            )
+
+            lifecycle = broker.track_order_lifecycle("BTCUSDT", "cid-filled", reference_price=100.0)
+
+            self.assertEqual(lifecycle["environment"], "testnet")
+            self.assertEqual(lifecycle["client_order_id"], "cid-filled")
+            self.assertEqual(lifecycle["order_id"], 42)
+            self.assertEqual(lifecycle["current_status"], "FILLED")
+            self.assertEqual(lifecycle["lifecycle_state"], "filled")
+            self.assertEqual(lifecycle["fills_summary"]["fill_quantity"], 0.02)
+            self.assertEqual(lifecycle["fills_summary"]["average_fill_price"], 101.0)
+            self.assertEqual(lifecycle["fills_summary"]["realized_pnl"], 3.0)
+            self.assertEqual(lifecycle["fills_summary"]["fees"], 0.0808)
+            self.assertEqual(lifecycle["fills_summary"]["net_pnl"], 2.9192)
+            self.assertEqual(lifecycle["fills_summary"]["slippage_abs"], 1.0)
+            self.assertEqual(lifecycle["fills_summary"]["slippage_bps"], 100.0)
+            self.assertTrue(any("/fapi/v1/order" in call[1] and "origClientOrderId=cid-filled" in call[1] for call in client.calls))
+            self.assertTrue(any("/fapi/v1/userTrades" in call[1] and "orderId=42" in call[1] for call in client.calls))
+            rows = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(rows[0]["event_type"], "order_lifecycle")
+            self.assertNotIn("signature", json.dumps(rows[0]))
+
+    def test_testnet_order_lifecycle_slippage_is_side_aware_for_sell_orders(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+
+        class FakeHttpClient:
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                if "/fapi/v1/order" in url:
+                    return {
+                        "symbol": "BTCUSDT",
+                        "orderId": 43,
+                        "clientOrderId": "cid-sell",
+                        "side": "SELL",
+                        "status": "FILLED",
+                        "avgPrice": "99.00",
+                    }
+                if "/fapi/v1/userTrades" in url:
+                    return [{"symbol": "BTCUSDT", "orderId": 43, "side": "SELL", "price": "99.00", "qty": "0.010", "realizedPnl": "0.50", "commission": "0.01"}]
+                raise AssertionError(url)
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            http_client=FakeHttpClient(),
+        )
+
+        lifecycle = broker.track_order_lifecycle("BTCUSDT", "cid-sell", reference_price=100.0)
+
+        self.assertEqual(lifecycle["fills_summary"]["average_fill_price"], 99.0)
+        self.assertEqual(lifecycle["fills_summary"]["slippage_abs"], 1.0)
+        self.assertEqual(lifecycle["fills_summary"]["slippage_bps"], 100.0)
+
+    def test_run_testnet_trading_cycle_tracks_signed_order_lifecycle_when_enabled(self):
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if "/fapi/v1/exchangeInfo" in url:
+                    return {"symbols": [{"symbol": "BTCUSDT", "filters": [{"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"}]}]}
+                if method == "POST" and "/fapi/v1/order" in url:
+                    params = dict(item.split("=", 1) for item in url.split("?", 1)[1].split("&"))
+                    return {"orderId": 42, "clientOrderId": params["newClientOrderId"], "status": "NEW"}
+                if method == "GET" and "/fapi/v1/order" in url:
+                    return {"symbol": "BTCUSDT", "orderId": 42, "clientOrderId": "hermes-1", "side": "BUY", "status": "FILLED", "avgPrice": "101.00"}
+                if "/fapi/v1/userTrades" in url:
+                    return [{"symbol": "BTCUSDT", "orderId": 42, "price": "101.00", "qty": "1.0", "realizedPnl": "2.0", "commission": "0.1"}]
+                raise AssertionError(url)
+
+        def fake_fetch_klines(symbol, interval, limit, base_url):
+            return [
+                {"open": 100.0 + idx, "high": 101.0 + idx, "low": 99.0 + idx, "close": 100.5 + idx}
+                for idx in range(240)
+            ]
+
+        client = FakeHttpClient()
+        with mock.patch.dict(os.environ, {"LALA_KEY": "k", "LALA_SECRET": "s"}), mock.patch.object(trend, "fetch_klines", fake_fetch_klines):
+            cycle = trend.run_testnet_trading_cycle(
+                ["BTCUSDT"],
+                interval="1h",
+                limit=240,
+                save_runtime_record=False,
+                dry_run=False,
+                testnet_http_client=client,
+                track_order_lifecycle=True,
+            )
+
+        self.assertEqual(cycle["errors"], [])
+        self.assertEqual(len(cycle["testnet_order_lifecycle"]), 1)
+        lifecycle = cycle["testnet_order_lifecycle"][0]
+        self.assertEqual(lifecycle["current_status"], "FILLED")
+        self.assertEqual(lifecycle["fills_summary"]["net_pnl"], 1.9)
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["testnet_order_lifecycle"]["tracked_order_count"], 1)
+        self.assertTrue(any("/fapi/v1/userTrades" in call[1] for call in client.calls))
+
     def test_cli_loads_testnet_risk_config_file_and_emits_sanitized_summary(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = pathlib.Path(tmpdir) / "risk.json"

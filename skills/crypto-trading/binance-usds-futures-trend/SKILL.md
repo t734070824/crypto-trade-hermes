@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when developing or operating the crypto-trade-hermes Binance USDS-M futures trend Skill. Current code provides paper-only signal, lifecycle, backtest, and diagnostic tools from free >=1h data; future work must evolve it into a real-time trading engine where paper/testnet/live share strategy, state, risk, and execution interfaces.
-version: 1.8.0
+version: 1.9.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -24,7 +24,7 @@ The intended architecture is **Skill-driven real-time trading**:
 - only the broker/fill adapter and environment configuration should change;
 - paper mode is a safety/testing adapter, not a separate report-style scanner product.
 
-Current implementation status: the CLI now supports paper diagnostics/shared paper cycles, runtime-evidence replay, and a v1.8-hardened Binance USDS-M futures **testnet** adapter. v1.5 adds the first shared trading loop wired to `PaperBroker` simulated fills, v1.6 adds runtime-evidence replay diagnostics for strategy evolution, v1.7 adds `BinanceTestnetBroker` with dry-run default/testnet endpoint guard/credential resolver/risk gates/redaction/CLI `--run-testnet-cycle`, and v1.8 adds exchangeInfo rule adaptation, clientOrderId + append-only order journal, unknown-order confirmation, config-driven risk limits, optional signed account sync, and hourly local dry-run evidence collection. It does **not** implement live/mainnet execution. Treat existing scan/lifecycle/runtime-recording code as reusable signal, state, and evidence modules while the project is refactored toward a shared real-time trading engine.
+Current implementation status: the CLI now supports paper diagnostics/shared paper cycles, runtime-evidence replay, and a v1.9-hardened Binance USDS-M futures **testnet** adapter. v1.5 adds the first shared trading loop wired to `PaperBroker` simulated fills, v1.6 adds runtime-evidence replay diagnostics for strategy evolution, v1.7 adds `BinanceTestnetBroker` with dry-run default/testnet endpoint guard/credential resolver/risk gates/redaction/CLI `--run-testnet-cycle`, v1.8 adds exchangeInfo rule adaptation, clientOrderId + append-only order journal, unknown-order confirmation, config-driven risk limits, optional signed account sync, and hourly local dry-run evidence collection, and v1.9 adds signed order lifecycle polling plus trade/PnL/slippage accounting. It does **not** implement live/mainnet execution. Treat existing scan/lifecycle/runtime-recording code as reusable signal, state, and evidence modules while the project is refactored toward a shared real-time trading engine.
 
 ## User Constraints
 
@@ -94,7 +94,7 @@ Current paper/testnet capabilities:
 - lightweight core realtime interface package under `scripts/binance_trend_core/`;
 - v1.5 shared paper trading loop via `scripts.binance_trend_core.loop.run_trading_cycle` and `PaperBroker` simulated fills;
 - v1.6 runtime evidence replay via `scripts.binance_trend_core.evolution` and CLI `--replay-runtime-evidence`;
-- v1.8-hardened Binance futures testnet adapter via `BinanceTestnetBroker` and CLI `--run-testnet-cycle`: dry-run default, explicit signed-testnet flag, exchangeInfo order rules, account/order sync helpers, clientOrderId/order journal, risk config, and redaction;
+- v1.9-hardened Binance futures testnet adapter via `BinanceTestnetBroker` and CLI `--run-testnet-cycle`: dry-run default, explicit signed-testnet flag, exchangeInfo order rules, account/order sync helpers, clientOrderId/order journal, signed order lifecycle polling, trade/PnL/slippage accounting, risk config, and redaction;
 - single-symbol trend decision from free K-lines;
 - full-universe or selected-symbol scan;
 - multi-timeframe confirmation, usually `1h,4h,1d`;
@@ -153,7 +153,7 @@ Shared testnet trading cycle dry-run (builds testnet events, signs nothing, subm
 scripts/binance_usds_futures_trend.py --run-testnet-cycle --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --runtime-record-file state/binance-usds-futures-trend-testnet-runtime.jsonl --no-save-runtime-record --testnet-dry-run
 ```
 
-Signed testnet submission exists only behind explicit `--testnet-submit-signed`; do not run it unless the user specifically asks for real Binance futures testnet orders in the current turn and risk limits are set.
+Signed testnet submission exists only behind explicit `--testnet-submit-signed`; do not run it unless the user specifically asks for real Binance futures testnet orders in the current turn and risk limits are set. When signed testnet is explicitly authorized, add `--testnet-track-order-lifecycle` only if the user also wants order/userTrades polling for lifecycle, PnL, fee, and slippage evidence.
 
 Historical paper backtest:
 
@@ -172,6 +172,12 @@ Runtime-evidence strategy evolution replay:
 ```bash
 scripts/binance_usds_futures_trend.py --replay-runtime-evidence --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl
 ```
+
+Operational cron pattern:
+
+- Use `no_agent=true` only for deterministic collectors/watchdogs whose script is the whole job, such as hourly testnet dry-run evidence capture. Empty `skills: []` is expected in this mode because no LLM reasoning runs.
+- Use a separate agent cron (`no_agent=false`) with this Skill loaded for periodic analysis/evolution reports over the collected JSONL evidence, e.g. 24h/72h signal stability, risk rejections, error rate, and readiness for signed testnet.
+- Do not conflate the collector with the evaluator: the hourly collector should stay boring and reproducible; the analyzer can reason over evidence and produce recommendations.
 
 Telegram diagnostic brief wrapper:
 
@@ -221,7 +227,7 @@ Current outputs are diagnostic contracts for paper mode:
 - `paper_lifecycle` / `lifecycle_change`: paper lifecycle state and intent changes;
 - `runtime_record`: append-only paper runtime evidence schema for future strategy evolution;
 - `paper_cycle`: v1.5 shared loop output containing signals, intents, desired orders, simulated fills, portfolio state, and runtime evidence;
-- `testnet_cycle`: v1.8 shared loop output using `BinanceTestnetBroker`; dry-run by default with testnet environment markers, exchangeInfo/risk-rule evidence, optional signed account sync, and redacted request evidence;
+- `testnet_cycle`: v1.9 shared loop output using `BinanceTestnetBroker`; dry-run by default with testnet environment markers, exchangeInfo/risk-rule evidence, optional signed account sync, optional signed order lifecycle/trade/PnL/slippage evidence, and redacted request evidence;
 - `runtime_evolution`: v1.6 replay report comparing strategy variants on identical recorded runtime evidence, with no default promotion;
 - `backtest`: paper historical performance diagnostics;
 - `refinement`: paper-only baseline/candidate comparison;
@@ -267,7 +273,7 @@ Current priority is documentation and architecture alignment, then implementatio
 4. Design the runtime data schema before implementing the first trading loop, including signals, decisions, risk checks, fills, state transitions, errors, and performance snapshots.
 5. Use `PaperBroker` and the shared `run_trading_cycle` loop to run simulated fills while recording runtime evidence.
 6. Use `StrategyEvolution` / `--replay-runtime-evidence` to compare candidate variants on recorded runtime evidence before promotion.
-7. Add Binance futures testnet adapter using signed endpoints and isolated testnet credentials/config. ✅ v1.7 implemented with dry-run default and explicit signed-testnet flag; v1.8 hardened exchangeInfo rules, order journal, unknown-order confirmation, risk config, optional account sync, and hourly local dry-run evidence collection.
+7. Add Binance futures testnet adapter using signed endpoints and isolated testnet credentials/config. ✅ v1.7 implemented with dry-run default and explicit signed-testnet flag; v1.8 hardened exchangeInfo rules, order journal, unknown-order confirmation, risk config, optional account sync, and hourly local dry-run evidence collection; v1.9 adds explicit signed order lifecycle polling and trade/PnL/slippage accounting.
 8. Add live adapter only after testnet validation, explicit risk caps, kill switch, audit logs, runtime evidence review, and user approval.
 9. Keep Telegram output as observability around the real trading loop, not as the source of trading state.
 10. Use recorded runtime data to evaluate and evolve future strategy variants before promotion.
@@ -350,6 +356,8 @@ Confirm:
 21. **Fail-open reference prices.** Testnet broker must not default missing `reference_price` / `entry_reference` to `1.0`; reject invalid/missing/non-finite prices before signing unless a global kill/order-count/loss gate already rejects.
 22. **Treating risk-limit config as inherently safe.** Validate testnet risk-limit values as finite, positive numbers where applicable; a NaN/inf/negative max notional, exposure cap, daily-loss cap, or order-count limit can silently weaken fail-closed behavior.
 23. **Fail-open exchange/order numbers.** Testnet broker must reject non-finite quantities and any exchangeInfo-adapted quantity/reference price that becomes invalid before signing; never allow `nan`, zero, or negative order parameters into signed POST URLs.
+24. **Conflating evidence collection with strategy evaluation.** A `no_agent=true` cron with `skills: []` is appropriate for deterministic runtime evidence collection, but it will not analyze whether the strategy is improving. Pair it with a separate agent-mode analyzer cron using this Skill when the user asks for 24h/72h evidence interpretation or promotion decisions.
+25. **Treating order acknowledgement as a fill.** Signed testnet submit success only proves Binance acknowledged an order. Use `track_order_lifecycle` / `--testnet-track-order-lifecycle` to query `/fapi/v1/order` and `/fapi/v1/userTrades`, then compute lifecycle state, fills, fees, realized/net PnL, and slippage from exchange-confirmed data.
 
 ## References
 
@@ -384,7 +392,8 @@ Tracked plans:
 - `plans/binance-usds-futures-trend-v1.5.md` — shared trading loop and PaperBroker plan;
 - `plans/binance-usds-futures-trend-v1.6.md` — strategy evolution from runtime evidence plan;
 - `plans/binance-usds-futures-trend-v1.7.md` — Binance futures testnet adapter plan;
-- `plans/binance-usds-futures-trend-v1.8.md` — testnet readiness hardening plan: exchangeInfo, order journal, risk config, sync, dry-run evidence.
+- `plans/binance-usds-futures-trend-v1.8.md` — testnet readiness hardening plan: exchangeInfo, order journal, risk config, sync, dry-run evidence;
+- `plans/binance-usds-futures-trend-v1.9.md` — signed testnet order lifecycle tracking plan: order/userTrades polling plus PnL, fee, and slippage evidence.
 
 ## Verification Checklist
 

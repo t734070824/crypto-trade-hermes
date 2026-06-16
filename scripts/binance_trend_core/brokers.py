@@ -569,6 +569,57 @@ class BinanceTestnetBroker:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
+    def track_order_lifecycle(self, symbol: str, client_order_id: str, reference_price: float | None = None) -> dict[str, Any]:
+        order_payload = self._signed_get("/fapi/v1/order", {"symbol": symbol.upper(), "origClientOrderId": client_order_id})
+        order_id = order_payload.get("orderId")
+        current_status = str(order_payload.get("status", "UNKNOWN")).upper()
+        trades_payload = self._signed_get("/fapi/v1/userTrades", {"symbol": symbol.upper(), "orderId": order_id}) if order_id is not None else []
+        trades = trades_payload if isinstance(trades_payload, list) else []
+        fill_quantity = sum(float(trade.get("qty", 0.0)) for trade in trades)
+        average_fill_price = _weighted_average([(float(trade.get("qty", 0.0)), float(trade.get("price", 0.0))) for trade in trades]) if trades else float(order_payload.get("avgPrice") or 0.0)
+        realized_pnl = sum(float(trade.get("realizedPnl", 0.0)) for trade in trades)
+        fees = sum(float(trade.get("commission", 0.0)) for trade in trades)
+        net_pnl = realized_pnl - fees
+        reference = float(reference_price or order_payload.get("price") or order_payload.get("avgPrice") or 0.0)
+        side = str(order_payload.get("side") or (trades[0].get("side") if trades else "BUY")).upper()
+        if side == "SELL":
+            slippage_abs = reference - average_fill_price if reference else 0.0
+        else:
+            slippage_abs = average_fill_price - reference if reference else 0.0
+        slippage_bps = (slippage_abs / reference * 10_000.0) if reference else 0.0
+        lifecycle_state = {
+            "NEW": "acknowledged",
+            "PARTIALLY_FILLED": "partially_filled",
+            "FILLED": "filled",
+            "CANCELED": "canceled",
+            "REJECTED": "rejected",
+            "EXPIRED": "expired",
+        }.get(current_status, "unknown")
+        event = {
+            "event_type": "order_lifecycle",
+            "environment": self.environment,
+            **_now_stamps(),
+            "symbol": symbol.upper(),
+            "client_order_id": client_order_id,
+            "order_id": order_id,
+            "current_status": current_status,
+            "lifecycle_state": lifecycle_state,
+            "fills_summary": {
+                "fill_quantity": round(fill_quantity, 8),
+                "average_fill_price": round(average_fill_price, 8),
+                "realized_pnl": round(realized_pnl, 8),
+                "fees": round(fees, 8),
+                "net_pnl": round(net_pnl, 8),
+                "slippage_abs": round(slippage_abs, 8),
+                "slippage_bps": round(slippage_bps, 8),
+                "trade_count": len(trades),
+            },
+            "order": redact_sensitive_testnet_fields(order_payload),
+            "trades": redact_sensitive_testnet_fields(trades),
+        }
+        self._append_order_journal(event)
+        return event
+
     def _confirm_order_by_client_order_id(self, symbol: str, client_order_id: str) -> Any:
         return self._signed_get("/fapi/v1/order", {"symbol": symbol.upper(), "origClientOrderId": client_order_id})
 
@@ -658,6 +709,12 @@ class BinanceTestnetBroker:
             "notional": round(notional, 8),
             "instruction": redact_sensitive_testnet_fields(_instruction_record(order)),
         }
+
+
+def _weighted_average(pairs: list[tuple[float, float]]) -> float:
+    numerator = sum(quantity * price for quantity, price in pairs)
+    denominator = sum(quantity for quantity, _ in pairs)
+    return numerator / denominator if denominator else 0.0
 
 
 def _coerce_instruction(instruction: OrderInstruction | dict[str, Any]) -> OrderInstruction:

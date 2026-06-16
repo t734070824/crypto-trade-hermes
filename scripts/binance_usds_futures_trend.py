@@ -1880,6 +1880,7 @@ def run_testnet_trading_cycle(
     order_journal_path: str | os.PathLike[str] | None = None,
     refresh_exchange_rules: bool = True,
     sync_account_state: bool = False,
+    track_order_lifecycle: bool = False,
 ) -> dict[str, Any]:
     """Run one shared trading cycle with Binance USDS-M futures testnet adapter.
 
@@ -1953,6 +1954,27 @@ def run_testnet_trading_cycle(
         risk_manager=FunctionRiskManager(),
         execution_engine=PaperIntentExecutionEngine(),
     )
+    if track_order_lifecycle and not dry_run:
+        lifecycle_events = []
+        for fill in cycle.get("fills", []):
+            client_order_id = fill.get("client_order_id") if isinstance(fill, dict) else None
+            symbol = fill.get("symbol") if isinstance(fill, dict) else None
+            status = fill.get("status") if isinstance(fill, dict) else None
+            if not client_order_id or not symbol or status not in {"submitted", "submitted_confirmed", "submitted_unknown"}:
+                continue
+            lifecycle_events.append(
+                broker.track_order_lifecycle(
+                    str(symbol),
+                    str(client_order_id),
+                    reference_price=float(fill.get("reference_price") or 0.0),
+                )
+            )
+        cycle["testnet_order_lifecycle"] = lifecycle_events
+        cycle["runtime_record"].setdefault("execution_events", {})["testnet_order_lifecycle"] = {
+            "tracked_order_count": len(lifecycle_events),
+            "filled_order_count": sum(1 for event in lifecycle_events if event.get("lifecycle_state") == "filled"),
+            "net_pnl": round(sum(float(event.get("fills_summary", {}).get("net_pnl", 0.0)) for event in lifecycle_events), 8),
+        }
     if sync_account_state and selected_symbols:
         account_sync_after = broker.fetch_signed_account_snapshot(selected_symbols[0])
         open_orders = account_sync_after.get("open_orders", []) if isinstance(account_sync_after, dict) else []
@@ -2064,6 +2086,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--testnet-risk-config-file", help="Optional JSON testnet risk config; supports max_* limits and kill_switch")
     parser.add_argument("--testnet-order-journal-file", help="Append-only JSONL order journal for signed testnet submissions")
     parser.add_argument("--testnet-sync-account-state", action="store_true", help="Fetch signed testnet account/position/open-order snapshots before and after the cycle")
+    parser.add_argument("--testnet-track-order-lifecycle", action="store_true", help="After signed testnet submission, poll order/userTrades and attach lifecycle, PnL, fee, and slippage evidence")
     parser.add_argument("--strategy-version", default="ema50_ema200_atr_trend_paper", help="Strategy version label stored in v1.3 runtime evidence")
     parser.add_argument("--config-version", default="default", help="Config version label stored in v1.3 runtime evidence")
     parser.add_argument("--no-save-runtime-record", action="store_true", help="Build runtime evidence without appending --runtime-record-file")
@@ -2242,6 +2265,7 @@ def main(argv: list[str] | None = None) -> int:
                 kill_switch=risk_limits.kill_switch,
                 order_journal_path=args.testnet_order_journal_file,
                 sync_account_state=args.testnet_sync_account_state,
+                track_order_lifecycle=args.testnet_track_order_lifecycle,
             )
             print(json.dumps({"ok": not bool(cycle["errors"]), "testnet_risk_limits": risk_limits.sanitized_summary(), "testnet_cycle": cycle}, ensure_ascii=False, indent=2))
             return 0 if not cycle["errors"] else 1
