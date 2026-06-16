@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when developing or operating the crypto-trade-hermes Binance USDS-M futures trend Skill. Current code provides paper-only signal, lifecycle, backtest, and diagnostic tools from free >=1h data; future work must evolve it into a real-time trading engine where paper/testnet/live share strategy, state, risk, and execution interfaces.
-version: 1.9.0
+version: 1.10.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -332,32 +332,37 @@ Confirm:
 
 ## Common Pitfalls
 
-1. **Building a paper scanner instead of a trading engine.** Paper is an execution adapter for the future trading loop, not the architecture itself.
-2. **Confusing safety with divergence.** Safety should come from adapter isolation, testnet-first validation, kill switches, strict risk caps, and explicit live gates — not from building a paper-only system that cannot become live.
-3. **Using short intervals.** The user rejects intervals below `1h`; enforce this in CLI, code, tests, docs, and cron schedules.
-4. **Over-exiting trends.** The strategy preference is to keep participating in the main trend and harvest in tranches; extension should usually reduce size, not force a full exit while the major trend remains valid.
-5. **Committing runtime state.** Real state files belong under ignored `state/*.json`; do not commit account/order/fill state or local cron output.
-6. **Leaking secrets.** Mention variable names only when needed; never expose values from `.env` or signed request payloads.
-7. **Overstating diagnostics.** Paper scans, backtests, and refinement comparisons are evidence and diagnostics, not live performance proof.
-8. **Letting Telegram briefs become the state machine.** Telegram output is observability; canonical state belongs in `PortfolioState` / lifecycle files / future execution logs.
-9. **Comparing strategy variants on drifting live samples.** Fetch each symbol sample once and reuse it across baseline/candidates so differences are strategy-driven.
-10. **Treating `PaperBroker` fills as live execution.** v1.5 fills are simulated; they prove loop plumbing and runtime evidence only.
-11. **Skipping independent review before push.** This repo requires an independent agent review before every push.
-12. **Forgetting timezone labels.** Any time-related output or report must explicitly label UTC or 北京时间（UTC+8）.
-13. **Mixing environments.** Future paper, testnet, and live adapters must isolate credentials, balances, order IDs, fills, and state files while sharing core interfaces.
-14. **Failing to preserve runtime evidence.** Strategy evolution must be based on recorded run data, not subjective impressions from Telegram summaries or isolated backtests.
+1. **Defaulting to split cron workflows when an agent loop should own the process.** If the user asks why one agent-type scheduled task cannot handle the whole testnet workflow, treat that as a design correction: prefer a single agent cron with this Skill loaded when the job needs to gather evidence, inspect state, reconcile positions/orders, decide whether signed testnet is safe, run the cycle, interpret failures, and report next actions. Use separate `no_agent=true` collectors only when deterministic evidence capture must be isolated from LLM reasoning; otherwise avoid over-fragmenting the operational loop into collector/analyzer/promoter jobs.
+2. **Trying signed testnet before credential validation and position reconciliation.** Before enabling recurring signed testnet operation, run a small explicit signed probe/cycle, verify Binance Futures Testnet credentials against signed endpoints, sync remote positions/account state, and confirm actual order/fill lifecycle evidence. A dry-run success plus locally present `LALA_KEY`/`LALA_SECRET` is not sufficient to enable signed cron.
+3. **Committing scheduler runtime noise.** Hermes cron may rewrite fields such as `completed`, `next_run_at`, `last_run_at`, and `updated_at` in `cron/jobs.json` while you are working. Treat those as runtime noise unless the task intentionally changes cron definitions; restore/exclude them before review, commit, and push.
+4. **Building a paper scanner instead of a trading engine.** Paper is an execution adapter for the future trading loop, not the architecture itself.
+5. **Confusing safety with divergence.** Safety should come from adapter isolation, testnet-first validation, kill switches, strict risk caps, and explicit live gates — not from building a paper-only system that cannot become live.
+6. **Using short intervals.** The user rejects intervals below `1h`; enforce this in CLI, code, tests, docs, and cron schedules.
+7. **Over-exiting trends.** The strategy preference is to keep participating in the main trend and harvest in tranches; extension should usually reduce size, not force a full exit while the major trend remains valid.
+8. **Committing runtime state.** Real state files belong under ignored `state/*.json`; do not commit account/order/fill state or local cron output.
+9. **Leaking secrets.** Mention variable names only when needed; never expose values from `.env` or signed request payloads.
+10. **Overstating diagnostics.** Paper scans, backtests, and refinement comparisons are evidence and diagnostics, not live performance proof.
+11. **Letting Telegram briefs become the state machine.** Telegram output is observability; canonical state belongs in `PortfolioState` / lifecycle files / future execution logs.
+12. **Comparing strategy variants on drifting live samples.** Fetch each symbol sample once and reuse it across baseline/candidates so differences are strategy-driven.
+13. **Treating `PaperBroker` fills as live execution.** v1.5 fills are simulated; they prove loop plumbing and runtime evidence only.
+14. **Skipping independent review before push.** This repo requires an independent agent review before every push.
+15. **Forgetting timezone labels.** Any time-related output or report must explicitly label UTC or 北京时间（UTC+8）.
+16. **Mixing environments.** Future paper, testnet, and live adapters must isolate credentials, balances, order IDs, fills, and state files while sharing core interfaces.
+17. **Failing to preserve runtime evidence.** Strategy evolution must be based on recorded run data, not subjective impressions from Telegram summaries or isolated backtests.
    - For runtime-evidence replay interval safety, validate every interval-bearing field, not only the top-level `intervals`: include `market_inputs.primary_interval`, `market_inputs.intervals`, and `signals[].interval`. When review finds an uncovered interval location, add a RED regression test for that exact location before patching.
-15. **Replaying with fresh samples.** v1.6 runtime-evidence replay must not fetch new K-lines; all variants must share the same captured input fingerprint.
-16. **Treating v1.7 selection as signed-execution authorization.** If the user chooses “1.7” after being offered planning-only v1.7 work, do planning only. Do not implement signed testnet execution code until the user explicitly authorizes writing a testnet signed adapter; live/mainnet remains unauthorized.
-17. **Confusing testnet adapter with live permission.** v1.7 testnet code may exist, but live/mainnet signed execution remains unimplemented and unauthorized.
-18. **Running signed testnet unintentionally.** `--run-testnet-cycle` defaults to dry-run. Only use `--testnet-submit-signed` after an explicit current-turn user request and after checking risk limits, kill switch, endpoint host, and secret redaction.
-19. **Weak endpoint validation.** Testnet URL checks must parse the hostname exactly as `testnet.binancefuture.com`; substring checks can be bypassed by lookalike hosts.
-20. **Signed-path exception leaks.** If signed testnet HTTP raises, never store `str(exc)` because lower layers may include signed URLs, signatures, or headers. Record sanitized `submitted_unknown` metadata instead.
-21. **Fail-open reference prices.** Testnet broker must not default missing `reference_price` / `entry_reference` to `1.0`; reject invalid/missing/non-finite prices before signing unless a global kill/order-count/loss gate already rejects.
-22. **Treating risk-limit config as inherently safe.** Validate testnet risk-limit values as finite, positive numbers where applicable; a NaN/inf/negative max notional, exposure cap, daily-loss cap, or order-count limit can silently weaken fail-closed behavior.
-23. **Fail-open exchange/order numbers.** Testnet broker must reject non-finite quantities and any exchangeInfo-adapted quantity/reference price that becomes invalid before signing; never allow `nan`, zero, or negative order parameters into signed POST URLs.
-24. **Conflating evidence collection with strategy evaluation.** A `no_agent=true` cron with `skills: []` is appropriate for deterministic runtime evidence collection, but it will not analyze whether the strategy is improving. Pair it with a separate agent-mode analyzer cron using this Skill when the user asks for 24h/72h evidence interpretation or promotion decisions.
-25. **Treating order acknowledgement as a fill.** Signed testnet submit success only proves Binance acknowledged an order. Use `track_order_lifecycle` / `--testnet-track-order-lifecycle` to query `/fapi/v1/order` and `/fapi/v1/userTrades`, then compute lifecycle state, fills, fees, realized/net PnL, and slippage from exchange-confirmed data.
+18. **Replaying with fresh samples.** v1.6 runtime-evidence replay must not fetch new K-lines; all variants must share the same captured input fingerprint.
+19. **Treating v1.7 selection as signed-execution authorization.** If the user chooses “1.7” after being offered planning-only v1.7 work, do planning only. Do not implement signed testnet execution code until the user explicitly authorizes writing a testnet signed adapter; live/mainnet remains unauthorized.
+20. **Confusing testnet adapter with live permission.** v1.7 testnet code may exist, but live/mainnet signed execution remains unimplemented and unauthorized.
+21. **Running signed testnet unintentionally.** `--run-testnet-cycle` defaults to dry-run. Only use `--testnet-submit-signed` after an explicit current-turn user request and after checking risk limits, kill switch, endpoint host, and secret redaction.
+22. **Weak endpoint validation.** Testnet URL checks must parse the hostname exactly as `testnet.binancefuture.com`; substring checks can be bypassed by lookalike hosts.
+23. **Signed-path exception leaks.** If signed testnet HTTP raises, never store `str(exc)` because lower layers may include signed URLs, signatures, or headers. Record sanitized `submitted_unknown` metadata instead.
+24. **Fail-open reference prices.** Testnet broker must not default missing `reference_price` / `entry_reference` to `1.0`; reject invalid/missing/non-finite prices before signing unless a global kill/order-count/loss gate already rejects.
+25. **Treating risk-limit config as inherently safe.** Validate testnet risk-limit values as finite, positive numbers where applicable; a NaN/inf/negative max notional, exposure cap, daily-loss cap, or order-count limit can silently weaken fail-closed behavior.
+26. **Fail-open exchange/order numbers.** Testnet broker must reject non-finite quantities and any exchangeInfo-adapted quantity/reference price that becomes invalid before signing; never allow `nan`, zero, or negative order parameters into signed POST URLs.
+27. **Conflating evidence collection with strategy evaluation.** A `no_agent=true` cron with `skills: []` is appropriate for deterministic runtime evidence collection, but it will not analyze whether the strategy is improving. Pair it with a separate agent-mode analyzer cron using this Skill when the user asks for 24h/72h evidence interpretation or promotion decisions.
+28. **Treating order acknowledgement as a fill.** Signed testnet submit success only proves Binance acknowledged an order. Use `track_order_lifecycle` / `--testnet-track-order-lifecycle` to query `/fapi/v1/order` and `/fapi/v1/userTrades`, then compute lifecycle state, fills, fees, realized/net PnL, and slippage from exchange-confirmed data.
+29. **Mistaking reconciliation no-ops for failed operation.** In the startup single-agent signed testnet cron, a successful cycle with `desired_orders=[]` and `real_orders_submitted=false` can be correct when signed preflight/account sync shows an existing BTCUSDT position already equals `desired_exposure` (currently `risk_unit=0.001`). Report it as duplicate-add prevention via position reconciliation, then verify with a post-cycle signed snapshot.
+30. **Pasting raw cycle JSON into Telegram reports.** For signed testnet cron output, parse JSON and summarize only safe fields: success, testnet-only environment, real-order-submitted flag, order/lifecycle counts, non-zero positions, open-order count, runtime record path, risk limits, and UTC/北京时间（UTC+8） timestamps. Never paste full raw JSON or signed request details.
 
 ## References
 
@@ -382,6 +387,8 @@ Historical workflow notes are intentionally kept out of the main operational pat
 - `references/session-v1.6-runtime-evidence-strategy-evolution.md` — implementation and verification workflow for replaying runtime evidence to compare strategy variants.
 - `references/session-v1.7-planning-authorization.md` — planning-only boundary and explicit authorization requirement before writing signed testnet adapter code.
 - `references/session-v1.7-testnet-adapter.md` — implementation workflow for the Binance futures testnet adapter, dry-run default, endpoint guard, and risk gates.
+- `references/session-v1.10-agent-cron-testnet-operations.md` — preference and workflow notes for a single agent-type cron owning testnet operational reasoning, plus signed-testnet gating and cron runtime-noise hygiene.
+- `references/session-v1.11-agent-testnet-cron-preflight-and-summary.md` — signed testnet cron runbook detail: read-only account preflight, post-cycle snapshot verification, position-reconciliation interpretation, and safe Chinese summary fields.
 
 Tracked plans:
 
