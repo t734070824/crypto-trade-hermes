@@ -153,30 +153,37 @@ def _protective_orders(
     take_profit_1 = _positive_signal_price(signal.get("take_profit_1"))
     take_profit_2 = _positive_signal_price(signal.get("take_profit_2"))
     orders: list[OrderInstruction] = []
-    existing_stop = _find_open_protection(portfolio_state, symbol, "stop_loss", target_exposure=target_exposure)
+    existing_stops = _open_protections(portfolio_state, symbol, "stop_loss", target_exposure=target_exposure)
+    existing_stop = _tightest_long_stop(existing_stops)
+    for stale_stop in existing_stops:
+        if stale_stop is not existing_stop:
+            orders.append(_cancel_algo_instruction(symbol, stale_stop, "stale_stop_loss_replacement"))
     if stop_price is not None:
         existing_stop_price = _positive_signal_price((existing_stop or {}).get("triggerPrice") or (existing_stop or {}).get("stopPrice"))
         if existing_stop is None:
             orders.append(_stop_loss_instruction(symbol, target_exposure, reference_price, stop_price, trailing_replacement=False))
         elif existing_stop_price is not None and stop_price > existing_stop_price:
             # Fail-closed: submit the tighter stop without cancelling the older, lower stop in
-            # the same blind instruction plan.  This can leave duplicate stop protection, but
-            # never creates a naked long position if the replacement is rejected or unknown.
+            # the same blind instruction plan.  A later cycle that sees both accepted stops will
+            # cancel the stale lower stop, so replacement never creates a naked long position.
             orders.append(_stop_loss_instruction(symbol, target_exposure, reference_price, stop_price, trailing_replacement=True))
-    existing_tp_coverage = _existing_take_profit_coverage(portfolio_state, symbol, target_exposure)
+    configured_layers = _configured_take_profit_layers(take_profit_1, take_profit_2)
+    stale_take_profits = _stale_take_profit_protections(portfolio_state, symbol, configured_layers, target_exposure)
+    stale_take_profit_keys = {_protection_key(item) for item in stale_take_profits}
+    for stale_tp in stale_take_profits:
+        orders.append(_cancel_algo_instruction(symbol, stale_tp, "stale_take_profit_replacement"))
+    existing_tp_coverage = _existing_take_profit_coverage(portfolio_state, symbol, target_exposure, excluded_keys=stale_take_profit_keys)
     remaining_tp_exposure = max(0.0, target_exposure - existing_tp_coverage)
     if remaining_tp_exposure > 0:
         if take_profit_1 is None and take_profit_2 is not None:
-            coverage = _take_profit_coverage_at_price(portfolio_state, symbol, take_profit_2, target_exposure)
+            coverage = _take_profit_coverage_at_price(portfolio_state, symbol, take_profit_2, target_exposure, excluded_keys=stale_take_profit_keys)
             qty = min(max(0.0, target_exposure - coverage), remaining_tp_exposure)
             if qty > 0:
                 orders.append(_take_profit_instruction(symbol, qty, reference_price, take_profit_2, "take_profit_2"))
         else:
-            configured_layers = [("take_profit_1", take_profit_1), ("take_profit_2", take_profit_2)]
-            configured_layers = [(role, price) for role, price in configured_layers if price is not None]
             per_layer_qty = target_exposure / max(1, len(configured_layers))
             for role, price in configured_layers:
-                coverage = _take_profit_coverage_at_price(portfolio_state, symbol, price, per_layer_qty)
+                coverage = _take_profit_coverage_at_price(portfolio_state, symbol, price, per_layer_qty, excluded_keys=stale_take_profit_keys)
                 qty = min(max(0.0, per_layer_qty - coverage), remaining_tp_exposure)
                 if qty > 0:
                     orders.append(_take_profit_instruction(symbol, qty, reference_price, price, role))
@@ -184,6 +191,26 @@ def _protective_orders(
                 if remaining_tp_exposure <= 0:
                     break
     return orders
+
+
+def _configured_take_profit_layers(take_profit_1: float | None, take_profit_2: float | None) -> list[tuple[str, float]]:
+    return [(role, price) for role, price in (("take_profit_1", take_profit_1), ("take_profit_2", take_profit_2)) if price is not None]
+
+
+def _cancel_algo_instruction(symbol: str, item: dict[str, Any], reason: str) -> OrderInstruction:
+    return OrderInstruction(
+        symbol=symbol,
+        side="SELL",
+        quantity=0.0,
+        order_type="CANCEL_ALGO_ORDER",
+        metadata={
+            "protective_order": True,
+            "action": "cancel_protection",
+            "cancel_reason": reason,
+            "cancel_algo_id": item.get("algoId") or item.get("orderId"),
+            "cancel_client_algo_id": item.get("clientAlgoId") or item.get("clientOrderId"),
+        },
+    )
 
 
 def _stop_loss_instruction(symbol: str, target_exposure: float, reference_price: float, stop_price: float, *, trailing_replacement: bool) -> OrderInstruction:
@@ -244,17 +271,34 @@ def _protection_rows(portfolio_state: dict[str, Any], symbol: str) -> list[Any]:
 
 
 def _find_open_protection(portfolio_state: dict[str, Any], symbol: str, role: str, *, target_exposure: float | None = None) -> dict[str, Any] | None:
+    rows = _open_protections(portfolio_state, symbol, role, target_exposure=target_exposure)
+    return rows[0] if rows else None
+
+
+def _open_protections(portfolio_state: dict[str, Any], symbol: str, role: str, *, target_exposure: float | None = None) -> list[dict[str, Any]]:
     symbol = symbol.upper()
     wanted_types = {"stop_loss": {"STOP", "STOP_MARKET"}, "take_profit": {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}}.get(role, set())
+    rows: list[dict[str, Any]] = []
     for item in _protection_rows(portfolio_state, symbol):
         if not isinstance(item, dict):
             continue
         if str(item.get("symbol", "")).upper() != symbol:
             continue
         order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
-        if order_type in wanted_types and _is_safe_long_protection(item, role, target_exposure=target_exposure):
-            return item
-    return None
+        effective_target = target_exposure
+        if role == "take_profit" and effective_target is None:
+            effective_target = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
+        if order_type in wanted_types and _is_safe_long_protection(item, role, target_exposure=effective_target):
+            rows.append(item)
+    return rows
+
+
+def _tightest_long_stop(stops: list[dict[str, Any]]) -> dict[str, Any] | None:
+    priced = [(item, _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))) for item in stops]
+    priced = [(item, price) for item, price in priced if price is not None]
+    if not priced:
+        return stops[0] if stops else None
+    return max(priced, key=lambda pair: pair[1])[0]
 
 
 def _has_open_protection(portfolio_state: dict[str, Any], symbol: str, role: str, *, target_exposure: float | None = None) -> bool:
@@ -275,11 +319,20 @@ def _has_matching_take_profit(portfolio_state: dict[str, Any], symbol: str, trig
     return False
 
 
-def _existing_take_profit_coverage(portfolio_state: dict[str, Any], symbol: str, target_exposure: float) -> float:
+def _existing_take_profit_coverage(
+    portfolio_state: dict[str, Any],
+    symbol: str,
+    target_exposure: float,
+    *,
+    excluded_keys: set[tuple[str, str]] | None = None,
+) -> float:
     symbol = symbol.upper()
+    excluded_keys = excluded_keys or set()
     coverage = 0.0
     for item in _protection_rows(portfolio_state, symbol):
         if not isinstance(item, dict) or str(item.get("symbol", "")).upper() != symbol:
+            continue
+        if _protection_key(item) in excluded_keys:
             continue
         order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
         quantity = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
@@ -291,11 +344,21 @@ def _existing_take_profit_coverage(portfolio_state: dict[str, Any], symbol: str,
     return min(coverage, target_exposure)
 
 
-def _take_profit_coverage_at_price(portfolio_state: dict[str, Any], symbol: str, trigger_price: float, layer_target_exposure: float) -> float:
+def _take_profit_coverage_at_price(
+    portfolio_state: dict[str, Any],
+    symbol: str,
+    trigger_price: float,
+    layer_target_exposure: float,
+    *,
+    excluded_keys: set[tuple[str, str]] | None = None,
+) -> float:
     symbol = symbol.upper()
+    excluded_keys = excluded_keys or set()
     coverage = 0.0
     for item in _protection_rows(portfolio_state, symbol):
         if not isinstance(item, dict) or str(item.get("symbol", "")).upper() != symbol:
+            continue
+        if _protection_key(item) in excluded_keys:
             continue
         order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
         quantity = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
@@ -308,6 +371,34 @@ def _take_profit_coverage_at_price(portfolio_state: dict[str, Any], symbol: str,
             continue
         coverage += min(quantity, layer_target_exposure)
     return min(coverage, layer_target_exposure)
+
+
+def _stale_take_profit_protections(
+    portfolio_state: dict[str, Any],
+    symbol: str,
+    configured_layers: list[tuple[str, float]],
+    target_exposure: float,
+) -> list[dict[str, Any]]:
+    if not configured_layers:
+        return _open_protections(portfolio_state, symbol, "take_profit", target_exposure=None)
+    stale: list[dict[str, Any]] = []
+    for item in _open_protections(portfolio_state, symbol, "take_profit", target_exposure=None):
+        existing_price = _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))
+        price_matches = existing_price is not None and any(
+            abs(existing_price - configured_price) <= max(1e-8, abs(configured_price) * 0.0001)
+            for _, configured_price in configured_layers
+        )
+        if not price_matches:
+            stale.append(item)
+    return stale
+
+
+def _protection_key(item: dict[str, Any]) -> tuple[str, str]:
+    for key in ("algoId", "clientAlgoId", "orderId", "clientOrderId"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return key, str(value)
+    return "object", str(id(item))
 
 
 def _is_safe_long_protection(item: dict[str, Any], role: str, *, target_exposure: float | None = None) -> bool:

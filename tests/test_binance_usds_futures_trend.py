@@ -199,6 +199,97 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertTrue(plan.metadata["skipped"])
         self.assertEqual(plan.metadata["reason"], "target_exposure_already_reached")
 
+    def test_position_reconciliation_execution_engine_cancels_stale_take_profit_layers_before_replacing_them(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        intent = types.StrategyIntent(
+            symbol="ETHUSDT",
+            desired_exposure=0.361,
+            action="hold_long",
+            reason="trend",
+            metadata={
+                "signal": {
+                    "entry_reference": 1799.44,
+                    "trailing_stop": 1757.99,
+                    "take_profit_1": 1827.07,
+                    "take_profit_2": 1854.70,
+                }
+            },
+        )
+        portfolio_state = {
+            "positions": {"ETHUSDT": {"size": 0.039}},
+            "open_algo_orders": [
+                {
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "orderType": "TAKE_PROFIT_MARKET",
+                    "quantity": "0.019",
+                    "reduceOnly": True,
+                    "triggerPrice": "1825.20",
+                    "clientAlgoId": "old-tp-1",
+                    "algoId": 101,
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "orderType": "TAKE_PROFIT_MARKET",
+                    "quantity": "0.019",
+                    "reduceOnly": True,
+                    "triggerPrice": "1855.74",
+                    "clientAlgoId": "old-tp-2",
+                    "algoId": 102,
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "orderType": "STOP_MARKET",
+                    "closePosition": True,
+                    "triggerPrice": "1748.85",
+                    "clientAlgoId": "existing-stop",
+                    "algoId": 103,
+                },
+            ],
+        }
+
+        plan = engine.plan_orders(intent, {"approved": True}, portfolio_state)
+
+        cancel_instructions = [item for item in plan.instructions if item.order_type == "CANCEL_ALGO_ORDER"]
+        self.assertEqual([item.metadata["cancel_client_algo_id"] for item in cancel_instructions], ["old-tp-1", "old-tp-2"])
+        self.assertEqual([item.metadata["cancel_reason"] for item in cancel_instructions], ["stale_take_profit_replacement", "stale_take_profit_replacement"])
+        replacement_tps = [item for item in plan.instructions if item.order_type == "TAKE_PROFIT_MARKET"]
+        self.assertEqual(len(replacement_tps), 2)
+        self.assertAlmostEqual(sum(item.quantity for item in replacement_tps), 0.361)
+        self.assertEqual([item.metadata["protection_role"] for item in replacement_tps], ["take_profit_1", "take_profit_2"])
+
+    def test_position_reconciliation_execution_engine_keeps_only_tightest_stop_loss_when_duplicates_exist(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        intent = types.StrategyIntent(
+            symbol="ETHUSDT",
+            desired_exposure=0.361,
+            action="hold_long",
+            reason="trend",
+            metadata={"signal": {"entry_reference": 1799.44, "trailing_stop": 1757.99}},
+        )
+        portfolio_state = {
+            "positions": {"ETHUSDT": {"size": 0.361}},
+            "open_algo_orders": [
+                {"symbol": "ETHUSDT", "side": "SELL", "orderType": "STOP_MARKET", "closePosition": True, "triggerPrice": "1748.85", "clientAlgoId": "old-stop", "algoId": 201},
+                {"symbol": "ETHUSDT", "side": "SELL", "orderType": "STOP_MARKET", "closePosition": True, "triggerPrice": "1757.99", "clientAlgoId": "tight-stop", "algoId": 202},
+            ],
+        }
+
+        plan = engine.plan_orders(intent, {"approved": True}, portfolio_state)
+
+        cancel_instructions = [item for item in plan.instructions if item.order_type == "CANCEL_ALGO_ORDER"]
+        self.assertEqual([item.metadata["cancel_client_algo_id"] for item in cancel_instructions], ["old-stop"])
+        self.assertEqual(cancel_instructions[0].metadata["cancel_reason"], "stale_stop_loss_replacement")
+        self.assertFalse(any(item.order_type == "STOP_MARKET" for item in plan.instructions))
+
     def test_testnet_broker_uses_testnet_base_url_only(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
 
