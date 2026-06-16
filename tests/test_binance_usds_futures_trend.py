@@ -8,6 +8,7 @@ import os
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "binance_usds_futures_trend.py"
 REPO_ROOT = MODULE_PATH.parents[1]
@@ -303,6 +304,522 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertNotIn("signature=", encoded)
         self.assertNotIn("X-MBX-APIKEY", encoded)
         self.assertNotIn("boom url=", encoded)
+
+    def test_testnet_exchange_rules_quantize_order_before_dry_run(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        rules = brokers.SymbolExchangeRules.from_exchange_info(
+            "BTCUSDT",
+            {
+                "filters": [
+                    {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                    {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                ]
+            },
+        )
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=True,
+            exchange_rules_by_symbol={"BTCUSDT": rules},
+        )
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=0.123456,
+                metadata={"reference_price": 100.17},
+            )
+        )
+
+        self.assertEqual(event["status"], "dry_run")
+        self.assertEqual(event["quantity"], 0.123)
+        self.assertEqual(event["reference_price"], 100.1)
+        self.assertEqual(event["request"]["params"]["quantity"], "0.123")
+        self.assertEqual(event["exchange_rule_adjustments"]["quantity_before"], 0.123456)
+        self.assertEqual(event["exchange_rule_adjustments"]["quantity_after"], 0.123)
+        self.assertEqual(event["exchange_rule_adjustments"]["reference_price_after"], 100.1)
+
+    def test_testnet_exchange_rules_reject_order_below_min_qty_before_signing(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        rules = brokers.SymbolExchangeRules.from_exchange_info(
+            "BTCUSDT",
+            {
+                "filters": [
+                    {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                    {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                ]
+            },
+        )
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            exchange_rules_by_symbol={"BTCUSDT": rules},
+        )
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=0.0009,
+                metadata={"reference_price": 100.0},
+            )
+        )
+
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason"], "exchange_min_qty_not_met")
+        self.assertFalse(event["signed"])
+        self.assertFalse(event["real_order_submitted"])
+
+    def test_testnet_broker_rejects_zero_quantity_without_raising(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=True,
+        )
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="TRXUSDT",
+                side="BUY",
+                quantity=0.0,
+                metadata={"reference_price": 0.01},
+            )
+        )
+
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason"], "non_positive_quantity")
+        self.assertFalse(event["signed"])
+        self.assertFalse(event["real_order_submitted"])
+
+    def test_testnet_broker_rejects_nan_quantity_before_signing(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        class FailIfCalledHttpClient:
+            def request(self, *args, **kwargs):
+                raise AssertionError("non-finite quantity must not reach HTTP")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            http_client=FailIfCalledHttpClient(),
+        )
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=float("nan"),
+                metadata={"reference_price": 100.0},
+            )
+        )
+
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason"], "non_finite_quantity")
+        self.assertFalse(event["signed"])
+        self.assertFalse(event["real_order_submitted"])
+
+    def test_testnet_exchange_rules_reject_zero_quantity_after_step_adaptation_before_signing(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        class FailIfCalledHttpClient:
+            def request(self, *args, **kwargs):
+                raise AssertionError("zero adapted quantity must not reach HTTP")
+
+        rules = brokers.SymbolExchangeRules.from_exchange_info(
+            "BTCUSDT",
+            {"filters": [{"filterType": "LOT_SIZE", "stepSize": "0.001"}]},
+        )
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            http_client=FailIfCalledHttpClient(),
+            exchange_rules_by_symbol={"BTCUSDT": rules},
+        )
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=0.0004,
+                metadata={"reference_price": 100.0},
+            )
+        )
+
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason"], "exchange_quantity_not_positive_after_adaptation")
+        self.assertFalse(event["signed"])
+        self.assertFalse(event["real_order_submitted"])
+
+    def test_testnet_broker_fetches_exchange_info_rules_from_testnet_endpoint(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url, headers, body, timeout))
+                return {
+                    "symbols": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "filters": [
+                                {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                                {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                                {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                            ],
+                        },
+                        {"symbol": "ETHUSDT", "filters": []},
+                    ]
+                }
+
+        client = FakeHttpClient()
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            http_client=client,
+        )
+
+        loaded = broker.refresh_exchange_rules(["BTCUSDT"])
+
+        self.assertEqual(client.calls[0][0], "GET")
+        self.assertEqual(client.calls[0][1], "https://testnet.binancefuture.com/fapi/v1/exchangeInfo")
+        self.assertIn("BTCUSDT", loaded)
+        self.assertIn("BTCUSDT", broker.exchange_rules_by_symbol)
+        self.assertEqual(str(broker.exchange_rules_by_symbol["BTCUSDT"].step_size), "0.001")
+        self.assertNotIn("ETHUSDT", loaded)
+
+    def test_testnet_broker_fetches_signed_account_snapshot(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url, headers, body, timeout))
+                if "/fapi/v2/account" in url:
+                    return {"assets": [{"asset": "USDT", "walletBalance": "1000"}]}
+                if "/fapi/v2/positionRisk" in url:
+                    return [{"symbol": "BTCUSDT", "positionAmt": "0.01"}]
+                if "/fapi/v1/openOrders" in url:
+                    return [{"symbol": "BTCUSDT", "clientOrderId": "cid-1"}]
+                raise AssertionError(url)
+
+        client = FakeHttpClient()
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            http_client=client,
+        )
+
+        snapshot = broker.fetch_signed_account_snapshot(symbol="BTCUSDT")
+
+        self.assertEqual([call[0] for call in client.calls], ["GET", "GET", "GET"])
+        self.assertIn("/fapi/v2/account?", client.calls[0][1])
+        self.assertIn("/fapi/v2/positionRisk?", client.calls[1][1])
+        self.assertIn("/fapi/v1/openOrders?", client.calls[2][1])
+        self.assertEqual(snapshot["environment"], "testnet")
+        self.assertEqual(snapshot["account"]["assets"][0]["asset"], "USDT")
+        self.assertEqual(snapshot["positions"][0]["symbol"], "BTCUSDT")
+        self.assertEqual(snapshot["open_orders"][0]["clientOrderId"], "cid-1")
+        encoded = json.dumps(snapshot, sort_keys=True)
+        self.assertNotIn("signature=", encoded)
+        self.assertNotIn("X-MBX-APIKEY", encoded)
+
+    def test_testnet_broker_reconciles_unknown_local_order_with_open_orders(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+        )
+        broker.fills.append(
+            {
+                "environment": "testnet",
+                "symbol": "BTCUSDT",
+                "status": "submitted_unknown",
+                "client_order_id": "cid-unknown",
+            }
+        )
+
+        report = broker.reconcile_open_orders(
+            open_orders=[{"symbol": "BTCUSDT", "clientOrderId": "cid-unknown", "orderId": 123}]
+        )
+
+        self.assertEqual(report["environment"], "testnet")
+        self.assertEqual(report["matched_open_order_client_ids"], ["cid-unknown"])
+        self.assertEqual(report["missing_unknown_client_ids"], [])
+        self.assertEqual(report["unknown_local_count"], 1)
+
+    def test_testnet_signed_submission_uses_client_order_id_and_order_journal(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        class FakeHttpClient:
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                parsed = url.split("?", 1)[1]
+                params = dict(item.split("=", 1) for item in parsed.split("&"))
+                return {"orderId": 99, "clientOrderId": params["newClientOrderId"], "status": "NEW"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = pathlib.Path(tmpdir) / "orders.jsonl"
+            broker = brokers.BinanceTestnetBroker(
+                credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+                dry_run=False,
+                http_client=FakeHttpClient(),
+                order_journal_path=str(journal_path),
+                client_order_id_prefix="testcid",
+            )
+
+            event = broker.submit_order(
+                execution.OrderInstruction(
+                    symbol="BTCUSDT",
+                    side="BUY",
+                    quantity=0.01,
+                    metadata={"reference_price": 100.0},
+                )
+            )
+
+            self.assertEqual(event["status"], "submitted")
+            self.assertTrue(event["client_order_id"].startswith("testcid-"))
+            self.assertEqual(event["request"]["params"]["newClientOrderId"], event["client_order_id"])
+            rows = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["client_order_id"], event["client_order_id"])
+            self.assertEqual(rows[0]["status"], "submitted")
+            self.assertNotIn("signature", json.dumps(rows[0]))
+
+    def test_testnet_unknown_submission_queries_order_status_by_client_order_id(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if method == "POST":
+                    raise TimeoutError("network timeout")
+                if "/fapi/v1/order" in url:
+                    return {"orderId": 101, "clientOrderId": "testcid-1", "status": "NEW"}
+                raise AssertionError(url)
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            http_client=FakeHttpClient(),
+            client_order_id_prefix="testcid",
+        )
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=0.01,
+                metadata={"reference_price": 100.0},
+            )
+        )
+
+        self.assertEqual(event["status"], "submitted_confirmed")
+        self.assertEqual(event["response"]["orderId"], 101)
+        self.assertIn("origClientOrderId=testcid-1", broker.http_client.calls[1][1])
+
+    def test_testnet_risk_limits_load_from_config_env_file_and_sanitize_summary(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            kill_file = pathlib.Path(tmpdir) / "kill-switch"
+            kill_file.write_text("enabled\n", encoding="utf-8")
+            old_value = os.environ.get("BINANCE_TESTNET_KILL_SWITCH")
+            os.environ["BINANCE_TESTNET_KILL_SWITCH"] = "0"
+            try:
+                limits = brokers.TestnetRiskLimits.from_config(
+                    {
+                        "max_order_notional": "25.5",
+                        "max_symbol_exposure": 100,
+                        "max_daily_loss": 10,
+                        "max_order_count": 2,
+                        "kill_switch": False,
+                        "api_secret": "must-not-leak",
+                    },
+                    kill_switch_env="BINANCE_TESTNET_KILL_SWITCH",
+                    kill_switch_file=str(kill_file),
+                )
+            finally:
+                if old_value is None:
+                    os.environ.pop("BINANCE_TESTNET_KILL_SWITCH", None)
+                else:
+                    os.environ["BINANCE_TESTNET_KILL_SWITCH"] = old_value
+
+        self.assertTrue(limits.kill_switch)
+        self.assertEqual(limits.max_order_notional, 25.5)
+        self.assertEqual(limits.max_order_count, 2)
+        summary = limits.sanitized_summary()
+        self.assertEqual(summary["kill_switch"], True)
+        self.assertNotIn("must-not-leak", json.dumps(summary))
+        self.assertEqual(summary["source"], "testnet_risk_limits")
+
+    def test_testnet_risk_limits_reject_invalid_non_finite_config(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        with self.assertRaises(ValueError):
+            brokers.TestnetRiskLimits.from_config({"max_order_notional": "nan"})
+        with self.assertRaises(ValueError):
+            brokers.TestnetRiskLimits.from_config({"max_order_count": 0})
+
+    def test_run_testnet_trading_cycle_refreshes_exchange_rules_and_writes_order_journal(self):
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if "/fapi/v1/exchangeInfo" in url:
+                    return {
+                        "symbols": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "filters": [
+                                    {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                                    {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                                    {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                                ],
+                            }
+                        ]
+                    }
+                if method == "POST" and "/fapi/v1/order" in url:
+                    params = dict(item.split("=", 1) for item in url.split("?", 1)[1].split("&"))
+                    return {"orderId": 555, "clientOrderId": params["newClientOrderId"], "status": "NEW"}
+                raise AssertionError(url)
+
+        def fake_fetch_klines(symbol, interval, limit, base_url):
+            return [
+                {"open": 100.0 + idx, "high": 101.0 + idx, "low": 99.0 + idx, "close": 100.5 + idx}
+                for idx in range(240)
+            ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = pathlib.Path(tmpdir) / "orders.jsonl"
+            client = FakeHttpClient()
+            with mock.patch.dict(os.environ, {"LALA_KEY": "k", "LALA_SECRET": "s"}), mock.patch.object(trend, "fetch_klines", fake_fetch_klines):
+                cycle = trend.run_testnet_trading_cycle(
+                    ["BTCUSDT"],
+                    interval="1h",
+                    limit=240,
+                    save_runtime_record=False,
+                    dry_run=False,
+                    testnet_http_client=client,
+                    order_journal_path=str(journal_path),
+                )
+
+            self.assertEqual(cycle["errors"], [])
+            self.assertTrue(any("/fapi/v1/exchangeInfo" in call[1] for call in client.calls))
+            self.assertTrue(any(call[0] == "POST" and "/fapi/v1/order" in call[1] for call in client.calls))
+            rows = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "submitted")
+            self.assertIn("client_order_id", rows[0])
+            self.assertIn("exchange_rule_adjustments", rows[0])
+            self.assertNotIn("signature", json.dumps(rows[0]))
+
+    def test_run_testnet_trading_cycle_can_attach_signed_account_sync_report(self):
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if "/fapi/v1/exchangeInfo" in url:
+                    return {"symbols": [{"symbol": "BTCUSDT", "filters": [{"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"}]}]}
+                if "/fapi/v2/account" in url:
+                    return {"assets": [{"asset": "USDT", "walletBalance": "1000"}]}
+                if "/fapi/v2/positionRisk" in url:
+                    return [{"symbol": "BTCUSDT", "positionAmt": "0.0"}]
+                if "/fapi/v1/openOrders" in url:
+                    return [{"symbol": "BTCUSDT", "clientOrderId": "hermes-1"}]
+                if method == "POST" and "/fapi/v1/order" in url:
+                    return {"orderId": 777, "clientOrderId": "hermes-1", "status": "NEW"}
+                raise AssertionError(url)
+
+        def fake_fetch_klines(symbol, interval, limit, base_url):
+            return [
+                {"open": 100.0 + idx, "high": 101.0 + idx, "low": 99.0 + idx, "close": 100.5 + idx}
+                for idx in range(240)
+            ]
+
+        client = FakeHttpClient()
+        with mock.patch.dict(os.environ, {"LALA_KEY": "k", "LALA_SECRET": "s"}), mock.patch.object(trend, "fetch_klines", fake_fetch_klines):
+            cycle = trend.run_testnet_trading_cycle(
+                ["BTCUSDT"],
+                interval="1h",
+                limit=240,
+                save_runtime_record=False,
+                dry_run=False,
+                testnet_http_client=client,
+                sync_account_state=True,
+            )
+
+        self.assertEqual(cycle["errors"], [])
+        sync = cycle["testnet_account_sync"]
+        self.assertEqual(sync["environment"], "testnet")
+        self.assertEqual(sync["before"]["account"]["assets"][0]["asset"], "USDT")
+        self.assertEqual(sync["after"]["open_orders"][0]["clientOrderId"], "hermes-1")
+        self.assertIn("reconciliation", sync)
+        self.assertEqual(cycle["runtime_record"]["execution_events"]["testnet_account_sync"]["after_open_orders_count"], 1)
+        self.assertNotIn("signature=", json.dumps(sync))
+
+    def test_cli_loads_testnet_risk_config_file_and_emits_sanitized_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = pathlib.Path(tmpdir) / "risk.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "max_order_notional": 12.5,
+                        "max_symbol_exposure": 33,
+                        "max_daily_loss": 5,
+                        "max_order_count": 2,
+                        "kill_switch": True,
+                        "api_secret": "super-secret",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_cycle = {
+                "errors": [],
+                "runtime_record": {"schema_version": "1"},
+                "environment": "testnet",
+            }
+            with mock.patch.object(trend, "run_testnet_trading_cycle", return_value=fake_cycle) as run_cycle:
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    exit_code = trend.main([
+                        "--run-testnet-cycle",
+                        "--symbol",
+                        "BTCUSDT",
+                        "--interval",
+                        "1h",
+                        "--limit",
+                        "240",
+                        "--runtime-record-file",
+                        str(pathlib.Path(tmpdir) / "runtime.jsonl"),
+                        "--testnet-dry-run",
+                        "--testnet-risk-config-file",
+                        str(config_path),
+                    ])
+
+        self.assertEqual(exit_code, 0)
+        called_kwargs = run_cycle.call_args.kwargs
+        self.assertEqual(called_kwargs["max_order_notional"], 12.5)
+        self.assertTrue(called_kwargs["kill_switch"])
+        rendered = stdout.getvalue()
+        self.assertIn('"testnet_risk_limits"', rendered)
+        self.assertNotIn("super-secret", rendered)
+        self.assertIn('"kill_switch": true', rendered)
 
     def test_testnet_broker_kill_switch_blocks_all_execution(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")

@@ -7,8 +7,10 @@ import hmac
 import json
 import math
 import os
+import pathlib
 import urllib.parse
 import urllib.request
+from decimal import Decimal, ROUND_DOWN
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Mapping, Protocol
@@ -88,6 +90,81 @@ class TestnetRiskLimits:
     max_order_count: int = 10
     kill_switch: bool = False
 
+    @classmethod
+    def from_config(
+        cls,
+        config: Mapping[str, Any] | None,
+        *,
+        kill_switch_env: str | None = None,
+        kill_switch_file: str | None = None,
+    ) -> "TestnetRiskLimits":
+        data = dict(config or {})
+        kill_switch = _config_bool(data.get("kill_switch", False))
+        if kill_switch_env and _env_bool(os.environ.get(kill_switch_env)):
+            kill_switch = True
+        if kill_switch_file and pathlib.Path(kill_switch_file).exists():
+            kill_switch = True
+        return cls(
+            max_order_notional=_positive_float(data.get("max_order_notional", cls.max_order_notional), "max_order_notional"),
+            max_symbol_exposure=_positive_float(data.get("max_symbol_exposure", cls.max_symbol_exposure), "max_symbol_exposure"),
+            max_daily_loss=_positive_float(data.get("max_daily_loss", cls.max_daily_loss), "max_daily_loss"),
+            max_order_count=_positive_int(data.get("max_order_count", cls.max_order_count), "max_order_count"),
+            kill_switch=kill_switch,
+        )
+
+    def sanitized_summary(self) -> dict[str, Any]:
+        return {"source": "testnet_risk_limits", **asdict(self)}
+
+
+@dataclass(frozen=True)
+class SymbolExchangeRules:
+    """Binance exchangeInfo order rules for one symbol."""
+
+    symbol: str
+    min_qty: Decimal | None = None
+    step_size: Decimal | None = None
+    tick_size: Decimal | None = None
+    min_notional: Decimal | None = None
+
+    @classmethod
+    def from_exchange_info(cls, symbol: str, payload: Mapping[str, Any]) -> "SymbolExchangeRules":
+        filters = {str(item.get("filterType")): item for item in payload.get("filters", [])}
+        lot = filters.get("LOT_SIZE") or {}
+        price = filters.get("PRICE_FILTER") or {}
+        min_notional = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL") or {}
+        return cls(
+            symbol=symbol.upper(),
+            min_qty=_optional_decimal(lot.get("minQty")),
+            step_size=_optional_decimal(lot.get("stepSize")),
+            tick_size=_optional_decimal(price.get("tickSize")),
+            min_notional=_optional_decimal(min_notional.get("notional") or min_notional.get("minNotional")),
+        )
+
+    def adapt(self, quantity: float, reference_price: float) -> tuple[float, float, dict[str, float]]:
+        original_quantity = Decimal(str(quantity))
+        original_reference_price = Decimal(str(reference_price))
+        adjusted_quantity = _floor_to_step(original_quantity, self.step_size)
+        adjusted_reference_price = _floor_to_step(original_reference_price, self.tick_size)
+        return (
+            float(adjusted_quantity),
+            float(adjusted_reference_price),
+            {
+                "quantity_before": float(original_quantity),
+                "quantity_after": float(adjusted_quantity),
+                "reference_price_before": float(original_reference_price),
+                "reference_price_after": float(adjusted_reference_price),
+            },
+        )
+
+    def validate(self, quantity: float, reference_price: float) -> str | None:
+        quantity_dec = Decimal(str(quantity))
+        price_dec = Decimal(str(reference_price))
+        if self.min_qty is not None and quantity_dec < self.min_qty:
+            return "exchange_min_qty_not_met"
+        if self.min_notional is not None and quantity_dec * price_dec < self.min_notional:
+            return "exchange_min_notional_not_met"
+        return None
+
 
 class UrllibHttpClient:
     """Tiny injectable HTTP client for signed testnet requests."""
@@ -97,6 +174,46 @@ class UrllibHttpClient:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
         return json.loads(raw) if raw else {}
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _floor_to_step(value: Decimal, step: Decimal | None) -> Decimal:
+    if step is None or step == 0:
+        return value
+    units = (value / step).to_integral_value(rounding=ROUND_DOWN)
+    return units * step
+
+
+def _config_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _env_bool(value: str | None) -> bool:
+    return value is not None and _config_bool(value)
+
+
+def _positive_float(value: Any, name: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return parsed
+
+
+def _positive_int(value: Any, name: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
 
 
 def resolve_binance_testnet_credentials(env: Mapping[str, str] | None = None) -> BinanceTestnetCredentials:
@@ -221,6 +338,9 @@ class BinanceTestnetBroker:
     dry_run: bool = True
     risk_limits: TestnetRiskLimits = field(default_factory=TestnetRiskLimits)
     http_client: Any = field(default_factory=UrllibHttpClient)
+    exchange_rules_by_symbol: dict[str, SymbolExchangeRules] = field(default_factory=dict)
+    order_journal_path: str | None = None
+    client_order_id_prefix: str = "hermes"
     environment: str = "testnet"
     fills: list[dict[str, Any]] = field(default_factory=list)
     positions: dict[str, PortfolioPosition] = field(default_factory=dict)
@@ -244,8 +364,17 @@ class BinanceTestnetBroker:
         if side not in {"BUY", "SELL"}:
             raise ValueError(f"unsupported testnet side: {order.side}")
         quantity = float(order.quantity)
+        if not math.isfinite(quantity):
+            event = self._base_event(order, self._reference_price(order) or 0.0, 0.0)
+            event.update({"status": "rejected", "reason": "non_finite_quantity", "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run})
+            self.fills.append(event)
+            return event
         if quantity <= 0:
-            raise ValueError("testnet order quantity must be positive")
+            event = self._base_event(order, self._reference_price(order) or 0.0, 0.0)
+            event.update({"status": "rejected", "reason": "non_positive_quantity", "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run})
+            self.fills.append(event)
+            return event
+        client_order_id = self._build_client_order_id(symbol)
         reference_price = self._reference_price(order)
         global_rejection = self._global_risk_rejection()
         if global_rejection:
@@ -258,11 +387,54 @@ class BinanceTestnetBroker:
             event.update({"status": "rejected", "reason": "invalid_reference_price", "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run})
             self.fills.append(event)
             return event
+        exchange_rule_adjustments: dict[str, float] | None = None
+        rules = self.exchange_rules_by_symbol.get(symbol)
+        if rules is not None:
+            quantity, reference_price, exchange_rule_adjustments = rules.adapt(quantity, reference_price)
+            order = OrderInstruction(
+                symbol=order.symbol,
+                side=order.side,
+                quantity=quantity,
+                order_type=order.order_type,
+                metadata={**order.metadata, "reference_price": reference_price},
+            )
+            if not math.isfinite(quantity):
+                event = self._base_event(order, reference_price if math.isfinite(reference_price) else 0.0, 0.0)
+                event.update({"status": "rejected", "reason": "exchange_quantity_not_finite_after_adaptation", "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run, "exchange_rule_adjustments": exchange_rule_adjustments})
+                self.fills.append(event)
+                return event
+            if not math.isfinite(reference_price) or reference_price <= 0:
+                event = self._base_event(order, 0.0, 0.0)
+                event.update({"status": "rejected", "reason": "exchange_reference_price_invalid_after_adaptation", "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run, "exchange_rule_adjustments": exchange_rule_adjustments})
+                self.fills.append(event)
+                return event
+            exchange_rejection = rules.validate(quantity, reference_price)
+            if not exchange_rejection and quantity <= 0:
+                event = self._base_event(order, reference_price, 0.0)
+                event.update({"status": "rejected", "reason": "exchange_quantity_not_positive_after_adaptation", "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run, "exchange_rule_adjustments": exchange_rule_adjustments})
+                self.fills.append(event)
+                return event
+            if exchange_rejection:
+                event = self._base_event(order, reference_price, abs(quantity * reference_price))
+                event.update(
+                    {
+                        "status": "rejected",
+                        "reason": exchange_rejection,
+                        "real_order_submitted": False,
+                        "signed": False,
+                        "testnet_dry_run": self.dry_run,
+                        "exchange_rule_adjustments": exchange_rule_adjustments,
+                    }
+                )
+                self.fills.append(event)
+                return event
         notional = abs(quantity * reference_price)
         rejection = self._risk_rejection(symbol=symbol, side=side, quantity=quantity, reference_price=reference_price, notional=notional)
         if rejection:
             event = self._base_event(order, reference_price, notional)
             event.update({"status": "rejected", "reason": rejection, "real_order_submitted": False, "signed": False, "testnet_dry_run": self.dry_run})
+            if exchange_rule_adjustments is not None:
+                event["exchange_rule_adjustments"] = exchange_rule_adjustments
             self.fills.append(event)
             return event
 
@@ -271,9 +443,13 @@ class BinanceTestnetBroker:
             "side": side,
             "type": order.order_type.upper(),
             "quantity": _decimal_string(quantity),
+            "newClientOrderId": client_order_id,
             "timestamp": int(datetime.now(UTC).timestamp() * 1000),
         }
         event = self._base_event(order, reference_price, notional)
+        event["client_order_id"] = client_order_id
+        if exchange_rule_adjustments is not None:
+            event["exchange_rule_adjustments"] = exchange_rule_adjustments
         event["request"] = {"method": "POST", "path": "/fapi/v1/order", "params": redact_sensitive_testnet_fields(params)}
         if self.dry_run:
             event.update({"status": "dry_run", "testnet_dry_run": True, "signed": False, "simulated": True, "real_order_submitted": False})
@@ -308,6 +484,22 @@ class BinanceTestnetBroker:
                     "response": None,
                 }
             )
+            try:
+                confirmed_payload = self._confirm_order_by_client_order_id(symbol, client_order_id)
+            except Exception as confirm_exc:
+                event.update({"confirm_status": "failed", "confirm_error_type": confirm_exc.__class__.__name__})
+                self._append_order_journal(event)
+                return event
+            self.accepted_order_count += 1
+            self._apply_position(symbol, side, quantity, reference_price)
+            event.update(
+                {
+                    "status": "submitted_confirmed",
+                    "confirm_status": "found",
+                    "response": redact_sensitive_testnet_fields(confirmed_payload),
+                }
+            )
+            self._append_order_journal(event)
             return event
         self.accepted_order_count += 1
         self._apply_position(symbol, side, quantity, reference_price)
@@ -317,10 +509,73 @@ class BinanceTestnetBroker:
                 "response": redact_sensitive_testnet_fields(response_payload),
             }
         )
+        self._append_order_journal(event)
         return event
 
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         return {"environment": self.environment, "order_id": order_id, "cancelled": False, "reason": "cancel not implemented in v1.7 testnet adapter skeleton"}
+
+    def refresh_exchange_rules(self, symbols: list[str] | tuple[str, ...] | set[str] | None = None) -> dict[str, SymbolExchangeRules]:
+        wanted = {item.upper() for item in symbols} if symbols is not None else None
+        payload = self.http_client.request("GET", f"{self.base_url}/fapi/v1/exchangeInfo")
+        loaded: dict[str, SymbolExchangeRules] = {}
+        for item in payload.get("symbols", []):
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol or (wanted is not None and symbol not in wanted):
+                continue
+            loaded[symbol] = SymbolExchangeRules.from_exchange_info(symbol, item)
+        self.exchange_rules_by_symbol.update(loaded)
+        return loaded
+
+    def fetch_signed_account_snapshot(self, symbol: str | None = None) -> dict[str, Any]:
+        symbol_param = {"symbol": symbol.upper()} if symbol else None
+        account = self._signed_get("/fapi/v2/account")
+        positions = self._signed_get("/fapi/v2/positionRisk", symbol_param)
+        open_orders = self._signed_get("/fapi/v1/openOrders", symbol_param)
+        return {
+            "environment": self.environment,
+            **_now_stamps(),
+            "account": redact_sensitive_testnet_fields(account),
+            "positions": redact_sensitive_testnet_fields(positions),
+            "open_orders": redact_sensitive_testnet_fields(open_orders),
+        }
+
+    def reconcile_open_orders(self, open_orders: list[dict[str, Any]]) -> dict[str, Any]:
+        remote_client_ids = {str(order.get("clientOrderId")) for order in open_orders if order.get("clientOrderId")}
+        unknown_local_ids = [str(event.get("client_order_id")) for event in self.fills if event.get("status") == "submitted_unknown" and event.get("client_order_id")]
+        matched = [client_id for client_id in unknown_local_ids if client_id in remote_client_ids]
+        missing = [client_id for client_id in unknown_local_ids if client_id not in remote_client_ids]
+        return {
+            "environment": self.environment,
+            **_now_stamps(),
+            "unknown_local_count": len(unknown_local_ids),
+            "matched_open_order_client_ids": matched,
+            "missing_unknown_client_ids": missing,
+        }
+
+    def _build_client_order_id(self, symbol: str) -> str:
+        sequence = len(self.fills) + self.submitted_order_count + self.accepted_order_count + 1
+        return f"{self.client_order_id_prefix}-{sequence}"
+
+    def _append_order_journal(self, event: dict[str, Any]) -> None:
+        if not self.order_journal_path:
+            return
+        path = pathlib.Path(self.order_journal_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = redact_sensitive_testnet_fields(event)
+        params = record.get("request", {}).get("params") if isinstance(record, dict) else None
+        if isinstance(params, dict):
+            params.pop("signature", None)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _confirm_order_by_client_order_id(self, symbol: str, client_order_id: str) -> Any:
+        return self._signed_get("/fapi/v1/order", {"symbol": symbol.upper(), "origClientOrderId": client_order_id})
+
+    def _signed_get(self, path: str, params: Mapping[str, Any] | None = None) -> Any:
+        signed_params = self._sign_params({**(dict(params or {})), "timestamp": int(datetime.now(UTC).timestamp() * 1000)})
+        query = urllib.parse.urlencode(signed_params)
+        return self.http_client.request("GET", f"{self.base_url}{path}?{query}", headers={"X-MBX-APIKEY": self.credentials.api_key})
 
     def get_account_state(self) -> dict[str, Any]:
         return {

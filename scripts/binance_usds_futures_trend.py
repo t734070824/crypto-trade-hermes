@@ -1876,6 +1876,10 @@ def run_testnet_trading_cycle(
     max_daily_loss: float = 100.0,
     max_order_count: int = 10,
     kill_switch: bool = False,
+    testnet_http_client: Any | None = None,
+    order_journal_path: str | os.PathLike[str] | None = None,
+    refresh_exchange_rules: bool = True,
+    sync_account_state: bool = False,
 ) -> dict[str, Any]:
     """Run one shared trading cycle with Binance USDS-M futures testnet adapter.
 
@@ -1906,17 +1910,26 @@ def run_testnet_trading_cycle(
     broker_kwargs: dict[str, Any] = {
         "credentials": resolve_binance_testnet_credentials(),
         "dry_run": dry_run,
-        "risk_limits": TestnetRiskLimits(
-            max_order_notional=max_order_notional,
-            max_symbol_exposure=max_symbol_exposure,
-            max_daily_loss=max_daily_loss,
-            max_order_count=max_order_count,
-            kill_switch=kill_switch,
+        "risk_limits": TestnetRiskLimits.from_config(
+            {
+                "max_order_notional": max_order_notional,
+                "max_symbol_exposure": max_symbol_exposure,
+                "max_daily_loss": max_daily_loss,
+                "max_order_count": max_order_count,
+                "kill_switch": kill_switch,
+            }
         ),
     }
+    if testnet_http_client is not None:
+        broker_kwargs["http_client"] = testnet_http_client
+    if order_journal_path is not None:
+        broker_kwargs["order_journal_path"] = str(order_journal_path)
     if testnet_base_url:
         broker_kwargs["base_url"] = testnet_base_url
     broker = BinanceTestnetBroker(**broker_kwargs)
+    if refresh_exchange_rules:
+        broker.refresh_exchange_rules(selected_symbols)
+    account_sync_before = broker.fetch_signed_account_snapshot(selected_symbols[0]) if sync_account_state and selected_symbols else None
     cycle = run_trading_cycle(
         TradingCycleConfig(
             symbols=selected_symbols,
@@ -1940,6 +1953,23 @@ def run_testnet_trading_cycle(
         risk_manager=FunctionRiskManager(),
         execution_engine=PaperIntentExecutionEngine(),
     )
+    if sync_account_state and selected_symbols:
+        account_sync_after = broker.fetch_signed_account_snapshot(selected_symbols[0])
+        open_orders = account_sync_after.get("open_orders", []) if isinstance(account_sync_after, dict) else []
+        reconciliation = broker.reconcile_open_orders(open_orders if isinstance(open_orders, list) else [])
+        cycle["testnet_account_sync"] = {
+            "environment": "testnet",
+            "before": account_sync_before,
+            "after": account_sync_after,
+            "reconciliation": reconciliation,
+        }
+        cycle["runtime_record"].setdefault("execution_events", {})["testnet_account_sync"] = {
+            "before_open_orders_count": len(account_sync_before.get("open_orders", [])) if isinstance(account_sync_before, dict) else 0,
+            "after_open_orders_count": len(open_orders) if isinstance(open_orders, list) else 0,
+            "unknown_local_count": reconciliation.get("unknown_local_count", 0),
+            "matched_open_order_client_ids": reconciliation.get("matched_open_order_client_ids", []),
+            "missing_unknown_client_ids": reconciliation.get("missing_unknown_client_ids", []),
+        }
     return _attach_cycle_runtime_record_receipt(
         cycle,
         runtime_record_file=runtime_record_file,
@@ -2031,6 +2061,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--testnet-max-daily-loss", type=float, default=100.0, help="Max testnet daily loss before rejection")
     parser.add_argument("--testnet-max-order-count", type=int, default=10, help="Max testnet accepted order count per cycle")
     parser.add_argument("--testnet-kill-switch", action="store_true", help="Reject all testnet execution before signing/submission")
+    parser.add_argument("--testnet-risk-config-file", help="Optional JSON testnet risk config; supports max_* limits and kill_switch")
+    parser.add_argument("--testnet-order-journal-file", help="Append-only JSONL order journal for signed testnet submissions")
+    parser.add_argument("--testnet-sync-account-state", action="store_true", help="Fetch signed testnet account/position/open-order snapshots before and after the cycle")
     parser.add_argument("--strategy-version", default="ema50_ema200_atr_trend_paper", help="Strategy version label stored in v1.3 runtime evidence")
     parser.add_argument("--config-version", default="default", help="Config version label stored in v1.3 runtime evidence")
     parser.add_argument("--no-save-runtime-record", action="store_true", help="Build runtime evidence without appending --runtime-record-file")
@@ -2169,6 +2202,27 @@ def main(argv: list[str] | None = None) -> int:
                 symbols = [part.strip().upper() for part in args.symbols.split(",") if part.strip()]
             else:
                 symbols = [args.symbol.upper()]
+            try:
+                from scripts.binance_trend_core.brokers import TestnetRiskLimits
+            except ModuleNotFoundError:
+                from binance_trend_core.brokers import TestnetRiskLimits
+            risk_config: dict[str, Any] = {
+                "max_order_notional": args.testnet_max_order_notional,
+                "max_symbol_exposure": args.testnet_max_symbol_exposure,
+                "max_daily_loss": args.testnet_max_daily_loss,
+                "max_order_count": args.testnet_max_order_count,
+                "kill_switch": args.testnet_kill_switch,
+            }
+            if args.testnet_risk_config_file:
+                loaded_risk_config = json.loads(Path(args.testnet_risk_config_file).read_text(encoding="utf-8"))
+                if not isinstance(loaded_risk_config, dict):
+                    raise ValueError("--testnet-risk-config-file must contain a JSON object")
+                risk_config.update(loaded_risk_config)
+            risk_limits = TestnetRiskLimits.from_config(
+                risk_config,
+                kill_switch_env="BINANCE_TESTNET_KILL_SWITCH",
+                kill_switch_file="state/binance-usds-futures-testnet.kill",
+            )
             cycle = run_testnet_trading_cycle(
                 symbols=symbols,
                 interval=args.interval,
@@ -2181,13 +2235,15 @@ def main(argv: list[str] | None = None) -> int:
                 risk_unit=args.risk_unit,
                 testnet_base_url=args.testnet_base_url,
                 dry_run=not args.testnet_submit_signed,
-                max_order_notional=args.testnet_max_order_notional,
-                max_symbol_exposure=args.testnet_max_symbol_exposure,
-                max_daily_loss=args.testnet_max_daily_loss,
-                max_order_count=args.testnet_max_order_count,
-                kill_switch=args.testnet_kill_switch,
+                max_order_notional=risk_limits.max_order_notional,
+                max_symbol_exposure=risk_limits.max_symbol_exposure,
+                max_daily_loss=risk_limits.max_daily_loss,
+                max_order_count=risk_limits.max_order_count,
+                kill_switch=risk_limits.kill_switch,
+                order_journal_path=args.testnet_order_journal_file,
+                sync_account_state=args.testnet_sync_account_state,
             )
-            print(json.dumps({"ok": not bool(cycle["errors"]), "testnet_cycle": cycle}, ensure_ascii=False, indent=2))
+            print(json.dumps({"ok": not bool(cycle["errors"]), "testnet_risk_limits": risk_limits.sanitized_summary(), "testnet_cycle": cycle}, ensure_ascii=False, indent=2))
             return 0 if not cycle["errors"] else 1
 
         if args.all_symbols or args.symbols:
