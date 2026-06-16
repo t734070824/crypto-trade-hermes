@@ -11,7 +11,7 @@
       "model": null,
       "provider": null,
       "base_url": null,
-      "script": "scripts/binance_usds_futures_testnet_hourly.sh",
+      "script": "binance_usds_futures_testnet_hourly.sh",
       "no_agent": false,
       "context_from": null,
       "schedule": {

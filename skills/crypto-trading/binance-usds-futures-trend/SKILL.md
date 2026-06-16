@@ -393,6 +393,7 @@ Confirm:
 
 45. **Ignoring zero-position symbols with open algo orders.** A selected symbol can have zero position but residual TP/SL algo orders. Post-run verification should report this as a stale/orphan-protection anomaly rather than treating it as normal protection. See `references/session-v1.26-single-agent-cron-artifact-and-budget-audit.md`.
 46. **Treating atomic add-on quantity as blindly additive.** In this codebase, strategy `position_size` is target total exposure, not “buy this much more”. For existing-position atomic groups, refresh signed account state and replan from `desired_exposure - current_exposure` before signing. If the account already equals the target, emit no duplicate add-on and report it as delta-only reconciliation / duplicate-add prevention. For add-on replans, avoid re-emitting duplicate protective SL/TP bundles; preserve intact bundles for true new entries. See `references/session-v1.27-stale-atomic-addon-replanning.md`.
+47. **Misconfiguring Hermes cron script paths.** In this profile, cron `script` values are resolved relative to the profile `scripts/` directory. For `scripts/binance_usds_futures_testnet_hourly.sh`, the job must store `script: "binance_usds_futures_testnet_hourly.sh"`, not `"scripts/binance_usds_futures_testnet_hourly.sh"`; the latter resolves to `scripts/scripts/...` and blocks before trading.
 
 ## References
 
