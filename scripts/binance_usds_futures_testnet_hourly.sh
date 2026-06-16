@@ -5,4 +5,4 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "${REPO_ROOT}"
-python3 scripts/binance_usds_futures_testnet_hourly.py --dry-run "$@"
+python3 scripts/binance_usds_futures_testnet_hourly.py "$@"
