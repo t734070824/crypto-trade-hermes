@@ -2,6 +2,10 @@
 
 Created: UTC 2026-06-15 15:44:10 / 北京时间（UTC+8）2026-06-15 23:44:10
 
+## Status
+
+Implemented: UTC 2026-06-16 00:21:00 / 北京时间（UTC+8）2026-06-16 08:21:00
+
 ## Goal
 
 实现第一版 shared trading loop，并用 `PaperBroker` 跑 paper；paper 不再只是独立 scanner，而是 broker adapter 上的同一套执行循环。

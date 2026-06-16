@@ -1871,6 +1871,23 @@ def run_paper_trading_cycle(
     return cycle
 
 
+def replay_runtime_evidence(
+    runtime_record_file: str | os.PathLike[str],
+    max_drawdown_worsening_limit: float = 0.03,
+) -> dict[str, Any]:
+    """Run v1.6 strategy-evolution diagnostics from recorded runtime JSONL only."""
+    try:
+        from scripts.binance_trend_core.evolution import compare_runtime_strategy_variants, load_runtime_records
+    except ModuleNotFoundError:
+        from binance_trend_core.evolution import compare_runtime_strategy_variants, load_runtime_records
+
+    records = load_runtime_records(Path(runtime_record_file))
+    return compare_runtime_strategy_variants(
+        records,
+        max_drawdown_worsening_limit=max_drawdown_worsening_limit,
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Binance USDS futures paper trend decision")
     parser.add_argument("--symbol", default="BTCUSDT", help="USDS futures symbol in configured universe")
@@ -1894,6 +1911,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backtest", action="store_true", help="Run v0.9 paper-only historical backtest instead of current scan/decision")
     parser.add_argument("--compare-refinements", action="store_true", help="Run v1.0 paper-only evidence-based strategy refinement comparison")
     parser.add_argument("--run-paper-cycle", action="store_true", help="Run v1.5 shared trading loop with PaperBroker simulated fills")
+    parser.add_argument("--replay-runtime-evidence", action="store_true", help="Run v1.6 strategy evolution replay from recorded runtime evidence JSONL")
     parser.add_argument("--initial-equity", type=float, default=10_000.0, help="Paper initial equity per symbol for backtest/cycle")
     parser.add_argument("--fee-bps", type=float, default=4.0, help="Paper transaction fee in basis points for backtest turnover")
     parser.add_argument("--max-position-size", type=float, default=1.0, help="Max paper long exposure per symbol for backtest")
@@ -1910,9 +1928,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     try:
-        selected_modes = [bool(args.compare_refinements), bool(args.backtest), bool(args.run_paper_cycle)]
+        selected_modes = [bool(args.compare_refinements), bool(args.backtest), bool(args.run_paper_cycle), bool(args.replay_runtime_evidence)]
         if sum(selected_modes) > 1:
-            raise ValueError("choose only one mode: --compare-refinements, --backtest, or --run-paper-cycle")
+            raise ValueError("choose only one mode: --compare-refinements, --backtest, --run-paper-cycle, or --replay-runtime-evidence")
+        if args.replay_runtime_evidence:
+            if not args.runtime_record_file:
+                raise ValueError("--replay-runtime-evidence requires --runtime-record-file")
+            if args.state_file:
+                raise ValueError("--state-file is for scan state only; omit it for --replay-runtime-evidence")
+            if args.lifecycle_file:
+                raise ValueError("--lifecycle-file is for scan lifecycle only; omit it for --replay-runtime-evidence")
+            if args.telegram_brief:
+                raise ValueError("--telegram-brief is for scan briefings only; omit it for --replay-runtime-evidence")
+            evolution = replay_runtime_evidence(
+                args.runtime_record_file,
+                max_drawdown_worsening_limit=args.max_drawdown_worsening_limit,
+            )
+            print(json.dumps({"ok": not bool(evolution["errors_count"]), "runtime_evolution": evolution}, ensure_ascii=False, indent=2))
+            return 0 if not evolution["errors_count"] else 1
+
         if args.compare_refinements:
             if args.backtest:
                 raise ValueError("choose only one mode: --compare-refinements or --backtest")

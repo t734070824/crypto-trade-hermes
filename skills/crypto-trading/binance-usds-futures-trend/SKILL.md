@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when developing or operating the crypto-trade-hermes Binance USDS-M futures trend Skill. Current code provides paper-only signal, lifecycle, backtest, and diagnostic tools from free >=1h data; future work must evolve it into a real-time trading engine where paper/testnet/live share strategy, state, risk, and execution interfaces.
-version: 1.5.0
+version: 1.6.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -24,7 +24,7 @@ The intended architecture is **Skill-driven real-time trading**:
 - only the broker/fill adapter and environment configuration should change;
 - paper mode is a safety/testing adapter, not a separate report-style scanner product.
 
-Current implementation status: the CLI is still **paper-only**, but v1.5 adds the first shared trading loop wired to `PaperBroker` simulated fills. It can generate trend signals, multi-symbol rankings, paper allocations, lifecycle diagnostics, runtime evidence records, backtests, refinement comparisons, Telegram briefs, and a `--run-paper-cycle` path that runs signal → strategy → risk → execution → broker → runtime evidence on one loop. It does **not** place signed Binance orders. Treat existing scan/lifecycle/runtime-recording code as reusable signal, state, and evidence modules while the project is refactored toward a shared real-time trading engine.
+Current implementation status: the CLI is still **paper-only**, but v1.5 adds the first shared trading loop wired to `PaperBroker` simulated fills, and v1.6 adds runtime-evidence replay diagnostics for strategy evolution. It can generate trend signals, multi-symbol rankings, paper allocations, lifecycle diagnostics, runtime evidence records, backtests, refinement comparisons, Telegram briefs, a `--run-paper-cycle` path that runs signal → strategy → risk → execution → broker → runtime evidence on one loop, and a `--replay-runtime-evidence` path that compares candidate variants on identical recorded runtime inputs. It does **not** place signed Binance orders. Treat existing scan/lifecycle/runtime-recording code as reusable signal, state, and evidence modules while the project is refactored toward a shared real-time trading engine.
 
 ## User Constraints
 
@@ -93,6 +93,7 @@ Current paper-only capabilities:
 
 - lightweight core realtime interface package under `scripts/binance_trend_core/`;
 - v1.5 shared paper trading loop via `scripts.binance_trend_core.loop.run_trading_cycle` and `PaperBroker` simulated fills;
+- v1.6 runtime evidence replay via `scripts.binance_trend_core.evolution` and CLI `--replay-runtime-evidence`;
 - single-symbol trend decision from free K-lines;
 - full-universe or selected-symbol scan;
 - multi-timeframe confirmation, usually `1h,4h,1d`;
@@ -156,6 +157,12 @@ Evidence-based refinement comparison:
 scripts/binance_usds_futures_trend.py --compare-refinements --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 500
 ```
 
+Runtime-evidence strategy evolution replay:
+
+```bash
+scripts/binance_usds_futures_trend.py --replay-runtime-evidence --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl
+```
+
 Telegram diagnostic brief wrapper:
 
 ```bash
@@ -204,6 +211,7 @@ Current outputs are diagnostic contracts for paper mode:
 - `paper_lifecycle` / `lifecycle_change`: paper lifecycle state and intent changes;
 - `runtime_record`: append-only paper runtime evidence schema for future strategy evolution;
 - `paper_cycle`: v1.5 shared loop output containing signals, intents, desired orders, simulated fills, portfolio state, and runtime evidence;
+- `runtime_evolution`: v1.6 replay report comparing strategy variants on identical recorded runtime evidence, with no default promotion;
 - `backtest`: paper historical performance diagnostics;
 - `refinement`: paper-only baseline/candidate comparison;
 - `summary_zh` or `--telegram-brief`: compact Chinese summaries with UTC and 北京时间（UTC+8） labels.
@@ -245,10 +253,11 @@ Current priority is documentation and architecture alignment, then implementatio
 3. Design shared realtime interfaces: `Strategy`, `RiskManager`, `PortfolioState`, `LifecycleManager`, `ExecutionEngine`, `BrokerAdapter`.
 4. Design the runtime data schema before implementing the first trading loop, including signals, decisions, risk checks, fills, state transitions, errors, and performance snapshots.
 5. Use `PaperBroker` and the shared `run_trading_cycle` loop to run simulated fills while recording runtime evidence.
-6. Add Binance futures testnet adapter using signed endpoints and isolated testnet credentials/config.
-7. Add live adapter only after testnet validation, explicit risk caps, kill switch, audit logs, runtime evidence review, and user approval.
-8. Keep Telegram output as observability around the real trading loop, not as the source of trading state.
-9. Use recorded runtime data to evaluate and evolve future strategy variants before promotion.
+6. Use `StrategyEvolution` / `--replay-runtime-evidence` to compare candidate variants on recorded runtime evidence before promotion.
+7. Add Binance futures testnet adapter using signed endpoints and isolated testnet credentials/config.
+8. Add live adapter only after testnet validation, explicit risk caps, kill switch, audit logs, runtime evidence review, and user approval.
+9. Keep Telegram output as observability around the real trading loop, not as the source of trading state.
+10. Use recorded runtime data to evaluate and evolve future strategy variants before promotion.
 
 Do not add more report-only paper features unless they directly support the shared realtime engine, runtime data collection, strategy evolution, or diagnostics around it.
 
@@ -281,7 +290,15 @@ For code or behavior edits, additionally run:
 python3 -m unittest tests/test_binance_usds_futures_trend.py -v
 scripts/binance_usds_futures_trend.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --intervals 1h,4h,1d --limit 240 --context-limit 30 --top 3 --portfolio-risk-budget 3 --max-symbol-risk 1 --state-file state/binance-usds-futures-trend-paper-state.json --lifecycle-file state/binance-usds-futures-trend-paper-lifecycle.json --no-save-state --no-save-lifecycle
 scripts/binance_usds_futures_trend.py --run-paper-cycle --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl --no-save-runtime-record
+scripts/binance_usds_futures_trend.py --run-paper-cycle --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --runtime-record-file /tmp/binance-v16-runtime.jsonl
+scripts/binance_usds_futures_trend.py --replay-runtime-evidence --runtime-record-file /tmp/binance-v16-runtime.jsonl
 ```
+
+Before committing or pushing repo changes:
+
+- inspect `git status` and exclude runtime noise such as `cron/jobs.json`, `state/*`, logs, caches, and temporary files;
+- get an independent agent review of the staged diff or final diff;
+- resolve review findings, re-check the final diff, then commit and push by default when the work is complete.
 
 Confirm:
 
@@ -309,6 +326,7 @@ Confirm:
 12. **Forgetting timezone labels.** Any time-related output or report must explicitly label UTC or 北京时间（UTC+8）.
 13. **Mixing environments.** Future paper, testnet, and live adapters must isolate credentials, balances, order IDs, fills, and state files while sharing core interfaces.
 14. **Failing to preserve runtime evidence.** Strategy evolution must be based on recorded run data, not subjective impressions from Telegram summaries or isolated backtests.
+15. **Replaying with fresh samples.** v1.6 runtime-evidence replay must not fetch new K-lines; all variants must share the same captured input fingerprint.
 
 ## References
 
@@ -330,6 +348,7 @@ Historical workflow notes are intentionally kept out of the main operational pat
 - `references/session-v1.3-runtime-recorder-implementation.md` — implementation and verification workflow for the paper runtime JSONL recorder.
 - `references/session-v1.4-core-interface-extraction.md` — implementation and verification workflow for extracting shared realtime core interfaces while preserving paper-only CLI behavior.
 - `references/session-v1.5-shared-paper-loop.md` — implementation and verification workflow for the shared trading loop and PaperBroker simulated fills.
+- `references/session-v1.6-runtime-evidence-strategy-evolution.md` — implementation and verification workflow for replaying runtime evidence to compare strategy variants.
 
 Tracked plans:
 

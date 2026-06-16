@@ -31,6 +31,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             "scripts.binance_trend_core.execution",
             "scripts.binance_trend_core.brokers",
             "scripts.binance_trend_core.runtime",
+            "scripts.binance_trend_core.evolution",
             "scripts.binance_trend_core.loop",
         ]
         for module_name in module_names:
@@ -272,6 +273,129 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertFalse(cycle["runtime_record_saved"])
         self.assertFalse(runtime_path.exists())
         self.assertGreaterEqual(cycle["runtime_record"]["execution_events"]["simulated_fills_count"], 1)
+
+    def test_runtime_evidence_loader_rejects_records_without_schema_environment_or_timestamps(self):
+        evolution = importlib.import_module("scripts.binance_trend_core.evolution")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = pathlib.Path(tmpdir) / "bad-runtime.jsonl"
+            path.write_text(json.dumps({"environment": "paper", "generated_at_utc": "u", "generated_at_beijing": "b"}) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "schema_version"):
+                evolution.load_runtime_records(path)
+
+            path.write_text(json.dumps({"schema_version": "runtime.v1", "environment": "paper", "generated_at_utc": "u"}) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "generated_at_beijing"):
+                evolution.load_runtime_records(path)
+
+    def test_runtime_evidence_loader_rejects_short_intervals(self):
+        evolution = importlib.import_module("scripts.binance_trend_core.evolution")
+        record = self._runtime_replay_records([0.01])[0]
+        record["intervals"] = ["5m"]
+        record["market_inputs"] = {"symbols": ["BTCUSDT"], "primary_interval": "5m"}
+        with self.assertRaisesRegex(ValueError, "short interval"):
+            evolution.build_runtime_replay_dataset([record])
+
+    def test_runtime_evidence_loader_rejects_short_market_input_intervals_even_with_valid_top_level_interval(self):
+        evolution = importlib.import_module("scripts.binance_trend_core.evolution")
+        record = self._runtime_replay_records([0.01])[0]
+        record["intervals"] = ["1h"]
+        record["market_inputs"] = {"symbols": ["BTCUSDT"], "primary_interval": "5m", "intervals": ["5m"]}
+        with self.assertRaisesRegex(ValueError, "short interval"):
+            evolution.build_runtime_replay_dataset([record])
+
+    def test_runtime_evidence_loader_rejects_short_signal_intervals(self):
+        evolution = importlib.import_module("scripts.binance_trend_core.evolution")
+        record = self._runtime_replay_records([0.01])[0]
+        record["signals"][0]["interval"] = "5m"
+        with self.assertRaisesRegex(ValueError, "short interval"):
+            evolution.build_runtime_replay_dataset([record])
+
+    def test_runtime_replay_uses_identical_captured_inputs_for_all_variants(self):
+        evolution = importlib.import_module("scripts.binance_trend_core.evolution")
+        records = self._runtime_replay_records([-0.02, 0.03])
+
+        dataset = evolution.build_runtime_replay_dataset(records)
+        report = evolution.compare_runtime_strategy_variants(records)
+
+        fingerprints = {item["captured_input_fingerprint"] for item in report["variants"]}
+        self.assertEqual(fingerprints, {dataset["captured_input_fingerprint"]})
+        self.assertEqual(report["selection_policy"]["auto_promote_defaults"], False)
+        self.assertIn("BTCUSDT", dataset["symbols"])
+
+    def test_runtime_evolution_drawdown_guardrail_blocks_higher_return_candidate(self):
+        evolution = importlib.import_module("scripts.binance_trend_core.evolution")
+        records = self._runtime_replay_records([-0.20, 0.50])
+
+        report = evolution.compare_runtime_strategy_variants(records, max_drawdown_worsening_limit=0.02)
+        trend_hold = next(item for item in report["variants"] if item["variant"] == "trend_hold_bias")
+        baseline = next(item for item in report["variants"] if item["variant"] == "baseline")
+
+        self.assertGreater(trend_hold["metrics"]["return_proxy"], baseline["metrics"]["return_proxy"])
+        self.assertFalse(trend_hold["eligible"])
+        self.assertIn("drawdown_guardrail", trend_hold["guardrail_flags"])
+        self.assertEqual(report["selected_variant"], "baseline")
+
+    def test_runtime_evolution_report_includes_time_labels_and_no_default_promotion(self):
+        evolution = importlib.import_module("scripts.binance_trend_core.evolution")
+        report = evolution.compare_runtime_strategy_variants(self._runtime_replay_records([0.01, 0.02]))
+
+        self.assertEqual(report["mode"], "paper")
+        self.assertIn("generated_at_utc", report)
+        self.assertIn("generated_at_beijing", report)
+        self.assertIn("北京时间（UTC+8）", report["summary_zh"])
+        self.assertFalse(report["selection_policy"]["auto_promote_defaults"])
+        self.assertFalse(report["defaults_changed"])
+
+    def test_cli_can_replay_runtime_evidence_jsonl_without_fetching_new_samples(self):
+        records = self._runtime_replay_records([0.01, 0.02])
+        original_fetch_klines = getattr(trend, "fetch_klines")
+        def fail_fetch(*args, **kwargs):
+            raise AssertionError("runtime replay must not fetch live samples")
+        setattr(trend, "fetch_klines", fail_fetch)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = pathlib.Path(tmpdir) / "runtime.jsonl"
+                path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc = trend.main(["--replay-runtime-evidence", "--runtime-record-file", str(path)])
+        finally:
+            setattr(trend, "fetch_klines", original_fetch_klines)
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["runtime_evolution"]["records_loaded"], len(records))
+        self.assertFalse(payload["runtime_evolution"]["selection_policy"]["auto_promote_defaults"])
+
+    def _runtime_replay_records(self, return_proxies):
+        records = []
+        for index, return_proxy in enumerate(return_proxies):
+            records.append(
+                {
+                    "schema_version": "runtime.v1",
+                    "environment": "paper",
+                    "run_id": f"fixture-{index}",
+                    "generated_at_utc": f"2026-06-15T0{index}:00:00+00:00",
+                    "generated_at_beijing": f"2026-06-15T0{index + 8}:00:00+08:00",
+                    "symbol_universe": ["BTCUSDT"],
+                    "intervals": ["1h"],
+                    "market_inputs": {"symbols": ["BTCUSDT"], "primary_interval": "1h"},
+                    "signals": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "interval": "1h",
+                            "action": "hold_long",
+                            "position_size": 1.0,
+                            "rank_score": 10.0,
+                            "trend_strength": 5.0,
+                            "return_proxy": return_proxy,
+                        }
+                    ],
+                    "execution_events": {"real_orders_submitted": False},
+                    "outcomes": {"errors_count": 0, "return_proxy_by_symbol": {"BTCUSDT": return_proxy}},
+                }
+            )
+        return records
 
     def test_rejects_short_intervals_below_one_hour(self):
         for interval in ["1m", "5m", "10m", "15m", "30m"]:

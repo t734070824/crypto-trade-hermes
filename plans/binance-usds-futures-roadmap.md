@@ -199,15 +199,15 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 - `RuntimeRecorder` wrapper 对齐 v1.3 runtime evidence builder/writer；
 - 保持现有 CLI JSON contract：`mode=paper`、`portfolio_allocation`、`paper_lifecycle` 不变。
 
-### v1.5 — Shared Trading Loop + PaperBroker 🟡
+### v1.5 — Shared Trading Loop + PaperBroker ✅
 
-**Status:** planned in `plans/binance-usds-futures-trend-v1.5.md`.
+**Status:** implemented in current v1.5 change set: shared `run_trading_cycle`, `TradingCycleConfig`, `PaperBroker` simulated fills, CLI `--run-paper-cycle`, and runtime evidence output.
 
 **Goal:** 用同一套 trading loop 跑 paper，并通过 `PaperBroker` 生成模拟 fill / execution events。
 
-### v1.6 — Strategy Evolution from Runtime Evidence 🟡
+### v1.6 — Strategy Evolution from Runtime Evidence ✅
 
-**Status:** planned in `plans/binance-usds-futures-trend-v1.6.md`.
+**Status:** implemented in current v1.6 change set: runtime JSONL loader, replay dataset fingerprint, runtime evidence variant comparison, drawdown guardrail, and CLI `--replay-runtime-evidence`.
 
 **Goal:** 基于 recorded runtime evidence replay/comparison 候选策略，禁止凭感觉或漂移样本调参。
 
@@ -235,7 +235,7 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 ## Default Next Step
 
-当前默认下一步：**推进 v1.4 Core Interface Extraction，把现有 scanner/lifecycle/backtest 能力拆成 shared realtime engine 接口，然后继续 v1.5 PaperBroker shared loop → v1.6 runtime evidence 策略进化。**
+当前默认下一步：**v1.7 Binance Futures Testnet Adapter 仍为锁定状态；只有在用户明确授权 testnet signed execution 后，才开始设计/实现 testnet adapter。未授权前继续收集 paper runtime evidence，并用 v1.6 replay 评估策略候选。**
 
 除非用户明确改变优先级，否则后续继续按本文件顺序推进；v1.7 testnet 与 v2.0 live 均需单独授权。
 
