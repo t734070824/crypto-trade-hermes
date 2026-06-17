@@ -366,8 +366,9 @@ Canonical current references:
 - `references/session-v1.31-pause-reset-after-manual-position-clear.md` — pause/reset workflow after manual testnet position clearing, including evidence archiving and UTC/北京时间（UTC+8） verification.
 - `references/session-v1.32-prompt-vs-cli-boundary.md` — distinguish prompt prose, fixed CLI flags, and actual engine code paths.
 - `references/session-v1.33-skill-boundary-curation.md` — curation checklist for keeping deterministic hourly cron ownership, Skill-library references, and memory/profile preferences aligned.
-- `references/session-v1.35-cagr-plan-current-chain-review.md` — checklist for reviewing CAGR/hold-style optimization plans against the current chain: account-risk sizing already exists, `position_size` is target total exposure, hourly hot path is script-owned `no_agent=true`, and replay promotion must use real runtime/order-journal evidence.
 - `references/session-v1.34-trimming-memory-user-skill.md` — compact checklist for trimming MEMORY/USER/SKILL together without dropping durable trading constraints or executable CLI boundaries.
+- `references/session-v1.35-cagr-plan-current-chain-review.md` — checklist for reviewing CAGR/hold-style optimization plans against the current chain: account-risk sizing already exists, `position_size` is target total exposure, hourly hot path is script-owned `no_agent=true`, and replay promotion must use real runtime/order-journal evidence.
+- `references/session-v1.36-runtime-evidence-bootstrap-and-cron-resume.md` — when runtime/order-journal files are empty, first restore and verify cron evidence collection before doing CAGR bottleneck analysis or strategy optimization.
 - `references/session-v1.22-account-risk-sizing-cap-diagnosis.md` — diagnosing account-risk sizing that is dominated by fixed max-order/max-symbol exposure caps.
 - `references/session-v1.24-testnet-order-budget-and-postrun-reconstruction.md` — order-count budget lesson for entry + stop + TP tranches and safe post-run reconstruction.
 - `references/session-v1.25-testnet-cron-endpoint-and-order-budget-audit.md` — strict testnet endpoint arguments and order-budget enforcement.
