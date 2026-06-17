@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when developing or operating the crypto-trade-hermes Binance USDS-M futures trend Skill. Current code supports paper diagnostics/shared paper cycles, runtime-evidence replay, and a hardened testnet adapter; future work must preserve shared strategy, state, risk, lifecycle, execution, and evidence paths across paper/testnet/live.
-version: 1.10.0
+version: 1.11.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -74,6 +74,7 @@ Future work should converge on these components:
 10. `StrategyEvolution` — compares future strategy variants against recorded runtime evidence before promoting changes.
 11. `Observability` — compact Telegram reports and logs around the same trading loop, not a separate decision path.
 12. `PostRunSummary` — summarize signed testnet runs from runtime JSONL, order journals, replay JSON, and a fresh signed snapshot when CLI stdout is truncated or too verbose.
+13. `ClosedOrderAnalysis` — normalize ended order-journal lifecycle records into `closed_order.v1` samples for loss attribution, risk-rebalance analysis, execution quality, and Skill/strategy evolution.
 
 Architectural invariant: paper/testnet/live must share strategy, risk, lifecycle, state, execution orchestration, and runtime data schema. Divergence belongs only inside broker adapters and environment config.
 
@@ -91,6 +92,7 @@ Current paper/testnet capabilities:
 - v1.5 shared paper trading loop via `scripts.binance_trend_core.loop.run_trading_cycle` and `PaperBroker` simulated fills;
 - v1.6 runtime evidence replay via `scripts.binance_trend_core.evolution` and CLI `--replay-runtime-evidence`;
 - v1.9-hardened Binance futures testnet adapter via `BinanceTestnetBroker` and CLI `--run-testnet-cycle`: dry-run default, explicit signed-testnet flag, exchangeInfo order rules, account/order sync helpers, clientOrderId/order journal, signed order lifecycle polling, trade/PnL/slippage accounting, risk config, and redaction;
+- closed-order analysis via `--analyze-closed-orders`, which reads ended testnet order-journal lifecycle records and emits `closed_order.v1` / `closed_order_analysis.v1` evidence for loss attribution and strategy evolution;
 - single-symbol trend decision from free K-lines;
 - testnet signed account snapshots that reconcile positions, ordinary open orders, and open algo orders used for TP/SL protection;
 - full-universe or selected-symbol scan;
@@ -171,6 +173,12 @@ Runtime-evidence strategy evolution replay:
 scripts/binance_usds_futures_trend.py --replay-runtime-evidence --runtime-record-file state/binance-usds-futures-trend-runtime.jsonl
 ```
 
+Closed testnet order/loss attribution analysis from the local order journal:
+
+```bash
+scripts/binance_usds_futures_trend.py --analyze-closed-orders --testnet-order-journal-file state/binance-usds-futures-trend-testnet-orders.jsonl
+```
+
 Operational cron pattern:
 
 - **Hourly testnet hot path:** when BTC/Alt groups, endpoints, risk parameters, runtime files, and report fields are fixed, use a deterministic `no_agent=true` script-owned cron. In this mode the script owns credential checks, signed preflight, account/position/open-order/open-algo reconciliation, gated signed testnet cycles, lifecycle/fill evidence, post-cycle snapshots, bounded stabilization, runtime/order-journal writes, secret redaction, and the final Chinese stdout summary. Prompt and skills do not execute in `no_agent=true`; stdout is delivered verbatim.
@@ -230,6 +238,7 @@ Current outputs are diagnostic contracts for paper mode:
 - `paper_cycle`: v1.5 shared loop output containing signals, intents, desired orders, simulated fills, portfolio state, and runtime evidence;
 - `testnet_cycle`: v1.9 shared loop output using `BinanceTestnetBroker`; dry-run by default with testnet environment markers, exchangeInfo/risk-rule evidence, optional signed account sync, optional signed order lifecycle/trade/PnL/slippage evidence, and redacted request evidence;
 - `runtime_evolution`: v1.6 replay report comparing strategy variants on identical recorded runtime evidence, with no default promotion;
+- `closed_order_analysis`: `closed_order_analysis.v1` report derived from local order journal ended-order lifecycle records, including standardized `closed_order.v1` samples, UTC/北京时间（UTC+8） labels, PnL/slippage/fee fields, close-reason attribution, and strategy-evolution input tags;
 - `backtest`: paper historical performance diagnostics;
 - `refinement`: paper-only baseline/candidate comparison;
 - `summary_zh` or `--telegram-brief`: compact Chinese summaries with UTC and 北京时间（UTC+8） labels.
@@ -346,7 +355,7 @@ Confirm:
 11. **Using fixed quantity as the primary sizing model.** `risk_unit` is a legacy/default floor for startup probes. Production testnet sizing should be based on equity × account-risk fraction, target leverage, exchange min/step/notional rules, current signed position, max symbol exposure, max order notional, max daily loss, and delta-only execution.
 12. **Misreading risk-resized reductions as trend exits.** When a cron run submits `SELL MARKET` for an existing long, first check whether the signal is still `hold_long` and whether account-risk sizing lowered the target total position because ATR/stop distance changed. A negative `desired_exposure - current_exposure` is a rebalance, not automatically a bearish/flat strategy decision. See `references/session-v1.41-testnet-delta-rebalance-and-entry-budget.md`.
 13. **Treating target position as additive quantity.** Strategy `position_size` means target total exposure, not “buy this much more”. Replan from `desired_exposure - current_exposure`; if existing exposure already equals target, emit no duplicate add-on.
-14. **Using the same protection target for SL and TP during reductions.** Stop-loss should remain fail-closed against `max(current_exposure, desired_exposure)` so a failed reduction is still protected, but take-profit coverage must track `desired_exposure`; same-price overcovered TP legs need cancel/replace, and flat targets should cancel remaining TP protection rather than leave orphan reduce-only legs.
+14. **Using the same protection target for SL and TP during reductions.** Stop-loss should remain fail-closed against `max(current_exposure, desired_exposure)` so a failed reduction is still protected, but take-profit coverage must track `desired_exposure`; same-price overcovered TP legs need cancel/replace, and flat targets should cancel remaining TP protection rather than leave orphan reduce-only legs. See `references/session-v1.42-tp-replan-and-cron-runtime-template.md`.
 15. **Under-budgeting order count for tranche plans.** Entry + stop-loss + multiple take-profit legs can exceed low `--testnet-max-order-count`. A BTC empty-position atomic entry with one stop-loss and two take-profit legs requires at least 4 order slots (`entry + SL + TP1 + TP2`); configure/test the group budget accordingly before expecting the strategy to enter. Enforce the per-cycle order budget before signing the ordered plan; treat `exchange_confirmed_count > max_order_count` as a risk-control defect. Distinguish this from Binance `minQty`/`MIN_NOTIONAL` rejections: after the budget is fixed, dry-run or signed evidence may still reject tiny symbols for exchange-rule sizing reasons, which is a separate sizing issue.
 16. **Expanding symbols without exchange minimum checks.** Binance Futures Testnet has per-symbol `minQty`, `stepSize`, and `MIN_NOTIONAL`. Dry-run against `exchangeInfo`, group symbols by compatible quantity floors, and keep notional/order-count limits explicit.
 17. **Losing canonical evidence files.** Operational cron evidence should use `state/binance-usds-futures-trend-testnet-runtime.jsonl` and `state/binance-usds-futures-trend-testnet-orders.jsonl`. Reconcile near-miss legacy files when found, but prevent mismatches by passing file flags explicitly.
@@ -358,7 +367,7 @@ Confirm:
 23. **Replaying with fresh samples.** Runtime-evidence replay must not fetch new K-lines; all variants must share captured input fingerprints.
 24. **Overstating diagnostics.** Paper scans, backtests, and refinement comparisons are evidence, not live performance proof.
 25. **Mixing environments or leaking state.** Keep paper/testnet/live credentials, balances, order IDs, fills, and state files isolated. Do not commit `state/*.json`, account/order/fill state, cron output, raw signed payloads, API keys, or secret values.
-26. **Committing scheduler runtime noise.** Hermes cron may rewrite counters and timestamps in `cron/jobs.json`; exclude runtime-only changes from staging before review, commit, and push. Do not blindly `git restore cron/jobs.json` while enabled cron jobs are active: restoring a tracked stale `next_run_at` can make the scheduler classify the job as missed and fast-forward the next run instead of executing the current scheduled tick.
+26. **Committing scheduler runtime noise.** Hermes cron may rewrite counters and timestamps in `cron/jobs.json`; prefer ignoring live `/cron/jobs.json` and tracking a sanitized `cron/jobs.template.json` without `next_run_at`, `last_run_at`, status/error, completed-repeat, `updated_at`, or origin chat identifiers. Exclude runtime-only changes from staging before review, commit, and push. Do not blindly `git restore cron/jobs.json` while enabled cron jobs are active: restoring a tracked stale `next_run_at` can make the scheduler classify the job as missed and fast-forward the next run instead of executing the current scheduled tick. See `references/session-v1.42-tp-replan-and-cron-runtime-template.md`.
 27. **Creating an extra run while diagnosing timing.** `cronjob(action="run")` and `hermes cron run` intentionally enqueue an immediate run on the next scheduler tick. If the user asks why a notification arrived at an odd minute, inspect existing job state and `cron/output/` only; do not trigger another run unless explicitly requested with execution-now intent such as “手动运行”, “立即运行”, “触发一次”, “run it now”, or “trigger once”. Do not treat generic words like “run result”, “运行结果”, or “runtime evidence” as authorization to execute.
 28. **Skipping independent review or timezone labels.** This repo requires independent agent review before push, and every time-related output must label UTC or 北京时间（UTC+8）.
 
@@ -378,6 +387,7 @@ Canonical current references:
 - `references/session-v1.39-testnet-protection-reconciliation.md` — durable root causes and regression pattern for group-scoped protection reports plus Binance conditional algo order `submitted_unknown` confirmation/reconciliation via `clientAlgoId` and `open_algo_orders`.
 - `references/session-v1.40-external-crypto-quant-skills-review.md` — comparison of external crypto/quant agent skills and frameworks; keep VectorBT/Hummingbot/AiCoin/Senpi ideas as references while excluding external trading skills from the deterministic testnet hot path.
 - `references/session-v1.41-testnet-delta-rebalance-and-entry-budget.md` — read-only audit pattern for explaining a specific hourly testnet decision: distinguish hold_long risk-resized reductions from trend exits, fixed hourly group scope from full-universe scans, and skipped entries caused by atomic entry/protection order-budget limits.
+- `references/session-v1.42-tp-replan-and-cron-runtime-template.md` — regression pattern for splitting SL vs TP protection targets during reductions and treating live `cron/jobs.json` as ignored scheduler runtime state with a sanitized tracked template.
 - `references/session-v1.22-account-risk-sizing-cap-diagnosis.md` — diagnosing account-risk sizing that is dominated by fixed max-order/max-symbol exposure caps.
 - `references/session-v1.24-testnet-order-budget-and-postrun-reconstruction.md` — order-count budget lesson for entry + stop + TP tranches and safe post-run reconstruction.
 - `references/session-v1.25-testnet-cron-endpoint-and-order-budget-audit.md` — strict testnet endpoint arguments and order-budget enforcement.

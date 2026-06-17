@@ -17,3 +17,5 @@ crypto-trade-hermes 运行过程中必须记录运行时数据；未来会基于
 crypto-trade-hermes 定时任务边界：小时级 testnet 热路径由 no_agent=true 的 script-owned cron 确定性执行；每日 runtime replay 诊断由 agent 型只读任务负责，分析 runtime evidence 和订单 journal，不下单、不取消订单、不泄露密钥。
 §
 crypto-trade-hermes 的当前仓位语义是：strategy 产出的 position_size 表示目标总持仓，由账户可用保证金/权益与止损距离计算；执行层用 current_exposure 与 desired_exposure 做 delta-only reconciliation，因此已有持仓不会自动再加，除非新的目标总仓位高于当前仓位且增量超过交易所最小下单约束。
+§
+crypto-trade-hermes 中已结束/亏损订单应作为带归因标签的 runtime evidence 使用：记录交易所最终成交/结束状态，聚合为 closed trades，分析 strategy/risk/execution/protection/testnet anomaly 归因，再决定是否修代码、调整策略候选或沉淀到 Skill。

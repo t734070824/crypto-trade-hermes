@@ -1170,6 +1170,221 @@ def append_runtime_record(path: str | os.PathLike[str], record: dict[str, Any]) 
     return {"path": str(runtime_path), "records_written": 1}
 
 
+def _load_jsonl_records(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    jsonl_path = Path(path)
+    with jsonl_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"line {line_number}: invalid JSONL record: {exc}") from exc
+            if not isinstance(item, dict):
+                raise ValueError(f"line {line_number}: JSONL record must be an object")
+            records.append(item)
+    return records
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _dict_field(record: dict[str, Any], key: str) -> dict[str, Any]:
+    value = record.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _final_order_status(record: dict[str, Any]) -> str:
+    order = _dict_field(record, "order")
+    return str(record.get("current_status") or record.get("status") or order.get("status") or "UNKNOWN").upper()
+
+
+def _order_side(record: dict[str, Any], submission: dict[str, Any] | None = None) -> str:
+    source = submission or record
+    order = _dict_field(record, "order")
+    instruction = _dict_field(source, "instruction")
+    return str(record.get("side") or order.get("side") or instruction.get("side") or "UNKNOWN").upper()
+
+
+def _order_type(record: dict[str, Any], submission: dict[str, Any] | None = None) -> str:
+    source = submission or record
+    order = _dict_field(record, "order")
+    instruction = _dict_field(source, "instruction")
+    return str(record.get("order_type") or order.get("origType") or order.get("type") or instruction.get("order_type") or "UNKNOWN").upper()
+
+
+def _instruction_metadata(record: dict[str, Any], submission: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = submission or record
+    instruction = _dict_field(source, "instruction")
+    metadata = instruction.get("metadata")
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _infer_position_effect(side: str, status: str) -> str:
+    if status not in {"FILLED", "PARTIALLY_FILLED"}:
+        return "no_position_change"
+    if side == "SELL":
+        return "reduce_or_close_long"
+    if side == "BUY":
+        return "increase_or_open_long"
+    return "unknown"
+
+
+def _infer_close_reason(order_type: str, side: str, status: str, metadata: dict[str, Any]) -> str:
+    protection_role = str(metadata.get("protection_role") or "").lower()
+    action = str(metadata.get("action") or "").lower()
+    delta_exposure = _safe_float(metadata.get("delta_exposure"), 0.0)
+    if status == "CANCELED":
+        return "canceled_or_replanned"
+    if status == "REJECTED":
+        return "rejected"
+    if status == "EXPIRED":
+        return "expired"
+    if "stop_loss" in protection_role or order_type in {"STOP_MARKET", "STOP"}:
+        return "stop_loss"
+    if "take_profit" in protection_role or order_type in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}:
+        return "take_profit"
+    if side == "SELL" and action == "hold_long" and delta_exposure < 0:
+        return "risk_rebalance_reduction"
+    if side == "SELL" and action in {"flat", "exit"}:
+        return "strategy_exit"
+    if side == "SELL":
+        return "manual_or_unclassified_reduction"
+    return "non_closing_or_opening_order"
+
+
+def _closed_order_analysis_flags(realized_pnl: float, net_pnl: float, slippage_bps: float, close_reason: str, status: str) -> list[str]:
+    flags: list[str] = []
+    is_closing_sample = close_reason != "non_closing_or_opening_order"
+    if realized_pnl < 0 or (is_closing_sample and net_pnl < 0):
+        flags.append("loss_sample")
+    if abs(slippage_bps) >= 10:
+        flags.append("slippage_sample")
+    if close_reason == "risk_rebalance_reduction":
+        flags.append("risk_sizing_sample")
+    if close_reason in {"stop_loss", "take_profit"}:
+        flags.append("protection_policy_sample")
+    if status in {"REJECTED", "EXPIRED"}:
+        flags.append("execution_anomaly_sample")
+    return flags
+
+
+def _strategy_evolution_inputs(closed_orders: list[dict[str, Any]]) -> list[str]:
+    inputs: set[str] = set()
+    for order in closed_orders:
+        reason = order.get("close_reason")
+        flags = set(order.get("analysis_flags") or [])
+        if reason == "risk_rebalance_reduction":
+            inputs.add("risk_sizing_or_rebalance")
+        if reason == "stop_loss":
+            inputs.add("stop_policy")
+        if reason == "take_profit":
+            inputs.add("take_profit_policy")
+        if "slippage_sample" in flags:
+            inputs.add("execution_quality")
+        if "loss_sample" in flags:
+            inputs.add("loss_attribution")
+        if reason in {"canceled_or_replanned", "rejected", "expired"}:
+            inputs.add("execution_or_protection_reconciliation")
+    return sorted(inputs)
+
+
+def analyze_closed_orders(order_journal_file: str | os.PathLike[str]) -> dict[str, Any]:
+    """Normalize ended testnet order lifecycle records into strategy-evolution evidence."""
+    records = _load_jsonl_records(order_journal_file)
+    submissions_by_client_id: dict[str, dict[str, Any]] = {}
+    for record in records:
+        client_order_id = record.get("client_order_id")
+        if client_order_id and record.get("event_type") != "order_lifecycle":
+            submissions_by_client_id[str(client_order_id)] = record
+
+    closed_orders: list[dict[str, Any]] = []
+    for record in records:
+        status = _final_order_status(record)
+        if status not in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
+            continue
+        order_payload = _dict_field(record, "order")
+        client_order_id = str(record.get("client_order_id") or order_payload.get("clientOrderId") or "")
+        submission = submissions_by_client_id.get(client_order_id)
+        side = _order_side(record, submission)
+        order_type = _order_type(record, submission)
+        metadata = _instruction_metadata(record, submission)
+        fills_summary = _dict_field(record, "fills_summary")
+        realized_pnl = round(_safe_float(fills_summary.get("realized_pnl")), 8)
+        fees = round(_safe_float(fills_summary.get("fees")), 8)
+        net_pnl = round(_safe_float(fills_summary.get("net_pnl"), realized_pnl - fees), 8)
+        fill_quantity = round(_safe_float(fills_summary.get("fill_quantity") or order_payload.get("executedQty") or record.get("quantity")), 8)
+        average_fill_price = round(_safe_float(fills_summary.get("average_fill_price") or order_payload.get("avgPrice")), 8)
+        slippage_bps = round(_safe_float(fills_summary.get("slippage_bps")), 8)
+        close_reason = _infer_close_reason(order_type, side, status, metadata)
+        closed_order = {
+            "schema_version": "closed_order.v1",
+            "environment": record.get("environment", (submission or {}).get("environment", "unknown")),
+            "symbol": str(record.get("symbol") or order_payload.get("symbol") or (submission or {}).get("symbol") or "UNKNOWN").upper(),
+            "client_order_id": client_order_id,
+            "order_id": record.get("order_id") or order_payload.get("orderId"),
+            "side": side,
+            "order_type": order_type,
+            "status": status,
+            "position_effect": _infer_position_effect(side, status),
+            "close_reason": close_reason,
+            "quantity": fill_quantity,
+            "average_fill_price": average_fill_price,
+            "realized_pnl": realized_pnl,
+            "fees": fees,
+            "net_pnl": net_pnl,
+            "slippage_bps": slippage_bps,
+            "trade_count": int(_safe_float(fills_summary.get("trade_count"), 0.0)),
+            "opened_or_submitted_at_utc": (submission or {}).get("generated_at_utc"),
+            "opened_or_submitted_at_beijing": (submission or {}).get("generated_at_beijing"),
+            "closed_at_utc": record.get("generated_at_utc"),
+            "closed_at_beijing": record.get("generated_at_beijing"),
+            "linked_signal_action": metadata.get("action"),
+            "current_exposure": metadata.get("current_exposure"),
+            "desired_exposure": metadata.get("desired_exposure"),
+        }
+        closed_order["analysis_flags"] = _closed_order_analysis_flags(realized_pnl, net_pnl, slippage_bps, close_reason, status)
+        closed_orders.append(closed_order)
+
+    by_reason: dict[str, int] = {}
+    by_symbol: dict[str, dict[str, Any]] = {}
+    for order in closed_orders:
+        reason = str(order["close_reason"])
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        symbol = str(order["symbol"])
+        symbol_summary = by_symbol.setdefault(symbol, {"orders": 0, "realized_pnl": 0.0, "net_pnl": 0.0, "loss_count": 0})
+        symbol_summary["orders"] += 1
+        symbol_summary["realized_pnl"] = round(float(symbol_summary["realized_pnl"]) + float(order["realized_pnl"]), 8)
+        symbol_summary["net_pnl"] = round(float(symbol_summary["net_pnl"]) + float(order["net_pnl"]), 8)
+        if "loss_sample" in order.get("analysis_flags", []):
+            symbol_summary["loss_count"] += 1
+
+    report = {
+        "schema_version": "closed_order_analysis.v1",
+        "environment": sorted({str(order.get("environment")) for order in closed_orders}) or [],
+        **now_stamps(),
+        "source_order_journal_file": str(order_journal_file),
+        "orders_loaded": len(closed_orders),
+        "loss_count": sum(1 for order in closed_orders if "loss_sample" in order.get("analysis_flags", [])),
+        "total_realized_pnl": round(sum(float(order["realized_pnl"]) for order in closed_orders), 8),
+        "total_net_pnl": round(sum(float(order["net_pnl"]) for order in closed_orders), 8),
+        "by_close_reason": by_reason,
+        "by_symbol": by_symbol,
+        "strategy_evolution_inputs": _strategy_evolution_inputs(closed_orders),
+        "closed_orders": closed_orders,
+        "summary_zh": "已结束订单分析：将 FILLED/CANCELED/REJECTED/EXPIRED 订单标准化为 closed_order.v1，用于亏损归因、执行质量、风控 sizing 与保护单策略演进；不会自动修改策略默认参数。",
+        "errors_count": 0,
+    }
+    return report
+
+
 def apply_runtime_record(
     scan: dict[str, Any],
     runtime_record_file: str | os.PathLike[str] | None = None,
@@ -2327,6 +2542,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-paper-cycle", action="store_true", help="Run v1.5 shared trading loop with PaperBroker simulated fills")
     parser.add_argument("--run-testnet-cycle", action="store_true", help="Run v1.7 shared trading loop with Binance futures testnet adapter")
     parser.add_argument("--replay-runtime-evidence", action="store_true", help="Run v1.6 strategy evolution replay from recorded runtime evidence JSONL")
+    parser.add_argument("--analyze-closed-orders", action="store_true", help="Analyze ended testnet order journal records into closed_order.v1 strategy-evolution evidence")
     parser.add_argument("--initial-equity", type=float, default=10_000.0, help="Paper initial equity per symbol for backtest/cycle")
     parser.add_argument("--fee-bps", type=float, default=4.0, help="Paper transaction fee in basis points for backtest turnover")
     parser.add_argument("--max-position-size", type=float, default=1.0, help="Max paper long exposure per symbol for backtest")
@@ -2358,9 +2574,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     try:
-        selected_modes = [bool(args.compare_refinements), bool(args.backtest), bool(args.run_paper_cycle), bool(args.run_testnet_cycle), bool(args.replay_runtime_evidence)]
+        selected_modes = [bool(args.compare_refinements), bool(args.backtest), bool(args.run_paper_cycle), bool(args.run_testnet_cycle), bool(args.replay_runtime_evidence), bool(args.analyze_closed_orders)]
         if sum(selected_modes) > 1:
-            raise ValueError("choose only one mode: --compare-refinements, --backtest, --run-paper-cycle, --run-testnet-cycle, or --replay-runtime-evidence")
+            raise ValueError("choose only one mode: --compare-refinements, --backtest, --run-paper-cycle, --run-testnet-cycle, --replay-runtime-evidence, or --analyze-closed-orders")
+        if args.analyze_closed_orders:
+            if not args.testnet_order_journal_file:
+                raise ValueError("--analyze-closed-orders requires --testnet-order-journal-file")
+            if args.runtime_record_file:
+                raise ValueError("--runtime-record-file is not used by --analyze-closed-orders")
+            if args.state_file:
+                raise ValueError("--state-file is for scan state only; omit it for --analyze-closed-orders")
+            if args.lifecycle_file:
+                raise ValueError("--lifecycle-file is for scan lifecycle only; omit it for --analyze-closed-orders")
+            if args.telegram_brief:
+                raise ValueError("--telegram-brief is for scan briefings only; omit it for --analyze-closed-orders")
+            analysis = analyze_closed_orders(args.testnet_order_journal_file)
+            print(json.dumps({"ok": not bool(analysis["errors_count"]), "closed_order_analysis": analysis}, ensure_ascii=False, indent=2))
+            return 0 if not analysis["errors_count"] else 1
         if args.replay_runtime_evidence:
             if not args.runtime_record_file:
                 raise ValueError("--replay-runtime-evidence requires --runtime-record-file")

@@ -4003,6 +4003,106 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertIn("paper only", payload["backtest"]["summary_zh"])
         self.assertNotRegex(stdout.getvalue().lower(), r"(api_key|secret|signed|live_order|order_id)")
 
+    def test_closed_order_analysis_classifies_losing_risk_rebalance_from_journal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = pathlib.Path(tmpdir) / "orders.jsonl"
+            submission = {
+                "environment": "testnet",
+                "generated_at_utc": "2026-06-17T07:05:18+00:00",
+                "generated_at_beijing": "2026-06-17T15:05:18+08:00",
+                "client_order_id": "hermes-ETHUSDT-reduce-1",
+                "symbol": "ETHUSDT",
+                "side": "SELL",
+                "order_type": "MARKET",
+                "quantity": 0.151,
+                "reference_price": 1778.12,
+                "instruction": {
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "quantity": 0.151,
+                    "order_type": "MARKET",
+                    "metadata": {
+                        "action": "hold_long",
+                        "current_exposure": 0.5,
+                        "desired_exposure": 0.349,
+                        "delta_exposure": -0.151,
+                        "position_reconciliation": True,
+                    },
+                },
+                "status": "submitted",
+            }
+            lifecycle = {
+                "event_type": "order_lifecycle",
+                "environment": "testnet",
+                "generated_at_utc": "2026-06-17T08:37:09+00:00",
+                "generated_at_beijing": "2026-06-17T16:37:09+08:00",
+                "symbol": "ETHUSDT",
+                "client_order_id": "hermes-ETHUSDT-reduce-1",
+                "order_id": 12345,
+                "current_status": "FILLED",
+                "lifecycle_state": "filled",
+                "fills_summary": {
+                    "fill_quantity": 0.151,
+                    "average_fill_price": 1767.57,
+                    "realized_pnl": -10.47659378,
+                    "fees": 0.24675277,
+                    "net_pnl": -10.72334655,
+                    "slippage_bps": 59.332,
+                    "trade_count": 1,
+                },
+                "order": {"symbol": "ETHUSDT", "side": "SELL", "origType": "MARKET", "status": "FILLED", "executedQty": "0.151", "avgPrice": "1767.57"},
+                "trades": [{"side": "SELL", "qty": "0.151", "price": "1767.57", "realizedPnl": "-10.47659378", "commission": "0.24675277"}],
+            }
+            journal_path.write_text(json.dumps(submission) + "\n" + json.dumps(lifecycle) + "\n", encoding="utf-8")
+
+            report = trend.analyze_closed_orders(journal_path)
+
+        self.assertEqual(report["schema_version"], "closed_order_analysis.v1")
+        self.assertEqual(report["orders_loaded"], 1)
+        self.assertEqual(report["loss_count"], 1)
+        self.assertEqual(report["total_realized_pnl"], -10.47659378)
+        order = report["closed_orders"][0]
+        self.assertEqual(order["schema_version"], "closed_order.v1")
+        self.assertEqual(order["symbol"], "ETHUSDT")
+        self.assertEqual(order["side"], "SELL")
+        self.assertEqual(order["position_effect"], "reduce_or_close_long")
+        self.assertEqual(order["close_reason"], "risk_rebalance_reduction")
+        self.assertIn("loss_sample", order["analysis_flags"])
+        self.assertIn("risk_sizing_or_rebalance", report["strategy_evolution_inputs"])
+
+    def test_cli_can_emit_closed_order_analysis_from_order_journal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = pathlib.Path(tmpdir) / "orders.jsonl"
+            journal_path.write_text(
+                json.dumps(
+                    {
+                        "event_type": "order_lifecycle",
+                        "environment": "testnet",
+                        "generated_at_utc": "2026-06-17T08:37:09+00:00",
+                        "generated_at_beijing": "2026-06-17T16:37:09+08:00",
+                        "symbol": "ETHUSDT",
+                        "client_order_id": "hermes-ETHUSDT-stop-1",
+                        "order_id": 12345,
+                        "current_status": "FILLED",
+                        "fills_summary": {"fill_quantity": 0.349, "average_fill_price": 1767.57, "realized_pnl": -10.47659378, "fees": 0.24675277, "net_pnl": -10.72334655, "slippage_bps": 0.0, "trade_count": 1},
+                        "order": {"symbol": "ETHUSDT", "side": "SELL", "origType": "STOP_MARKET", "status": "FILLED"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = trend.main(["--analyze-closed-orders", "--testnet-order-journal-file", str(journal_path)])
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["closed_order_analysis"]["orders_loaded"], 1)
+        self.assertEqual(payload["closed_order_analysis"]["closed_orders"][0]["close_reason"], "stop_loss")
+        self.assertIn("generated_at_utc", payload["closed_order_analysis"])
+        self.assertIn("generated_at_beijing", payload["closed_order_analysis"])
+
     def test_fetch_market_context_uses_free_usds_futures_endpoints(self):
         calls = []
 
