@@ -141,6 +141,7 @@ Cron-specific cleanup before committing `cron/jobs.json`:
 
 Staged-diff review and follow-up cleanup:
 - Independent review approval applies only to the exact staged diff that was reviewed. If you patch files after a failed review, re-stage and rerun review before committing.
+- For Skill-library reference/index pushes, inspect both modified `SKILL.md` index lines and every new/modified `references/*.md` file before review. Verify that every indexed reference file exists, durable constraints are not weakened, and reference ordering is logical (usually chronological by session/version) unless there is an explicit reason to group differently.
 - If a reviewed commit/push succeeds but `git status` reveals new untracked skill/reference files or runtime scheduler noise, handle them in a follow-up pass instead of leaving the repo dirty: revert pure runtime noise, and either commit durable skill/reference knowledge through a new reviewed diff or deliberately remove it if it is truly transient.
 - For plans created under ignored `.hermes/plans/`, mirror durable plans into the tracked `plans/` directory when the repository policy says `plans/` changes should be committed. Do not assume an ignored `.hermes/` file satisfies the repo's tracked planning workflow.
 
