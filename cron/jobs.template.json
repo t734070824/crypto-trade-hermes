@@ -1,0 +1,72 @@
+{
+  "jobs": [
+    {
+      "id": "f7201d6c1c57",
+      "name": "testnet-agent-hourly",
+      "prompt": "你是 crypto-trade-hermes 的固定 script-owned Binance USDS-M Futures testnet hourly job。该任务由脚本独立完成，prompt/skills 在 no_agent=true 时不参与执行。",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "binance_usds_futures_testnet_hourly.sh",
+      "no_agent": true,
+      "context_from": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "5 * * * *",
+        "display": "5 * * * *"
+      },
+      "schedule_display": "5 * * * *",
+      "repeat": {
+        "times": null
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-06-16T10:28:23.299240+08:00",
+      "deliver": "telegram",
+      "enabled_toolsets": null,
+      "workdir": "/root/.hermes/profiles/crypto-trade-hermes",
+      "profile": null
+    },
+    {
+      "id": "4666a4cbbdf8",
+      "name": "replay-diagnostics-daily",
+      "prompt": "你是 crypto-trade-hermes 的每日 runtime replay 诊断 agent。不要创建、修改、暂停、删除任何 cron job。\n\n目标：每 24h 对 Binance USDS-M Futures testnet runtime evidence 做一次 replay 诊断，判断最近运行证据是否支持当前策略继续运行，是否出现数据/保护单/生命周期/提交状态异常，以及是否需要人工介入。\n\n必须遵守：\n- 只做诊断与报告；不要下单、不要运行 signed testnet cycle、不要调用任何会产生订单/取消订单的命令。\n- 不输出、不读取展示 LALA_KEY / LALA_SECRET 的值；如果需要提及，只报告 present/missing。\n- 所有时间必须同时标注 UTC 和 北京时间（UTC+8）。\n- 禁止使用 <1h 周期。\n- 不要发送 Telegram/send_message；cron 会自动投递最终回复。\n\n工作目录：/root/.hermes/profiles/crypto-trade-hermes。\n\n建议步骤：\n1. 确认当前 UTC 与 北京时间（UTC+8）。\n2. 检查 runtime evidence 文件是否存在：state/binance-usds-futures-trend-testnet-runtime.jsonl。\n3. 运行 replay 诊断：\n   `python3 scripts/binance_usds_futures_trend.py --replay-runtime-evidence --runtime-record-file state/binance-usds-futures-trend-testnet-runtime.jsonl`\n4. 如 replay 输出 JSON，解析并只总结安全字段：baseline/candidate/selected/guardrail/errors、样本数量、符号/周期、异常类型。\n5. 可只读检查最近 order journal：state/binance-usds-futures-trend-testnet-orders.jsonl；重点统计 submitted_unknown、rejected、submitted/confirmed、生命周期/fill 相关安全摘要，不输出签名 URL、headers、signature 或完整 raw JSON。\n6. 给出中文简报：\n   - 诊断时间：UTC / 北京时间（UTC+8）\n   - evidence 文件是否存在、记录数/最近记录时间（如可安全解析）\n   - replay 结论：当前 selected 策略、guardrail 是否触发、错误/异常\n   - 订单/生命周期健康度：submitted_unknown/rejected 是否需要人工介入\n   - 下一步建议：继续运行 / 需要检查保护单 / 需要暂停人工处理\n\n如果文件缺失或 JSON 解析失败，明确报告 blocker，不要编造诊断结果。",
+      "skills": [
+        "binance-usds-futures-trend"
+      ],
+      "skill": "binance-usds-futures-trend",
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": null,
+      "no_agent": false,
+      "context_from": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "37 18 * * *",
+        "display": "37 18 * * *"
+      },
+      "schedule_display": "37 18 * * *",
+      "repeat": {
+        "times": null
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-06-16T18:37:01.947934+08:00",
+      "deliver": "origin",
+      "enabled_toolsets": [
+        "terminal",
+        "file",
+        "skills"
+      ],
+      "workdir": "/root/.hermes/profiles/crypto-trade-hermes",
+      "profile": null
+    }
+  ]
+}

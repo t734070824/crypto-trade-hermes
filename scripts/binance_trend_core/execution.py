@@ -145,43 +145,46 @@ def _protective_orders(
 ) -> list[OrderInstruction]:
     if not isinstance(signal, dict):
         return []
-    target_exposure = max(float(desired_exposure or 0.0), float(current_exposure or 0.0))
-    if target_exposure <= 0:
+    stop_target_exposure = max(float(desired_exposure or 0.0), float(current_exposure or 0.0))
+    take_profit_target_exposure = max(0.0, float(desired_exposure or 0.0))
+    if stop_target_exposure <= 0 and take_profit_target_exposure <= 0:
         return []
     reference_price = _reference_price_from_signal(signal)
     stop_price = _positive_signal_price(signal.get("trailing_stop"))
     take_profit_1 = _positive_signal_price(signal.get("take_profit_1"))
     take_profit_2 = _positive_signal_price(signal.get("take_profit_2"))
     orders: list[OrderInstruction] = []
-    existing_stops = _open_protections(portfolio_state, symbol, "stop_loss", target_exposure=target_exposure)
+    existing_stops = _open_protections(portfolio_state, symbol, "stop_loss", target_exposure=stop_target_exposure)
     existing_stop = _tightest_long_stop(existing_stops)
     for stale_stop in existing_stops:
         if stale_stop is not existing_stop:
             orders.append(_cancel_algo_instruction(symbol, stale_stop, "stale_stop_loss_replacement"))
-    if stop_price is not None:
+    if stop_price is not None and stop_target_exposure > 0:
         existing_stop_price = _positive_signal_price((existing_stop or {}).get("triggerPrice") or (existing_stop or {}).get("stopPrice"))
         if existing_stop is None:
-            orders.append(_stop_loss_instruction(symbol, target_exposure, reference_price, stop_price, trailing_replacement=False))
+            orders.append(_stop_loss_instruction(symbol, stop_target_exposure, reference_price, stop_price, trailing_replacement=False))
         elif existing_stop_price is not None and stop_price > existing_stop_price:
             # Fail-closed: submit the tighter stop without cancelling the older, lower stop in
             # the same blind instruction plan.  A later cycle that sees both accepted stops will
             # cancel the stale lower stop, so replacement never creates a naked long position.
-            orders.append(_stop_loss_instruction(symbol, target_exposure, reference_price, stop_price, trailing_replacement=True))
+            orders.append(_stop_loss_instruction(symbol, stop_target_exposure, reference_price, stop_price, trailing_replacement=True))
     configured_layers = _configured_take_profit_layers(take_profit_1, take_profit_2)
-    stale_take_profits = _stale_take_profit_protections(portfolio_state, symbol, configured_layers, target_exposure)
+    stale_take_profits = _stale_take_profit_protections(portfolio_state, symbol, configured_layers, take_profit_target_exposure)
     stale_take_profit_keys = {_protection_key(item) for item in stale_take_profits}
     for stale_tp in stale_take_profits:
         orders.append(_cancel_algo_instruction(symbol, stale_tp, "stale_take_profit_replacement"))
-    existing_tp_coverage = _existing_take_profit_coverage(portfolio_state, symbol, target_exposure, excluded_keys=stale_take_profit_keys)
-    remaining_tp_exposure = max(0.0, target_exposure - existing_tp_coverage)
+    if take_profit_target_exposure <= 0:
+        return orders
+    existing_tp_coverage = _existing_take_profit_coverage(portfolio_state, symbol, take_profit_target_exposure, excluded_keys=stale_take_profit_keys)
+    remaining_tp_exposure = max(0.0, take_profit_target_exposure - existing_tp_coverage)
     if remaining_tp_exposure > 0:
         if take_profit_1 is None and take_profit_2 is not None:
-            coverage = _take_profit_coverage_at_price(portfolio_state, symbol, take_profit_2, target_exposure, excluded_keys=stale_take_profit_keys)
-            qty = min(max(0.0, target_exposure - coverage), remaining_tp_exposure)
+            coverage = _take_profit_coverage_at_price(portfolio_state, symbol, take_profit_2, take_profit_target_exposure, excluded_keys=stale_take_profit_keys)
+            qty = min(max(0.0, take_profit_target_exposure - coverage), remaining_tp_exposure)
             if qty > 0:
                 orders.append(_take_profit_instruction(symbol, qty, reference_price, take_profit_2, "take_profit_2"))
         else:
-            per_layer_qty = target_exposure / max(1, len(configured_layers))
+            per_layer_qty = take_profit_target_exposure / max(1, len(configured_layers))
             for role, price in configured_layers:
                 coverage = _take_profit_coverage_at_price(portfolio_state, symbol, price, per_layer_qty, excluded_keys=stale_take_profit_keys)
                 qty = min(max(0.0, per_layer_qty - coverage), remaining_tp_exposure)
@@ -381,14 +384,22 @@ def _stale_take_profit_protections(
 ) -> list[dict[str, Any]]:
     if not configured_layers:
         return _open_protections(portfolio_state, symbol, "take_profit", target_exposure=None)
+    if target_exposure <= 0:
+        return _open_protections(portfolio_state, symbol, "take_profit", target_exposure=None)
+    layer_target = target_exposure / max(1, len(configured_layers))
     stale: list[dict[str, Any]] = []
     for item in _open_protections(portfolio_state, symbol, "take_profit", target_exposure=None):
         existing_price = _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))
-        price_matches = existing_price is not None and any(
-            abs(existing_price - configured_price) <= max(1e-8, abs(configured_price) * 0.0001)
-            for _, configured_price in configured_layers
-        )
-        if not price_matches:
+        matching_layers = [
+            role
+            for role, configured_price in configured_layers
+            if existing_price is not None and abs(existing_price - configured_price) <= max(1e-8, abs(configured_price) * 0.0001)
+        ]
+        if not matching_layers:
+            stale.append(item)
+            continue
+        quantity = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
+        if layer_target > 0 and quantity is not None and quantity > layer_target * 1.001:
             stale.append(item)
     return stale
 

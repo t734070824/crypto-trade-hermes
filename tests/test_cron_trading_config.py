@@ -1,5 +1,6 @@
 import json
 import pathlib
+import subprocess
 import unittest
 from unittest import mock
 
@@ -11,10 +12,33 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 class TestnetAgentHourlyCronConfigTests(unittest.TestCase):
     def _testnet_agent_job(self) -> dict:
-        data = json.loads((REPO_ROOT / "cron" / "jobs.json").read_text(encoding="utf-8"))
+        data = json.loads((REPO_ROOT / "cron" / "jobs.template.json").read_text(encoding="utf-8"))
         matches = [job for job in data["jobs"] if job["name"] == "testnet-agent-hourly"]
         self.assertEqual(len(matches), 1)
         return matches[0]
+
+    def test_live_cron_jobs_file_is_runtime_state_not_git_tracked(self):
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", "cron/jobs.json"],
+            cwd=REPO_ROOT,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+
+        self.assertEqual(tracked, "")
+
+    def test_cron_template_omits_scheduler_runtime_fields(self):
+        data = json.loads((REPO_ROOT / "cron" / "jobs.template.json").read_text(encoding="utf-8"))
+        encoded = json.dumps(data)
+
+        self.assertNotIn("next_run_at", encoded)
+        self.assertNotIn("last_run_at", encoded)
+        self.assertNotIn("last_status", encoded)
+        self.assertNotIn("last_error", encoded)
+        self.assertNotIn("updated_at", encoded)
+        for job in data["jobs"]:
+            self.assertNotIn("completed", job.get("repeat", {}))
 
     def test_hourly_testnet_agent_is_script_owned_no_agent_job(self):
         job = self._testnet_agent_job()

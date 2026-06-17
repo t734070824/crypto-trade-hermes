@@ -130,7 +130,8 @@ git commit -m "chore: update profile state"
 git push
 ```
 
-Cron-specific cleanup before committing `cron/jobs.json`:
+Cron-specific cleanup before committing cron configuration:
+- Prefer keeping live `cron/jobs.json` as ignored runtime state and tracking a separate durable template such as `cron/jobs.template.json`. The template should contain job name, schedule, script/no_agent, skills/toolsets, deliver, workdir/profile, and prompt when durable, but omit scheduler runtime fields (`next_run_at`, `last_run_at`, `last_status`, `last_error`, root `updated_at`, and `repeat.completed`).
 - When the user asks for wall-clock-aligned schedules (e.g. “每小时 01 分钟”, “北京时间每天 00:05”, “整点运行”), use a cron expression (`1 * * * *`, `5 0 * * *`) rather than interval syntax (`every 60m`, `every 1440m`). Interval schedules anchor to creation/last-run time and drift away from natural clock boundaries. After updating, verify `next_run_at` includes the expected timezone/offset before committing.
 - For cron jobs that use a `script`, remember Hermes resolves relative script paths under the profile `scripts/` directory. If the actual file is `scripts/foo.sh`, store `script: "foo.sh"`, not `"scripts/foo.sh"`; the latter can resolve as `scripts/scripts/foo.sh` and fail with `ScriptNotFound`. See `references/session-v1.30-cron-script-relative-paths.md`.
 - `cronjob create/update/run/list` and background scheduler activity may rewrite scheduler runtime fields (`repeat.completed`, `next_run_at`, `last_run_at`, `last_status`, root `updated_at`), including after a commit/push has already succeeded. Treat unrelated changes to pre-existing jobs as runtime noise; normalize or revert them before staging unless the user explicitly asked to preserve the new runtime state.
@@ -168,3 +169,4 @@ git config user.email "hermes-agent@users.noreply.github.com"
 - `references/profile-config-visibility.md` — Hermes profile config keys for Telegram/gateway real-time tool progress and context-usage footer, plus the note that ignored `config.yaml` changes are local rather than pushed.
 - `references/profile-source-test-allowlist.md` — how to safely add project `scripts/` and `tests/` directories to a profile-root repository, including Python cache and Skills Hub cache ignore rules.
 - `references/session-v1.30-cron-script-relative-paths.md` — cron `script` path resolution under the profile `scripts/` directory and the `scripts/`-prefix pitfall.
+- `references/session-skill-reference-docs-push.md` — focused workflow for reviewing, committing, pushing, and post-push-cleaning Skill-library/reference-only diffs.
