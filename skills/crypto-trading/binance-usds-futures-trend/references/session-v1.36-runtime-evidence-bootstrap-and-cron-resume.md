@@ -54,6 +54,17 @@ Then verify the structured summary and evidence files:
 
 If a grouped hourly harness reports one cycle as `ok=false` without useful errors, do not immediately assume the runtime append path is broken. Retry once and isolate with the harness's per-group `run_cycle(..., dry_run=True)` or the underlying CLI using `--no-save-runtime-record` vs normal save. In the observed session, a first Alt-group failure was transient; a retry and direct `run_cycle()` calls both wrote runtime records correctly.
 
+## Evidence cleanup after manual safe-run
+
+Manual dry-run records are useful proof that evidence plumbing works, but they are not cron-produced baseline evidence. Before waiting for the next scheduled cron trigger, prefer archive + truncate:
+
+1. copy `state/binance-usds-futures-trend-testnet-runtime.jsonl` to an ignored archive path such as `state/archive/binance-usds-futures-trend-testnet-runtime.manual-dryrun.<UTC>.utc.<BEIJING>.bj.jsonl`;
+2. truncate the canonical runtime file back to `0 bytes / 0 lines`;
+3. leave `state/binance-usds-futures-trend-testnet-orders.jsonl` untouched if it is already `0 bytes / 0 lines` from dry-run;
+4. report archive path, archive bytes/lines, canonical runtime bytes/lines, order-journal bytes/lines, and UTC/北京时间（UTC+8） cleanup time.
+
+This keeps the subsequent 24h/72h cron evidence window clean while preserving manual verification evidence for audit.
+
 ## Planning correction
 
 When no runtime evidence exists yet, the correct sequence is:
