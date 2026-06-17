@@ -108,6 +108,14 @@ def test_hourly_harness_emits_compact_safe_json_and_skips_replay(capsys, monkeyp
         assert argv[argv.index("--interval") + 1] == "1h"
 
 
+def test_btc_group_order_budget_covers_atomic_entry_protection_group():
+    btc_group = next(group for group in hourly.GROUPS if group["key"] == "btc")
+
+    atomic_entry_protection_order_count = 4  # entry + stop loss + two take-profit tranches
+
+    assert int(btc_group["max_order_count"]) >= atomic_entry_protection_order_count
+
+
 def test_hourly_harness_stops_before_cycles_when_preflight_fails(capsys, monkeypatch):
     monkeypatch.delenv("LALA_KEY", raising=False)
     monkeypatch.delenv("LALA_SECRET", raising=False)

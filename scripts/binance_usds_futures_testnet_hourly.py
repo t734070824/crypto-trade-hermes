@@ -50,7 +50,7 @@ GROUPS = (
         "key": "btc",
         "symbols": ["BTCUSDT"],
         "risk_unit": "0.001",
-        "max_order_count": "3",
+        "max_order_count": "4",
     },
     {
         "name": "Alt组",
