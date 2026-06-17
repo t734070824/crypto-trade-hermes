@@ -1,4 +1,4 @@
-# Session v1.29: hourly postflight stabilization and single-agent ownership
+# Session v1.29: hourly postflight stabilization and explicit ownership
 
 ## What changed
 
@@ -6,9 +6,9 @@ A user questioned a Binance USDS-M testnet hourly report that completed in ~4 se
 
 ## Durable lessons
 
-- For the main testnet operational cron, one Skill-loaded agent should own the full flow:
+- For the main testnet operational cron, ownership must be explicit. In the current fixed hourly setup, the deterministic `no_agent=true` script owns:
   preflight → reconcile → cycle → postflight verification → summary.
-- Keep the daily runtime replay diagnostic separate and read-only.
+- Keep the daily runtime replay diagnostic separate, read-only, and agent-owned.
 - When real or attempted real submissions occur, add a short postflight stabilization window instead of treating the first snapshot as final.
 - Report `postflight_attempts` and `postflight_stabilization_seconds` so a short wall-clock run is not mistaken for a complete lifecycle.
 - Summaries should distinguish:

@@ -6,11 +6,11 @@ A user asked why a single agent cron could not handle the full testnet workflow 
 
 ## Durable lesson
 
-For this trading skill, the clean operational shape is:
+For this trading skill, the current clean operational shape is:
 
-- one agent-type hourly cron owns the end-to-end testnet trading flow;
+- one deterministic `no_agent=true` script-owned hourly cron owns the end-to-end testnet trading hot path when the logic is fully implemented in code;
 - the hourly hot path should focus on preflight, reconciliation, cycle execution, and post-cycle snapshotting;
-- runtime replay should usually live in a separate daily read-only analyzer cron.
+- runtime replay should usually live in a separate daily read-only agent analyzer cron.
 
 This reduces notification latency and makes timing easier to reason about.
 

@@ -14,8 +14,10 @@ Binance API 密钥值属于敏感信息；当前 profile .env 中变量名为 LA
 §
 crypto-trade-hermes 运行过程中必须记录运行时数据；未来会基于真实运行结果持续评估并进化策略。
 §
-用户强调 crypto-trade-hermes 的定时任务应服务于“用 Hermes Skills 构建 Binance USDS-M 合约实时交易”的总目标；偏好由一个加载 binance-usds-futures-trend Skill 的 agent 型 cron 处理 testnet 交易全流程，no_agent 脚本型 cron 只能定位为 runtime evidence collector。
+crypto-trade-hermes 的定时任务应服务于“用 Hermes Skills 构建 Binance USDS-M 合约实时交易”的总目标；当前边界是：小时级 testnet 热路径由 no_agent=true 的 script-owned cron 确定性执行，agent 型任务保留给每日只读 runtime replay 诊断、异常分析和策略演进。
 §
-crypto-trade-hermes 运营偏好：除 hourly testnet agent cron 外，用户要求每 24h 运行一次 agent 型 runtime replay 诊断，只读 replay runtime evidence 和订单 journal，报告异常/是否需人工介入，不下单、不取消订单、不泄露密钥。
+crypto-trade-hermes 运营偏好：小时级 testnet script-owned cron 负责确定性交易热路径；每 24h 运行一次 agent 型 runtime replay 诊断，只读 replay runtime evidence 和订单 journal，报告异常/是否需人工介入，不下单、不取消订单、不泄露密钥。
 §
 crypto-trade-hermes 的当前仓位语义是：strategy 产出的 position_size 表示‘目标总持仓’，由账户可用保证金/权益与止损距离计算；执行层用 current_exposure 与 desired_exposure 做 delta-only reconciliation，因此已有持仓不会自动再加，除非新的目标总仓位高于当前仓位且增量超过交易所最小下单约束。
+§
+crypto-trade-hermes 当前小时级 testnet 任务已切换为 no_agent=true 的 script-owned 模式；每日 runtime replay 诊断仍保留为 agent 型只读分析任务。

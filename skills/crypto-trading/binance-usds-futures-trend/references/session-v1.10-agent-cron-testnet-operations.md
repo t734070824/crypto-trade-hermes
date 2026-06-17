@@ -2,21 +2,21 @@
 
 ## Context
 
-The user challenged the split collector/analyzer approach with: “为什么不是 一个 agent 型定时任务 处理所有流程”. Treat this as an architectural preference for testnet operations when reasoning is required.
+The user challenged the split collector/analyzer approach with: “为什么不是 一个 agent 型定时任务 处理所有流程”. This was the earlier architectural preference for testnet operations when reasoning was required. The later boundary refined this: deterministic hourly execution should be script-owned, while agent mode should be reserved for analysis/reasoning.
 
 ## Durable lesson
 
-For Binance USDS-M futures testnet operations, a single agent-type cron with this Skill loaded is often the right default when the scheduled workflow must:
+For Binance USDS-M futures testnet operations, choose the owner explicitly. Use an agent-type cron with this Skill loaded when the scheduled workflow must reason about:
 
 - gather runtime evidence;
 - inspect current state and recent errors;
 - sync account/positions/orders from Binance Futures Testnet;
 - decide whether signed submission is safe;
-- run dry-run or signed testnet cycle according to gates;
+- propose or audit dry-run/signed testnet cycle decisions according to gates;
 - interpret credential/risk/API failures;
 - report next actions in Chinese with UTC and 北京时间（UTC+8） labels.
 
-Use `no_agent=true` scripts only for deterministic evidence collectors/watchdogs where no reasoning is wanted. Do not split the system into collector/analyzer/promoter cron jobs merely by habit; split only when reproducibility, cost, or isolation materially benefits from it.
+Use `no_agent=true` scripts for deterministic hot paths where no reasoning is wanted, including the current fixed hourly testnet runner when commands, risk parameters, endpoint guards, reconciliation, postflight checks, and report fields are all implemented in code. Do not split the system merely by habit, but also do not use an LLM when the script is the real owner.
 
 ## Signed testnet gate learned
 
