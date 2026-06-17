@@ -4003,6 +4003,177 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertIn("paper only", payload["backtest"]["summary_zh"])
         self.assertNotRegex(stdout.getvalue().lower(), r"(api_key|secret|signed|live_order|order_id)")
 
+    def test_daily_runtime_analysis_links_risk_rebalance_losses_to_hold_long_runtime_evidence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_path = pathlib.Path(tmpdir) / "runtime.jsonl"
+            order_journal_path = pathlib.Path(tmpdir) / "orders.jsonl"
+            runtime_record = {
+                "schema_version": "runtime.v1",
+                "environment": "testnet",
+                "generated_at_utc": "2026-06-17T08:00:00+00:00",
+                "generated_at_beijing": "2026-06-17T16:00:00+08:00",
+                "symbol_universe": ["ETHUSDT"],
+                "signals": [{"symbol": "ETHUSDT", "action": "hold_long", "primary_interval": "1h", "major_trend": "long", "close": 1800.0, "ema50": 1750.0, "ema200": 1600.0}],
+                "risk": {"account_risk_fraction": 0.01},
+                "execution_events": {
+                    "desired_orders": [
+                        {
+                            "symbol": "ETHUSDT",
+                            "side": "SELL",
+                            "order_type": "MARKET",
+                            "quantity": 0.151,
+                            "metadata": {"action": "hold_long", "current_exposure": 0.5, "desired_exposure": 0.349, "delta_exposure": -0.151},
+                        }
+                    ],
+                    "submitted_orders": [],
+                    "errors": [],
+                },
+                "outcomes": {"position_protection": {"unprotected_symbols": []}},
+            }
+            order_lifecycle = {
+                "event_type": "order_lifecycle",
+                "environment": "testnet",
+                "generated_at_utc": "2026-06-17T08:05:00+00:00",
+                "generated_at_beijing": "2026-06-17T16:05:00+08:00",
+                "symbol": "ETHUSDT",
+                "client_order_id": "hermes-ETHUSDT-reduce-1",
+                "current_status": "FILLED",
+                "fills_summary": {"fill_quantity": 0.151, "average_fill_price": 1767.57, "realized_pnl": -10.0, "fees": 0.2, "net_pnl": -10.2, "slippage_bps": 4.0, "trade_count": 1},
+                "order": {"symbol": "ETHUSDT", "side": "SELL", "origType": "MARKET", "status": "FILLED"},
+            }
+            # Link the lifecycle record back to the desired order metadata so the analyzer can distinguish a hold_long rebalance from a trend exit.
+            order_submission = {
+                "environment": "testnet",
+                "generated_at_utc": "2026-06-17T08:00:30+00:00",
+                "generated_at_beijing": "2026-06-17T16:00:30+08:00",
+                "symbol": "ETHUSDT",
+                "client_order_id": "hermes-ETHUSDT-reduce-1",
+                "side": "SELL",
+                "order_type": "MARKET",
+                "instruction": runtime_record["execution_events"]["desired_orders"][0],
+                "status": "submitted",
+            }
+            runtime_path.write_text(json.dumps(runtime_record) + "\n", encoding="utf-8")
+            order_journal_path.write_text(json.dumps(order_submission) + "\n" + json.dumps(order_lifecycle) + "\n", encoding="utf-8")
+
+            report = trend.analyze_daily_runtime(runtime_path, order_journal_path, window_hours=24)
+
+        self.assertEqual(report["schema_version"], "daily_runtime_analysis.v1")
+        self.assertEqual(report["runtime_records_loaded"], 1)
+        self.assertEqual(report["closed_orders_loaded"], 1)
+        self.assertEqual(report["system_health"]["status"], "healthy")
+        self.assertEqual(report["order_attribution"]["by_close_reason"], {"risk_rebalance_reduction": 1})
+        self.assertIn("risk_rebalance_loss_not_trend_exit", report["strategy_diagnosis"]["findings"])
+        self.assertIn("risk_sizing_or_rebalance", report["strategy_evolution_inputs"])
+        self.assertIn("continue_observing_before_default_strategy_change", report["recommendations"])
+
+    def test_daily_runtime_analysis_counts_signed_cycle_and_lifecycle_evidence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_path = pathlib.Path(tmpdir) / "runtime.jsonl"
+            order_journal_path = pathlib.Path(tmpdir) / "orders.jsonl"
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "runtime.v1",
+                        "environment": "testnet",
+                        "generated_at_utc": "2026-06-17T08:00:00+00:00",
+                        "generated_at_beijing": "2026-06-17T16:00:00+08:00",
+                        "symbol_universe": ["BTCUSDT"],
+                        "signals": [{"symbol": "BTCUSDT", "action": "hold_long", "primary_interval": "1h"}],
+                        "execution_events": {
+                            "desired_orders": [{"symbol": "BTCUSDT", "side": "BUY", "order_type": "MARKET", "quantity": 0.01}],
+                            "real_orders_submitted": True,
+                            "simulated_fills": [{"symbol": "BTCUSDT", "status": "submitted"}],
+                            "testnet_order_lifecycle": {"tracked_order_count": 2, "filled_order_count": 1, "net_pnl": -1.25},
+                            "errors": [],
+                        },
+                        "outcomes": {"position_protection": {"unprotected_symbols": []}},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            order_journal_path.write_text("", encoding="utf-8")
+
+            report = trend.analyze_daily_runtime(runtime_path, order_journal_path, window_hours=24)
+
+        self.assertEqual(report["system_health"]["real_order_cycles"], 1)
+        self.assertEqual(report["system_health"]["broker_event_count"], 1)
+        self.assertEqual(report["system_health"]["lifecycle_tracked_order_count"], 2)
+        self.assertEqual(report["system_health"]["lifecycle_filled_order_count"], 1)
+
+    def test_daily_runtime_analysis_flags_submitted_unknown_journal_evidence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_path = pathlib.Path(tmpdir) / "runtime.jsonl"
+            order_journal_path = pathlib.Path(tmpdir) / "orders.jsonl"
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "runtime.v1",
+                        "environment": "testnet",
+                        "generated_at_utc": "2026-06-17T08:00:00+00:00",
+                        "generated_at_beijing": "2026-06-17T16:00:00+08:00",
+                        "execution_events": {"desired_orders": []},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            order_journal_path.write_text(
+                json.dumps(
+                    {
+                        "environment": "testnet",
+                        "generated_at_utc": "2026-06-17T08:05:00+00:00",
+                        "generated_at_beijing": "2026-06-17T16:05:00+08:00",
+                        "event_type": "order_submission",
+                        "client_order_id": "cid-unknown",
+                        "symbol": "BTCUSDT",
+                        "status": "submitted_unknown",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = trend.analyze_daily_runtime(runtime_path, order_journal_path, window_hours=24)
+
+        self.assertEqual(report["system_health"]["status"], "degraded")
+        self.assertEqual(report["system_health"]["submitted_unknown_count"], 1)
+        self.assertIn("submitted_unknown_orders", report["system_health"]["issues"])
+
+    def test_cli_can_emit_daily_runtime_analysis_without_signed_side_effects(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_path = pathlib.Path(tmpdir) / "runtime.jsonl"
+            order_journal_path = pathlib.Path(tmpdir) / "orders.jsonl"
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "runtime.v1",
+                        "environment": "testnet",
+                        "generated_at_utc": "2026-06-17T08:00:00+00:00",
+                        "generated_at_beijing": "2026-06-17T16:00:00+08:00",
+                        "symbol_universe": ["BTCUSDT"],
+                        "signals": [{"symbol": "BTCUSDT", "action": "hold_long", "primary_interval": "1h"}],
+                        "execution_events": {"desired_orders": [], "submitted_orders": [], "errors": []},
+                        "outcomes": {"position_protection": {"unprotected_symbols": []}},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            order_journal_path.write_text("", encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = trend.main(["--daily-analyze-runtime", "--runtime-record-file", str(runtime_path), "--testnet-order-journal-file", str(order_journal_path), "--analysis-window-hours", "24"])
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["daily_runtime_analysis"]["schema_version"], "daily_runtime_analysis.v1")
+        self.assertEqual(payload["daily_runtime_analysis"]["system_health"]["status"], "healthy")
+        self.assertIn("generated_at_utc", payload["daily_runtime_analysis"])
+        self.assertIn("generated_at_beijing", payload["daily_runtime_analysis"])
+
     def test_closed_order_analysis_classifies_losing_risk_rebalance_from_journal(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             journal_path = pathlib.Path(tmpdir) / "orders.jsonl"

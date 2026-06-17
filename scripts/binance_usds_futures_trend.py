@@ -1385,6 +1385,207 @@ def analyze_closed_orders(order_journal_file: str | os.PathLike[str]) -> dict[st
     return report
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _filter_records_by_window(records: list[dict[str, Any]], window_hours: int, timestamp_key: str = "generated_at_utc") -> list[dict[str, Any]]:
+    if window_hours <= 0:
+        raise ValueError("analysis window must be positive hours")
+    dated = [(record, _parse_iso_datetime(record.get(timestamp_key))) for record in records]
+    latest = max((stamp for _, stamp in dated if stamp is not None), default=None)
+    if latest is None:
+        return records
+    cutoff = latest - timedelta(hours=window_hours)
+    return [record for record, stamp in dated if stamp is None or stamp >= cutoff]
+
+
+def _list_field(record: dict[str, Any], key: str) -> list[Any]:
+    value = record.get(key)
+    return value if isinstance(value, list) else []
+
+
+def _runtime_execution_events(record: dict[str, Any]) -> dict[str, Any]:
+    value = record.get("execution_events")
+    return value if isinstance(value, dict) else {}
+
+
+def _runtime_signal_action_by_symbol(runtime_records: list[dict[str, Any]]) -> dict[str, str]:
+    actions: dict[str, str] = {}
+    for record in runtime_records:
+        for signal in _list_field(record, "signals"):
+            if not isinstance(signal, dict):
+                continue
+            symbol = str(signal.get("symbol") or "").upper()
+            action = str(signal.get("action") or "").lower()
+            if symbol and action:
+                actions[symbol] = action
+    return actions
+
+
+def _runtime_health(runtime_records: list[dict[str, Any]], closed_orders: list[dict[str, Any]], order_records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    issues: list[str] = []
+    total_desired_orders = 0
+    total_submitted_orders = 0
+    broker_event_count = 0
+    real_order_cycles = 0
+    lifecycle_tracked_order_count = 0
+    lifecycle_filled_order_count = 0
+    unprotected_symbols: set[str] = set()
+    submitted_unknown_count = 0
+    execution_error_count = 0
+    for raw_order in order_records or []:
+        if _final_order_status(raw_order) == "SUBMITTED_UNKNOWN":
+            submitted_unknown_count += 1
+    for record in runtime_records:
+        events = _runtime_execution_events(record)
+        desired_orders = _list_field(events, "desired_orders")
+        submitted_orders = _list_field(events, "submitted_orders")
+        errors = _list_field(events, "errors")
+        total_desired_orders += len(desired_orders)
+        total_submitted_orders += len(submitted_orders)
+        broker_events = submitted_orders or _list_field(events, "simulated_fills")
+        broker_event_count += len(broker_events)
+        if bool(events.get("real_orders_submitted")):
+            real_order_cycles += 1
+        lifecycle = _dict_field(events, "testnet_order_lifecycle")
+        lifecycle_tracked_order_count += int(_safe_float(lifecycle.get("tracked_order_count"), 0.0))
+        lifecycle_filled_order_count += int(_safe_float(lifecycle.get("filled_order_count"), 0.0))
+        execution_error_count += len(errors)
+        outcomes = _dict_field(record, "outcomes")
+        protection = _dict_field(outcomes, "position_protection")
+        for symbol in _list_field(protection, "unprotected_symbols"):
+            unprotected_symbols.add(str(symbol).upper())
+    if execution_error_count:
+        issues.append("runtime_execution_errors")
+    if unprotected_symbols:
+        issues.append("unprotected_symbols")
+    if submitted_unknown_count:
+        issues.append("submitted_unknown_orders")
+    status = "healthy" if not issues else "degraded"
+    return {
+        "status": status,
+        "issues": issues,
+        "runtime_records": len(runtime_records),
+        "desired_orders": total_desired_orders,
+        "submitted_orders": total_submitted_orders,
+        "broker_event_count": broker_event_count,
+        "real_order_cycles": real_order_cycles,
+        "lifecycle_tracked_order_count": lifecycle_tracked_order_count,
+        "lifecycle_filled_order_count": lifecycle_filled_order_count,
+        "execution_error_count": execution_error_count,
+        "submitted_unknown_count": submitted_unknown_count,
+        "unprotected_symbols": sorted(unprotected_symbols),
+    }
+
+
+def _daily_strategy_diagnosis(runtime_records: list[dict[str, Any]], closed_orders: list[dict[str, Any]]) -> dict[str, Any]:
+    findings: list[str] = []
+    symbol_actions = _runtime_signal_action_by_symbol(runtime_records)
+    risk_rebalance_losses = [order for order in closed_orders if order.get("close_reason") == "risk_rebalance_reduction" and "loss_sample" in order.get("analysis_flags", [])]
+    stop_losses = [order for order in closed_orders if order.get("close_reason") == "stop_loss" and "loss_sample" in order.get("analysis_flags", [])]
+    take_profits = [order for order in closed_orders if order.get("close_reason") == "take_profit"]
+    strategy_exits = [order for order in closed_orders if order.get("close_reason") == "strategy_exit"]
+    if risk_rebalance_losses:
+        if any(symbol_actions.get(str(order.get("symbol") or "").upper()) == "hold_long" for order in risk_rebalance_losses):
+            findings.append("risk_rebalance_loss_not_trend_exit")
+        else:
+            findings.append("risk_rebalance_loss_requires_signal_context")
+    if stop_losses:
+        findings.append("stop_loss_samples_need_stop_distance_review")
+    if take_profits:
+        findings.append("take_profit_samples_need_runner_review")
+    if strategy_exits:
+        findings.append("strategy_exit_samples_need_trend_break_review")
+    if not findings:
+        findings.append("no_strategy_change_signal_yet")
+    return {
+        "findings": findings,
+        "risk_rebalance_loss_count": len(risk_rebalance_losses),
+        "stop_loss_count": len(stop_losses),
+        "take_profit_count": len(take_profits),
+        "strategy_exit_count": len(strategy_exits),
+        "latest_signal_action_by_symbol": symbol_actions,
+    }
+
+
+def _daily_recommendations(system_health: dict[str, Any], strategy_diagnosis: dict[str, Any], closed_orders: list[dict[str, Any]]) -> list[str]:
+    recommendations: list[str] = []
+    if system_health.get("status") != "healthy":
+        recommendations.append("fix_execution_or_evidence_quality_before_strategy_change")
+    findings = set(strategy_diagnosis.get("findings") or [])
+    if "risk_rebalance_loss_not_trend_exit" in findings:
+        recommendations.append("evaluate_rebalance_hysteresis_or_cooldown_candidate")
+    if "stop_loss_samples_need_stop_distance_review" in findings:
+        recommendations.append("evaluate_stop_distance_candidate")
+    if "take_profit_samples_need_runner_review" in findings:
+        recommendations.append("evaluate_take_profit_runner_candidate")
+    if closed_orders:
+        recommendations.append("continue_observing_before_default_strategy_change")
+    else:
+        recommendations.append("collect_more_closed_order_evidence")
+    return recommendations
+
+
+def analyze_daily_runtime(runtime_record_file: str | os.PathLike[str], order_journal_file: str | os.PathLike[str], window_hours: int = 24) -> dict[str, Any]:
+    """Read runtime/order evidence and produce a daily read-only analyzer report."""
+    runtime_records = _filter_records_by_window(_load_jsonl_records(runtime_record_file), window_hours)
+    order_records = _filter_records_by_window(_load_jsonl_records(order_journal_file), window_hours)
+    closed_report = analyze_closed_orders(order_journal_file)
+    closed_orders = _filter_records_by_window(list(closed_report.get("closed_orders") or []), window_hours, timestamp_key="closed_at_utc")
+    by_reason: dict[str, int] = {}
+    by_symbol: dict[str, dict[str, Any]] = {}
+    for order in closed_orders:
+        reason = str(order.get("close_reason"))
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        symbol = str(order.get("symbol") or "UNKNOWN").upper()
+        summary = by_symbol.setdefault(symbol, {"orders": 0, "realized_pnl": 0.0, "net_pnl": 0.0, "loss_count": 0})
+        summary["orders"] += 1
+        summary["realized_pnl"] = round(float(summary["realized_pnl"]) + _safe_float(order.get("realized_pnl")), 8)
+        summary["net_pnl"] = round(float(summary["net_pnl"]) + _safe_float(order.get("net_pnl")), 8)
+        if "loss_sample" in (order.get("analysis_flags") or []):
+            summary["loss_count"] += 1
+    system_health = _runtime_health(runtime_records, closed_orders, order_records)
+    strategy_diagnosis = _daily_strategy_diagnosis(runtime_records, closed_orders)
+    strategy_evolution_inputs = _strategy_evolution_inputs(closed_orders)
+    report = {
+        "schema_version": "daily_runtime_analysis.v1",
+        "environment": sorted({str(record.get("environment")) for record in runtime_records if record.get("environment")} | {str(order.get("environment")) for order in closed_orders if order.get("environment")}),
+        **now_stamps(),
+        "analysis_window_hours": window_hours,
+        "source_runtime_record_file": str(runtime_record_file),
+        "source_order_journal_file": str(order_journal_file),
+        "runtime_records_loaded": len(runtime_records),
+        "order_journal_records_loaded": len(order_records),
+        "closed_orders_loaded": len(closed_orders),
+        "system_health": system_health,
+        "order_attribution": {
+            "by_close_reason": by_reason,
+            "by_symbol": by_symbol,
+            "loss_count": sum(1 for order in closed_orders if "loss_sample" in (order.get("analysis_flags") or [])),
+            "total_realized_pnl": round(sum(_safe_float(order.get("realized_pnl")) for order in closed_orders), 8),
+            "total_net_pnl": round(sum(_safe_float(order.get("net_pnl")) for order in closed_orders), 8),
+        },
+        "strategy_diagnosis": strategy_diagnosis,
+        "strategy_evolution_inputs": strategy_evolution_inputs,
+        "recommendations": _daily_recommendations(system_health, strategy_diagnosis, closed_orders),
+        "summary_zh": "每日只读运行分析：先判断系统/证据健康，再归因已结束订单，最后给出候选策略或风控演进建议；不会自动修改默认策略或触发交易。",
+        "errors_count": 0,
+    }
+    return report
+
+
 def apply_runtime_record(
     scan: dict[str, Any],
     runtime_record_file: str | os.PathLike[str] | None = None,
@@ -2543,6 +2744,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-testnet-cycle", action="store_true", help="Run v1.7 shared trading loop with Binance futures testnet adapter")
     parser.add_argument("--replay-runtime-evidence", action="store_true", help="Run v1.6 strategy evolution replay from recorded runtime evidence JSONL")
     parser.add_argument("--analyze-closed-orders", action="store_true", help="Analyze ended testnet order journal records into closed_order.v1 strategy-evolution evidence")
+    parser.add_argument("--daily-analyze-runtime", action="store_true", help="Run read-only daily runtime/order-journal diagnosis without trading side effects")
+    parser.add_argument("--analysis-window-hours", type=int, default=24, help="Lookback window for daily runtime analysis")
     parser.add_argument("--initial-equity", type=float, default=10_000.0, help="Paper initial equity per symbol for backtest/cycle")
     parser.add_argument("--fee-bps", type=float, default=4.0, help="Paper transaction fee in basis points for backtest turnover")
     parser.add_argument("--max-position-size", type=float, default=1.0, help="Max paper long exposure per symbol for backtest")
@@ -2574,9 +2777,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     try:
-        selected_modes = [bool(args.compare_refinements), bool(args.backtest), bool(args.run_paper_cycle), bool(args.run_testnet_cycle), bool(args.replay_runtime_evidence), bool(args.analyze_closed_orders)]
+        selected_modes = [bool(args.compare_refinements), bool(args.backtest), bool(args.run_paper_cycle), bool(args.run_testnet_cycle), bool(args.replay_runtime_evidence), bool(args.analyze_closed_orders), bool(args.daily_analyze_runtime)]
         if sum(selected_modes) > 1:
-            raise ValueError("choose only one mode: --compare-refinements, --backtest, --run-paper-cycle, --run-testnet-cycle, --replay-runtime-evidence, or --analyze-closed-orders")
+            raise ValueError("choose only one mode: --compare-refinements, --backtest, --run-paper-cycle, --run-testnet-cycle, --replay-runtime-evidence, --analyze-closed-orders, or --daily-analyze-runtime")
+        if args.daily_analyze_runtime:
+            if not args.runtime_record_file:
+                raise ValueError("--daily-analyze-runtime requires --runtime-record-file")
+            if not args.testnet_order_journal_file:
+                raise ValueError("--daily-analyze-runtime requires --testnet-order-journal-file")
+            if args.state_file:
+                raise ValueError("--state-file is for scan state only; omit it for --daily-analyze-runtime")
+            if args.lifecycle_file:
+                raise ValueError("--lifecycle-file is for scan lifecycle only; omit it for --daily-analyze-runtime")
+            if args.telegram_brief:
+                raise ValueError("--telegram-brief is for scan briefings only; omit it for --daily-analyze-runtime")
+            analysis = analyze_daily_runtime(args.runtime_record_file, args.testnet_order_journal_file, window_hours=args.analysis_window_hours)
+            print(json.dumps({"ok": not bool(analysis["errors_count"]), "daily_runtime_analysis": analysis}, ensure_ascii=False, indent=2))
+            return 0 if not analysis["errors_count"] else 1
         if args.analyze_closed_orders:
             if not args.testnet_order_journal_file:
                 raise ValueError("--analyze-closed-orders requires --testnet-order-journal-file")

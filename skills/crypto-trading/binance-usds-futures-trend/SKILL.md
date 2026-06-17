@@ -322,6 +322,7 @@ scripts/binance_usds_futures_trend.py --run-paper-cycle --symbols BTCUSDT,ETHUSD
 scripts/binance_usds_futures_trend.py --run-testnet-cycle --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --runtime-record-file state/binance-usds-futures-trend-testnet-runtime.jsonl --no-save-runtime-record --testnet-dry-run
 scripts/binance_usds_futures_trend.py --run-paper-cycle --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --runtime-record-file /tmp/binance-v16-runtime.jsonl
 scripts/binance_usds_futures_trend.py --replay-runtime-evidence --runtime-record-file /tmp/binance-v16-runtime.jsonl
+scripts/binance_usds_futures_trend.py --daily-analyze-runtime --runtime-record-file state/binance-usds-futures-trend-testnet-runtime.jsonl --testnet-order-journal-file state/binance-usds-futures-trend-testnet-orders.jsonl --analysis-window-hours 24
 ```
 
 Before committing or pushing repo changes:
@@ -369,7 +370,8 @@ Confirm:
 25. **Mixing environments or leaking state.** Keep paper/testnet/live credentials, balances, order IDs, fills, and state files isolated. Do not commit `state/*.json`, account/order/fill state, cron output, raw signed payloads, API keys, or secret values.
 26. **Committing scheduler runtime noise.** Hermes cron may rewrite counters and timestamps in `cron/jobs.json`; prefer ignoring live `/cron/jobs.json` and tracking a sanitized `cron/jobs.template.json` without `next_run_at`, `last_run_at`, status/error, completed-repeat, `updated_at`, or origin chat identifiers. Exclude runtime-only changes from staging before review, commit, and push. Do not blindly `git restore cron/jobs.json` while enabled cron jobs are active: restoring a tracked stale `next_run_at` can make the scheduler classify the job as missed and fast-forward the next run instead of executing the current scheduled tick. See `references/session-v1.42-tp-replan-and-cron-runtime-template.md`.
 27. **Creating an extra run while diagnosing timing.** `cronjob(action="run")` and `hermes cron run` intentionally enqueue an immediate run on the next scheduler tick. If the user asks why a notification arrived at an odd minute, inspect existing job state and `cron/output/` only; do not trigger another run unless explicitly requested with execution-now intent such as “手动运行”, “立即运行”, “触发一次”, “run it now”, or “trigger once”. Do not treat generic words like “run result”, “运行结果”, or “runtime evidence” as authorization to execute.
-28. **Skipping independent review or timezone labels.** This repo requires independent agent review before push, and every time-related output must label UTC or 北京时间（UTC+8）.
+28. **Treating opening fees as closed-trade losses.** A filled BUY/opening order can have negative `net_pnl` because of commission, but it is not a closed losing trade. Closed-order analyzers should mark `loss_sample` from realized PnL or net loss on closing/reduction/protection orders, and keep ordinary opening orders as cost evidence rather than strategy-loss samples. See `references/session-v1.43-closed-order-analysis.md`.
+29. **Skipping independent review or timezone labels.** This repo requires independent agent review before push, and every time-related output must label UTC or 北京时间（UTC+8）.
 
 ## References
 
