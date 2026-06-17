@@ -357,7 +357,7 @@ Confirm:
 22. **Overstating diagnostics.** Paper scans, backtests, and refinement comparisons are evidence, not live performance proof.
 23. **Mixing environments or leaking state.** Keep paper/testnet/live credentials, balances, order IDs, fills, and state files isolated. Do not commit `state/*.json`, account/order/fill state, cron output, raw signed payloads, API keys, or secret values.
 24. **Committing scheduler runtime noise.** Hermes cron may rewrite counters and timestamps in `cron/jobs.json`; restore/exclude runtime-only changes before review, commit, and push.
-25. **Creating an extra run while diagnosing timing.** `cronjob(action="run")` and `hermes cron run` intentionally enqueue an immediate run on the next scheduler tick. If the user asks why a notification arrived at an odd minute, inspect existing job state and `cron/output/` only; do not trigger another run unless explicitly requested.
+25. **Creating an extra run while diagnosing timing.** `cronjob(action="run")` and `hermes cron run` intentionally enqueue an immediate run on the next scheduler tick. If the user asks why a notification arrived at an odd minute, inspect existing job state and `cron/output/` only; do not trigger another run unless explicitly requested with execution-now intent such as “手动运行”, “立即运行”, “触发一次”, “run it now”, or “trigger once”. Do not treat generic words like “run result”, “运行结果”, or “runtime evidence” as authorization to execute.
 26. **Skipping independent review or timezone labels.** This repo requires independent agent review before push, and every time-related output must label UTC or 北京时间（UTC+8）.
 
 ## References
