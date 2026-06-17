@@ -1000,6 +1000,22 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         )
         self.assertTrue(safe["all_positions_protected"])
 
+    def test_verify_position_protection_can_scope_to_cycle_symbols(self):
+        scoped = trend.verify_position_protection(
+            {
+                "positions": [
+                    {"symbol": "BTCUSDT", "positionAmt": "0"},
+                    {"symbol": "ETHUSDT", "positionAmt": "0.5"},
+                ],
+                "open_algo_orders": [],
+            },
+            symbols=["BTCUSDT"],
+        )
+
+        self.assertTrue(scoped["all_positions_protected"])
+        self.assertEqual(scoped["unprotected_symbols"], [])
+        self.assertEqual(scoped["symbols"], {})
+
     def test_testnet_broker_fetches_exchange_info_rules_from_testnet_endpoint(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
 
@@ -1102,6 +1118,32 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(report["missing_unknown_client_ids"], [])
         self.assertEqual(report["unknown_local_count"], 1)
 
+    def test_testnet_broker_reconciles_unknown_local_algo_order_with_open_algo_orders(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+        )
+        broker.fills.append(
+            {
+                "environment": "testnet",
+                "symbol": "SOLUSDT",
+                "status": "submitted_unknown",
+                "client_order_id": "algo-unknown",
+                "client_algo_id": "algo-unknown",
+            }
+        )
+
+        report = broker.reconcile_open_orders(
+            {
+                "open_orders": [],
+                "open_algo_orders": [{"symbol": "SOLUSDT", "clientAlgoId": "algo-unknown", "algoId": 456}],
+            }
+        )
+
+        self.assertEqual(report["matched_open_order_client_ids"], ["algo-unknown"])
+        self.assertEqual(report["missing_unknown_client_ids"], [])
+        self.assertEqual(report["unknown_local_count"], 1)
+
     def test_testnet_client_order_id_is_unique_across_fresh_brokers(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
 
@@ -1195,6 +1237,45 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(event["response"]["orderId"], 101)
         self.assertIn(f"origClientOrderId={event['client_order_id']}", broker.http_client.calls[1][1])
         self.assertTrue(event["client_order_id"].startswith("testcid-BTCUSDT-"))
+
+    def test_testnet_unknown_algo_submission_queries_algo_order_by_client_algo_id(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if method == "POST":
+                    raise TimeoutError("network timeout")
+                if "/fapi/v1/algoOrder" in url:
+                    return {"algoId": 202, "clientAlgoId": "testcid-1", "status": "NEW"}
+                raise AssertionError(url)
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=False,
+            http_client=FakeHttpClient(),
+            client_order_id_prefix="testcid",
+        )
+
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="SOLUSDT",
+                side="SELL",
+                quantity=1.0,
+                order_type="STOP_MARKET",
+                metadata={"reference_price": 100.0, "stop_price": 95.0, "close_position": True},
+            )
+        )
+
+        self.assertEqual(event["status"], "submitted_confirmed")
+        self.assertEqual(event["response"]["algoId"], 202)
+        self.assertIn("/fapi/v1/algoOrder?", broker.http_client.calls[1][1])
+        self.assertIn(f"clientAlgoId={event['client_order_id']}", broker.http_client.calls[1][1])
+        self.assertNotIn("origClientOrderId=", broker.http_client.calls[1][1])
 
     def test_trading_cycle_prioritizes_missing_take_profit_repairs_before_new_addons_when_order_budget_is_tight(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")

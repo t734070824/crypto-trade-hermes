@@ -1984,11 +1984,17 @@ def run_paper_trading_cycle(
     )
 
 
-def verify_position_protection(account_snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Verify every non-zero long testnet position has safe SL and TP protection."""
+def verify_position_protection(account_snapshot: dict[str, Any], symbols: Iterable[str] | None = None) -> dict[str, Any]:
+    """Verify non-zero long testnet positions have safe SL and TP protection.
+
+    When symbols is provided, scope the result to that cycle's symbol group so a
+    BTC-only cycle does not report unrelated ETH/SOL protection gaps from the
+    account-wide signed snapshot.
+    """
     positions = account_snapshot.get("positions", []) if isinstance(account_snapshot, dict) else []
     open_orders = account_snapshot.get("open_orders", []) if isinstance(account_snapshot, dict) else []
     open_algo_orders = account_snapshot.get("open_algo_orders", []) if isinstance(account_snapshot, dict) else []
+    wanted_symbols = {validate_symbol(symbol) for symbol in symbols} if symbols is not None else None
     order_rows = []
     if isinstance(open_orders, list):
         order_rows.extend(open_orders)
@@ -2006,6 +2012,8 @@ def verify_position_protection(account_snapshot: dict[str, Any]) -> dict[str, An
             amount = float(item.get("positionAmt") or item.get("position_amt") or item.get("size") or 0.0)
         except (TypeError, ValueError):
             amount = 0.0
+        if wanted_symbols is not None and symbol not in wanted_symbols:
+            continue
         if abs(amount) <= 1e-12:
             continue
         if amount < 0:
@@ -2224,8 +2232,8 @@ def run_testnet_trading_cycle(
     if sync_account_state and selected_symbols:
         account_sync_after = broker.fetch_signed_account_snapshot()
         open_orders = account_sync_after.get("open_orders", []) if isinstance(account_sync_after, dict) else []
-        reconciliation = broker.reconcile_open_orders(open_orders if isinstance(open_orders, list) else [])
-        protection_verification = verify_position_protection(account_sync_after)
+        reconciliation = broker.reconcile_open_orders(account_sync_after)
+        protection_verification = verify_position_protection(account_sync_after, selected_symbols)
         cycle["testnet_account_sync"] = {
             "environment": "testnet",
             "before": account_sync_before,

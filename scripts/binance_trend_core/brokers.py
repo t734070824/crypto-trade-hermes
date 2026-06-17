@@ -525,7 +525,7 @@ class BinanceTestnetBroker:
                 }
             )
             try:
-                confirmed_payload = self._confirm_order_by_client_order_id(symbol, client_order_id)
+                confirmed_payload = self._confirm_order_by_client_order_id(symbol, client_order_id, conditional_algo=conditional_algo)
             except Exception as confirm_exc:
                 event.update({"confirm_status": "failed", "confirm_error_type": confirm_exc.__class__.__name__})
                 self._append_order_journal(event)
@@ -640,8 +640,15 @@ class BinanceTestnetBroker:
             "open_algo_orders": redact_sensitive_testnet_fields(open_algo_orders),
         }
 
-    def reconcile_open_orders(self, open_orders: list[dict[str, Any]]) -> dict[str, Any]:
-        remote_client_ids = {str(order.get("clientOrderId")) for order in open_orders if order.get("clientOrderId")}
+    def reconcile_open_orders(self, account_snapshot: Mapping[str, Any] | list[dict[str, Any]] | None = None, *, open_orders: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        if isinstance(account_snapshot, Mapping):
+            open_orders_payload = account_snapshot.get("open_orders", [])
+            open_algo_orders = account_snapshot.get("open_algo_orders", [])
+        else:
+            open_orders_payload = account_snapshot if account_snapshot is not None else (open_orders or [])
+            open_algo_orders = []
+        remote_client_ids = {str(order.get("clientOrderId")) for order in open_orders_payload if isinstance(order, Mapping) and order.get("clientOrderId")}
+        remote_client_ids.update(str(order.get("clientAlgoId")) for order in open_algo_orders if isinstance(order, Mapping) and order.get("clientAlgoId"))
         unknown_local_ids = [str(event.get("client_order_id")) for event in self.fills if event.get("status") == "submitted_unknown" and event.get("client_order_id")]
         matched = [client_id for client_id in unknown_local_ids if client_id in remote_client_ids]
         missing = [client_id for client_id in unknown_local_ids if client_id not in remote_client_ids]
@@ -765,7 +772,9 @@ class BinanceTestnetBroker:
         self._append_order_journal(event)
         return event
 
-    def _confirm_order_by_client_order_id(self, symbol: str, client_order_id: str) -> Any:
+    def _confirm_order_by_client_order_id(self, symbol: str, client_order_id: str, *, conditional_algo: bool = False) -> Any:
+        if conditional_algo:
+            return self._signed_get("/fapi/v1/algoOrder", {"symbol": symbol.upper(), "clientAlgoId": client_order_id})
         return self._signed_get("/fapi/v1/order", {"symbol": symbol.upper(), "origClientOrderId": client_order_id})
 
     def _signed_get(self, path: str, params: Mapping[str, Any] | None = None) -> Any:
