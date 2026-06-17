@@ -5,7 +5,7 @@
 **Goal:** Improve the current Binance USDS-M futures trading chain so it better supports the CAGR target while matching the desired long-hold / trend-participation style.
 
 **Architecture:**
-Keep the existing shared paper/testnet trading loop as the operational core. Live/mainnet execution remains unimplemented and unauthorized; any future live adapter would require a separate explicit approval path, stricter gates, and new review. Upgrade the current paper/testnet flow from a basic signal → intent → delta execution path into a stronger trend-holding engine. The main improvements should come from better regime detection, better sizing and pyramiding, more disciplined lifecycle management, stronger execution reconciliation, and a tighter evidence loop driven by runtime records.
+Keep the existing shared paper/testnet trading loop as the operational core. Live/mainnet execution remains unimplemented and unauthorized; any future live adapter would require a separate explicit approval path, stricter gates, and new review. The current chain is already stronger than a basic scanner: it has free K-line ingestion, signal generation, account-risk sizing, target-total exposure semantics, delta-only execution, protective-order reconciliation, runtime/order journals, and a script-owned testnet hot path. The next step is not to replace this chain, but to make it more regime-aware, more compounding-friendly, and better evidenced by real runtime results.
 
 **Tech Stack:**
 Python 3.11, current `scripts/binance_trend_core/*` modules, Binance public data endpoints, Binance Futures Testnet adapter, unittest, runtime JSONL evidence, cron jobs.
@@ -15,26 +15,27 @@ Python 3.11, current `scripts/binance_trend_core/*` modules, Binance public data
 ## Current chain, in one sentence
 
 Current flow is roughly:
-`public K-lines -> signal engine -> trend intent -> risk approval -> execution planning -> broker submit/reconcile -> runtime evidence`.
+`public K-lines >=1h -> signal engine -> account-risk sizing -> target-total intent -> risk approval -> delta-only execution + protection reconciliation -> broker submit/reconcile -> runtime evidence -> daily replay analysis`.
 
-That is good for correctness, but still too simple for a CAGR-focused trend holder because:
+This is already suitable for correctness, but still needs improvement for CAGR because:
 
-- sizing is still mostly threshold-driven and not fully regime-aware;
-- add-on logic is not strong enough to scale into persistent trends;
-- exits can still be too mechanical relative to the "hold main trend, harvest in tranches" preference;
-- execution/reconciliation is conservative, but not yet optimized for repeated long-run capital efficiency;
-- there is not yet a complete feedback loop that turns runtime evidence into strategy upgrades.
+- regime quality is not yet first-class in sizing and lifecycle decisions;
+- add-on / harvest / trim behavior is not yet explicit enough for persistent trends;
+- the current evidence loop still relies too much on proxy metrics and not enough on real testnet lifecycle and fill evidence;
+- hourly hot-path execution and daily replay analysis are already separated, but the plan should reflect that separation more explicitly;
+- the strategy still needs better compounding discipline so it can hold winners longer without turning every cycle into a full reset.
 
 ---
 
 ## Priority order
 
-1. **Fix portfolio sizing to be regime-aware and compounding-friendly.**
-2. **Make lifecycle management explicitly support hold / add / trim / trail behavior.**
-3. **Improve execution reconciliation so delta sizing is precise and not overly timid.**
-4. **Add better regime filters and multi-timeframe persistence signals.**
-5. **Use runtime evidence to promote only improvements that survive replay and testnet.**
-6. **Tighten observability and ops so the strategy can run unattended with less manual intervention.**
+1. **Measure current bottlenecks from runtime/order-journal evidence before changing logic.**
+2. **Add regime / persistence / trend-quality scoring as a first-class input.**
+3. **Upgrade the existing account-risk sizing to be regime-aware and compounding-aware.**
+4. **Make lifecycle management explicitly support entry / add / hold / trim / harvest / exit.**
+5. **Refine delta-only execution so it handles minimum effective deltas and protection reconciliation cleanly.**
+6. **Use runtime evidence, including real testnet lifecycle data, as the promotion gate.**
+7. **Tighten observability and cron boundaries so the hot path stays deterministic and the analyzer stays read-only.**
 
 ---
 
@@ -42,64 +43,101 @@ That is good for correctness, but still too simple for a CAGR-focused trend hold
 
 ### Task 1: Measure current bottlenecks before changing logic
 
-**Objective:** Identify which part of the chain is limiting CAGR most: signal quality, sizing, lifecycle exits, or execution friction.
+**Objective:** Identify what is currently limiting CAGR most: signal quality, regime filtering, sizing, lifecycle exits, protection friction, or no-op cycles.
 
 **Files:**
-- Read: `scripts/binance_trend_core/loop.py`
-- Read: `scripts/binance_trend_core/strategy.py`
-- Read: `scripts/binance_trend_core/risk.py`
-- Read: `scripts/binance_trend_core/execution.py`
-- Read: `scripts/binance_trend_core/runtime.py`
-- Read: `scripts/binance_trend_core/evolution.py`
-- Read: `cron/output/f7201d6c1c57/*.md`
-- Read: `state/binance-usds-futures-trend-testnet-runtime.jsonl`
-- Read: `state/binance-usds-futures-trend-testnet-orders.jsonl`
+- `scripts/binance_trend_core/loop.py`
+- `scripts/binance_trend_core/strategy.py`
+- `scripts/binance_trend_core/risk.py`
+- `scripts/binance_trend_core/execution.py`
+- `scripts/binance_trend_core/runtime.py`
+- `scripts/binance_trend_core/evolution.py`
+- `scripts/binance_usds_futures_trend.py`
+- `scripts/binance_usds_futures_testnet_hourly.py`
+- `state/binance-usds-futures-trend-testnet-runtime.jsonl`
+- `state/binance-usds-futures-trend-testnet-orders.jsonl`
+- `cron/output/f7201d6c1c57/*.md`
 
 **What to extract:**
 - how often signals produce `hold_long` vs `flat`;
-- how often desired exposure is below current exposure, causing no add;
-- how often increments are blocked by min quantity / step size / notional;
-- how often protective orders exist, are duplicated, or fail-closed;
-- how often runtime evidence shows repeated no-op cycles.
+- how often target exposure is above current exposure vs equal vs below;
+- how often sizing is constrained by stop distance, margin, max order notional, max symbol exposure, or symbol exposure fraction;
+- how often execution is skipped because delta is below the effective minimum after rounding or exchange rules;
+- how often protection orders are already sufficient vs repaired vs duplicated;
+- how often runtime evidence shows repeated no-op cycles or `correct no-op` cycles;
+- how often real testnet fills, lifecycle tracking, fees, and slippage are actually observed.
 
 **Deliverable:**
 A short baseline note with 3–5 primary bottlenecks and evidence counts.
 
 **Verification:**
-- Use recent runtime JSONL and cron outputs only.
+- Use recent runtime JSONL, order journal, and cron outputs only.
 - Do not infer from intuition when data is available.
 
 ---
 
-### Task 2: Redesign sizing around account risk, trend strength, and headroom
+### Task 2: Add regime / persistence / trend-quality scoring
 
-**Objective:** Make position sizing support compounding during strong trends instead of only producing a fixed or near-fixed target.
+**Objective:** Turn the current binary long-trend decision into a graded regime score that can drive sizing, adds, trims, and hold persistence.
 
 **Files likely to change:**
+- `scripts/binance_trend_core/signals.py`
+- `scripts/binance_trend_core/strategy.py`
+- `scripts/binance_trend_core/evolution.py`
+- `tests/test_binance_usds_futures_trend.py`
+
+**Proposed behavior:**
+- keep the current EMA/ATR core;
+- add features such as:
+  - trend persistence / slope;
+  - normalized distance from EMA200 by ATR;
+  - volatility compression then expansion;
+  - multi-timeframe agreement score;
+  - public context confirmation from funding / OI / long-short imbalance;
+  - extension penalty only when trend is too stretched, not as an automatic exit trigger.
+- convert the binary trend decision into a graded regime score;
+- keep `hold_long` as the long-trend participation signal, but attach a `regime_score` or equivalent quality metric;
+- make the score explicit enough to reuse in sizing and lifecycle rules.
+
+**Tests:**
+- strong aligned multi-timeframe trend should score higher than weak or conflicting trend;
+- extension alone should not force exit;
+- weak/noisy regime should reduce add aggression;
+- regime score should be deterministic on identical input candles.
+
+**Verification:**
+- compare baseline vs candidate on the same candle set;
+- inspect runtime replay results for fewer premature exits.
+
+---
+
+### Task 3: Upgrade existing account-risk sizing to be regime-aware and compounding-aware
+
+**Objective:** Keep the current account-risk sizing model, but make it scale with regime quality and trend persistence so the engine can compound into strong trends instead of capping itself too early.
+
+**Files likely to change:**
+- `scripts/binance_usds_futures_trend.py`
 - `scripts/binance_trend_core/risk.py`
 - `scripts/binance_trend_core/strategy.py`
 - `scripts/binance_trend_core/execution.py`
 - `tests/test_binance_usds_futures_trend.py`
 
-**Proposed behavior:**
-- base risk on account equity and risk fraction;
-- scale size by trend strength / confidence / regime quality;
-- introduce explicit headroom for add-ons when the trend is healthy;
-- cap by symbol exposure, total portfolio risk, daily loss, and exchange limits;
-- allow larger target exposure only when the market has proven persistence.
+**Current reality:**
+The project already has `apply_account_risk_sizing_to_signal()` and it already sizes from account equity / available balance / stop distance / leverage cap / max order notional / max symbol exposure / max symbol exposure fraction. So this task is **not** “add account-risk sizing from scratch.” It is “make the existing sizing regime-aware and compounding-aware.”
 
-**Implementation idea:**
-- keep the current `desired_exposure` abstraction;
-- add a sizing component that computes:
-  - base size,
-  - add-on capacity,
-  - max total target exposure,
-  - minimum meaningful delta.
+**Proposed behavior:**
+- keep the current target-total `position_size` abstraction;
+- scale base size by regime quality and persistence;
+- reserve explicit headroom for future adds when trend quality remains strong;
+- reduce size when equity falls, daily loss rises, or regime quality weakens;
+- keep the hard caps: stop-distance risk budget, max order notional, max symbol exposure, max exposure fraction, and exchange minimums;
+- ensure any scale-up still respects the current `position_size` meaning: target total exposure, not incremental add quantity.
 
 **Tests:**
-- strong trend with good headroom should produce larger target size than weak trend;
+- strong regime should size larger than weak regime on the same account snapshot;
 - repeated cycles should not increase size indefinitely;
-- if equity drops or daily loss grows, target exposure should shrink.
+- equity drawdown or regime decay should shrink target exposure;
+- sizing should remain fail-closed on invalid stop distance or invalid account snapshot.
 
 **Verification:**
 - unit tests for sizing outputs;
@@ -108,49 +146,51 @@ A short baseline note with 3–5 primary bottlenecks and evidence counts.
 
 ---
 
-### Task 3: Turn lifecycle into explicit entry / add / hold / trim / exit policy
+### Task 4: Make lifecycle management explicit: entry / add / hold / trim / harvest / exit
 
-**Objective:** Make the engine behave like a trend holder instead of a one-shot entry/exit scanner.
+**Objective:** Make the engine behave like a trend holder that stays in the move, trims only when needed, and exits only when the trend actually fails or risk trips.
 
 **Files likely to change:**
-- `scripts/binance_trend_core/strategy.py`
 - `scripts/binance_trend_core/portfolio.py`
+- `scripts/binance_trend_core/strategy.py`
 - `scripts/binance_trend_core/execution.py`
 - `scripts/binance_trend_core/loop.py`
 - `tests/test_binance_usds_futures_trend.py`
 
 **Proposed behavior:**
-- `hold_long` should mean "stay in the trend while conditions remain valid";
-- `add` should happen only when:
-  - trend remains healthy,
-  - current exposure is below target,
-  - increment is meaningful after fees and exchange constraints;
-- `trim` should happen on weakening momentum or excessive extension, not only on full invalidation;
-- `exit` should be reserved for actual trend failure or risk stop.
-
-**Implementation idea:**
-- extend lifecycle state to track:
-  - entry price,
-  - current tranche count,
-  - last add timestamp,
-  - last trim timestamp,
-  - trailing stop level,
+- `hold_long` means stay in the trend while conditions remain valid;
+- `add` only happens when:
+  - trend remains healthy;
+  - current exposure is below target total exposure;
+  - the delta is meaningful after fees, rounding, and exchange constraints;
+- `trim` or `harvest` happens on weakening momentum or excessive extension, not only on full invalidation;
+- `exit` is reserved for true trend failure or hard risk stop;
+- lifecycle state should track at least:
+  - entry price;
+  - current tranche count;
+  - last add timestamp;
+  - last trim timestamp;
+  - trailing stop level;
   - next add threshold;
-- add rules for "do not re-enter too fast" and "do not trim too aggressively".
+  - partial-harvest state.
+
+**Important semantic rule:**
+Strategy `position_size` remains the **desired total exposure**. The execution layer must always reconcile `desired_exposure - current_exposure`, not blindly add the full target again.
 
 **Tests:**
 - add-on should fire only when current exposure < target exposure;
 - trim should not wipe the full position unless trend breaks;
-- flat/exit only when major trend invalidates or risk trips.
+- flat / exit only when major trend invalidates or risk trips;
+- lifecycle state should preserve monotonic trailing-stop behavior.
 
 **Verification:**
 - lifecycle state diff tests;
 - paper cycle with persistent trend;
-- confirm add/hold/trim behavior in runtime record.
+- confirm add / hold / trim behavior in runtime record.
 
 ---
 
-### Task 4: Upgrade execution from simple delta reconciliation to smarter delta + protection reconciliation
+### Task 5: Refine delta-only execution and protection reconciliation
 
 **Objective:** Improve capital efficiency and reduce wasted no-op cycles while keeping fail-closed safety.
 
@@ -159,25 +199,28 @@ A short baseline note with 3–5 primary bottlenecks and evidence counts.
 - `scripts/binance_trend_core/brokers.py`
 - `tests/test_binance_usds_futures_trend.py`
 
+**Current reality:**
+The execution path already does delta-only reconciliation and already handles protective orders, stale stop replacement, stale TP replacement, and order budget constraints. So this task is not “build reconciliation”; it is “make the existing reconciliation smarter and more observable.”
+
 **Proposed behavior:**
 - keep delta-only reconciliation for core position management;
-- but distinguish:
-  - pure add delta,
-  - pure reduce delta,
-  - protection refresh,
+- distinguish clearly between:
+  - pure add delta;
+  - pure reduce delta;
+  - protection refresh;
   - duplicate-protection suppression;
-- avoid repeatedly submitting tiny increments that fail exchange filters;
-- preserve fail-closed protective orders on testnet-like adapter paths; live/mainnet remains out of scope.
-
-**Implementation idea:**
-- add a minimum effective delta after rounding to step size and notional;
-- suppress repeated protection submissions when the exchange state is already sufficient;
-- log why an add was skipped: below threshold, already at target, protection already present, or exchange limits.
+  - below-minimum delta after rounding;
+  - exchange-rule rejection;
+  - risk-capped no-op;
+  - already-at-target no-op;
+- suppress repeated submission of tiny increments that fail exchange filters;
+- preserve fail-closed protective orders on testnet-like adapter paths.
 
 **Tests:**
 - delta below minimum should be skipped with an explicit reason;
 - protection orders should be recognized and not duplicated unnecessarily;
-- target equal to current exposure should produce no position order.
+- target equal to current exposure should produce no position order;
+- stale protection repair should not create a naked long position.
 
 **Verification:**
 - testnet dry-run should show fewer unnecessary orders;
@@ -185,48 +228,9 @@ A short baseline note with 3–5 primary bottlenecks and evidence counts.
 
 ---
 
-### Task 5: Improve regime detection so the engine stays in trends longer
+### Task 6: Build a compounding policy for pyramiding and partial harvesting
 
-**Objective:** Reduce premature exits and avoid entering weak or noisy regimes.
-
-**Files likely to change:**
-- `scripts/binance_trend_core/signals.py`
-- `scripts/binance_trend_core/strategy.py`
-- `tests/test_binance_usds_futures_trend.py`
-
-**Proposed behavior:**
-- keep the current EMA/ATR base,
-- add regime features such as:
-  - trend persistence / slope,
-  - volatility compression then expansion,
-  - distance from EMA200 normalized by ATR,
-  - multi-timeframe agreement score,
-  - context confirmation from funding / OI / long-short imbalance.
-- use regime score to decide whether to:
-  - hold aggressively,
-  - hold but reduce size,
-  - add,
-  - wait.
-
-**Implementation idea:**
-- convert a binary signal into a graded regime score;
-- use the score in sizing and lifecycle decisions;
-- keep the existing long-trend core intact so logic remains understandable.
-
-**Tests:**
-- strong aligned multi-timeframe trend should score higher than weak or conflicting trend;
-- extension alone should not cause forced exit;
-- weak/noisy regime should suppress adds.
-
-**Verification:**
-- compare baseline vs candidate on the same candle set;
-- inspect runtime replay results for fewer false exits.
-
----
-
-### Task 6: Build a compounding policy for pyramid entries and partial harvesting
-
-**Objective:** Make the strategy fit the desired "持续参与主趋势、持续持有、持续收割" style.
+**Objective:** Make the strategy fit the desired “持续参与主趋势、持续持有、持续收割” style.
 
 **Files likely to change:**
 - `scripts/binance_trend_core/portfolio.py`
@@ -236,18 +240,20 @@ A short baseline note with 3–5 primary bottlenecks and evidence counts.
 
 **Proposed behavior:**
 - define a maximum tranche count per symbol;
-- define add levels based on ATR or volatility bands;
-- define trim levels that harvest part of gains without abandoning the trend;
-- define a trailing stop that rises with the market instead of sitting too tight.
+- define add levels based on ATR / volatility bands / regime score;
+- define harvest levels that take partial gains without abandoning the trend;
+- define a trailing stop that rises with the market instead of sitting too tight;
+- let the last tranche ride until trend failure or hard risk stop.
 
 **Implementation idea:**
-- add explicit tranche state:
+- make tranche state explicit:
   - first entry,
   - add 1,
   - add 2,
   - harvest 1,
   - harvest 2;
-- keep the last tranche on until trend failure or hard risk stop.
+- ensure harvest reduces size rather than forcing a full exit while the major trend is still valid;
+- keep add rules compatible with current delta-only reconciliation and existing position semantics.
 
 **Tests:**
 - add-on levels must be monotonic and sensible;
@@ -274,11 +280,7 @@ A short baseline note with 3–5 primary bottlenecks and evidence counts.
 - add portfolio correlation or concentration caps;
 - cap total exposure per market regime;
 - add cooldowns after losses or failed entries;
-- add time-based de-risking only when the regime weakens, not on arbitrary timers.
-
-**Implementation idea:**
-- track symbol clustering and portfolio heat;
-- reject new adds when concentration is too high;
+- add time-based de-risking only when the regime weakens, not on arbitrary timers;
 - reduce only the weakest / most extended tranches first.
 
 **Tests:**
@@ -305,15 +307,25 @@ A short baseline note with 3–5 primary bottlenecks and evidence counts.
 **Proposed behavior:**
 - replay the same runtime evidence across candidate strategy versions;
 - compare:
-  - fewer premature exits,
-  - better trend participation duration,
-  - fewer no-op orders,
-  - better realized vs unrealized capture,
-  - lower protective-order friction.
+  - fewer premature exits;
+  - better trend participation duration;
+  - fewer no-op orders;
+  - better realized vs unrealized capture;
+  - lower protection-friction;
+  - fewer skip reasons caused by exchange limits or order-budget pressure;
+  - better net PnL after fees and slippage.
 
 **Implementation idea:**
 - define promotion metrics around trend capture and hold quality, not only raw win rate;
-- add a simple scorecard for candidate comparison.
+- incorporate real runtime artifacts, not only proxy returns:
+  - runtime JSONL;
+  - order journal;
+  - lifecycle tracking;
+  - lifecycle confirmations;
+  - fees;
+  - slippage;
+  - rejected / skipped reasons;
+  - actual order-count efficiency.
 
 **Tests:**
 - replay must use identical captured inputs;
@@ -328,27 +340,35 @@ A short baseline note with 3–5 primary bottlenecks and evidence counts.
 
 ### Task 9: Tighten observability and cron behavior for unattended operation
 
-**Objective:** Make it easier to tell whether the strategy is doing the right thing over days, not just one cycle.
+**Objective:** Make it easy to tell whether the strategy is doing the right thing over days, not just one cycle.
 
 **Files likely to change:**
-- `scripts/binance_usds_futures_trend_brief.sh`
+- `scripts/binance_usds_futures_testnet_hourly.py`
+- `scripts/binance_usds_futures_testnet_hourly.sh`
 - `scripts/binance_usds_futures_trend.py`
-- `cron/jobs.json`
+- `scripts/binance_usds_futures_trend_brief.sh`
+- `cron/jobs.json` only if cron definitions themselves intentionally change
 
 **Proposed behavior:**
-- summarize:
-  - current exposure,
-  - target exposure,
-  - add/trim/hold reason,
-  - protection status,
-  - runtime errors,
+- hourly hot path stays script-owned and deterministic (`no_agent=true`);
+- the script, not prompt prose, is the operational contract for that job;
+- daily replay diagnostics remain agent-owned and read-only;
+- reports should summarize:
+  - current exposure;
+  - target exposure;
+  - add / trim / hold reason;
+  - protection status;
+  - runtime errors;
   - whether the cycle helped compounding;
-- keep reports compact and actionable;
-- distinguish "correct no-op" from "failed to add because of an issue".
+  - execution latency vs delivery latency when cron output is late.
+
+**Important boundary:**
+Do not treat prompt prose as execution logic. If a behavior must happen in the hourly hot path, it must be encoded in the script or trading-engine code path, not only described in the cron prompt.
 
 **Verification:**
-- cron output should show why the engine held, added, or trimmed;
-- no raw signed payloads or secrets in output.
+- cron output should show why the engine held, added, trimmed, or did nothing;
+- no raw signed payloads or secrets in output;
+- hot-path report and daily replay report remain separate concerns.
 
 ---
 
@@ -357,13 +377,15 @@ A short baseline note with 3–5 primary bottlenecks and evidence counts.
 **Objective:** Introduce changes in a safe order.
 
 **Rollout order:**
-1. unit tests for sizing/lifecycle/execution rules;
-2. paper dry-run validation on selected symbols;
-3. paper multi-symbol validation;
-4. testnet dry-run validation;
-5. testnet signed cycle only if explicitly required and safe;
-6. compare runtime evidence before and after;
-7. only then consider continuing or expanding testnet scope; live/mainnet remains out of scope unless separately authorized.
+1. baseline measurement from current runtime evidence;
+2. regime / persistence score;
+3. sizing upgrade on top of existing account-risk sizing;
+4. lifecycle add / trim / hold / harvest rules;
+5. execution delta refinement;
+6. replay comparison using recorded runtime evidence;
+7. paper and testnet dry-run validation;
+8. signed testnet only if explicitly required and safe;
+9. only then consider expanding scope; live/mainnet remains out of scope unless separately authorized.
 
 **Baseline test commands:**
 ```bash
@@ -404,10 +426,11 @@ scripts/binance_usds_futures_trend.py --replay-runtime-evidence --runtime-record
 If I were implementing next, I would do this order:
 
 1. baseline measurement from current runtime evidence;
-2. sizing model upgrade;
-3. lifecycle add/trim/hold rules;
-4. execution delta refinement;
-5. replay comparison;
-6. paper and testnet dry-run validation.
+2. regime score;
+3. sizing model upgrade on top of current account-risk sizing;
+4. lifecycle add / trim / hold rules;
+5. execution delta refinement;
+6. replay comparison;
+7. paper and testnet dry-run validation.
 
 That gives the biggest chance of improving CAGR without breaking the current shared trading chain.
