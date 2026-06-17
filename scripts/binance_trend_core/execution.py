@@ -77,15 +77,21 @@ class PositionReconciliationExecutionEngine:
             return ExecutionPlan(instructions=[], metadata={"skipped": True, "risk_result": risk_result})
         current_exposure = _current_symbol_exposure(portfolio_state, intent.symbol)
         desired_exposure = float(intent.desired_exposure or 0.0)
-        delta = desired_exposure - current_exposure
+        signal = intent.metadata.get("signal") if isinstance(intent.metadata, dict) else None
+        add_blocked = _signal_blocks_new_add(signal) and desired_exposure > current_exposure
+        effective_desired_exposure = current_exposure if add_blocked else desired_exposure
+        delta = effective_desired_exposure - current_exposure
         metadata = {
             "intent": intent,
             "portfolio_state": portfolio_state,
             "current_exposure": current_exposure,
             "desired_exposure": desired_exposure,
+            "effective_desired_exposure": effective_desired_exposure,
             "delta_exposure": delta,
         }
-        signal = intent.metadata.get("signal") if isinstance(intent.metadata, dict) else None
+        if add_blocked:
+            metadata["add_blocked"] = True
+            metadata["add_blockers"] = _signal_add_blockers(signal)
         instructions: list[OrderInstruction] = []
         if abs(delta) > self.min_delta:
             instructions.append(
@@ -99,14 +105,29 @@ class PositionReconciliationExecutionEngine:
                         "reference_price": _reference_price_from_signal(signal),
                         "current_exposure": current_exposure,
                         "desired_exposure": desired_exposure,
+                        "effective_desired_exposure": effective_desired_exposure,
                         "delta_exposure": delta,
                     },
                 )
             )
-        instructions.extend(_protective_orders(intent.symbol, desired_exposure, current_exposure, signal, portfolio_state))
+        instructions.extend(_protective_orders(intent.symbol, effective_desired_exposure, current_exposure, signal, portfolio_state))
         if not instructions:
-            return ExecutionPlan(instructions=[], metadata={**metadata, "skipped": True, "reason": "target_exposure_already_reached"})
+            reason = "add_blocked_by_signal" if add_blocked else "target_exposure_already_reached"
+            return ExecutionPlan(instructions=[], metadata={**metadata, "skipped": True, "reason": reason})
         return ExecutionPlan(instructions=instructions, metadata=metadata)
+
+
+def _signal_blocks_new_add(signal: Any) -> bool:
+    return isinstance(signal, dict) and signal.get("add_allowed") is False
+
+
+def _signal_add_blockers(signal: Any) -> list[str]:
+    if not isinstance(signal, dict):
+        return []
+    blockers = signal.get("add_blockers")
+    if isinstance(blockers, list):
+        return [str(item) for item in blockers]
+    return []
 
 
 def _reference_price_from_signal(signal: Any) -> float:

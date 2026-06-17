@@ -1,7 +1,7 @@
 ---
 name: binance-usds-futures-trend
 description: Use when developing or operating the crypto-trade-hermes Binance USDS-M futures trend Skill. Current code supports paper diagnostics/shared paper cycles, runtime-evidence replay, and a hardened testnet adapter; future work must preserve shared strategy, state, risk, lifecycle, execution, and evidence paths across paper/testnet/live.
-version: 1.11.0
+version: 1.11.1
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -210,18 +210,21 @@ Current signal model:
 5. Require enough candles for EMA200 and ATR14.
 6. Compute EMA50, EMA200, ATR14, trend strength, extension, and context flags.
 7. Main long-trend filter:
+   - use only **closed** Binance K-lines; drop the currently forming latest candle from `/fapi/v1/klines` before signal generation;
    - `close > EMA200`;
    - `EMA50 > EMA200`.
 8. If the major trend is valid:
    - action is `hold_long`;
    - ATR references define take-profit tranches and trailing stop;
    - excessive extension reduces paper size rather than forcing a full exit;
-   - context factors adjust confidence/size, not the core trend participation decision.
+   - context factors adjust confidence/size, not the core trend participation decision;
+   - `add_allowed` is true only when price is not below EMA50 and recent 6/12-candle slope is non-negative.
 9. If the major trend is invalid:
    - action is `flat`;
    - existing open paper lifecycle state may emit `exit` intent.
-10. In portfolio mode, allocate paper risk units by rank under total-budget and per-symbol caps.
-11. In lifecycle mode, persist paper entry/add/reduce/hold/exit intent, monotonic long trailing stops, and take-profit tranche records.
+10. Important semantics: `hold_long` means “major trend remains valid”, not “new add is allowed”. During a visible 1h pullback, the signal can remain `hold_long` but set `hold_existing_allowed=true`, `add_allowed=false`, `add_blockers=[...]`, and `market_regime=major_long_pullback_hold_only`. Position reconciliation must clip positive deltas to current exposure when `add_allowed=false`, while still allowing reductions and protective-order repair.
+11. In portfolio mode, allocate paper risk units by rank under total-budget and per-symbol caps.
+12. In lifecycle mode, persist paper entry/add/reduce/hold/exit intent, monotonic long trailing stops, and take-profit tranche records.
 
 Do not overfit this logic into a separate paper-only product. During the realtime-engine refactor, preserve the strategy rules as `Strategy`/`SignalEngine`, and move sizing/state/reconciliation into shared `RiskManager`, `PortfolioState`, and `ExecutionEngine` components.
 
@@ -373,6 +376,7 @@ Confirm:
 27. **Creating an extra run while diagnosing timing.** `cronjob(action="run")` and `hermes cron run` intentionally enqueue an immediate run on the next scheduler tick. If the user asks why a notification arrived at an odd minute, inspect existing job state and `cron/output/` only; do not trigger another run unless explicitly requested with execution-now intent such as “手动运行”, “立即运行”, “触发一次”, “run it now”, or “trigger once”. Do not treat generic words like “run result”, “运行结果”, or “runtime evidence” as authorization to execute.
 28. **Treating opening fees as closed-trade losses.** A filled BUY/opening order can have negative `net_pnl` because of commission, but it is not a closed losing trade. Closed-order analyzers should mark `loss_sample` from realized PnL or net loss on closing/reduction/protection orders, and keep ordinary opening orders as cost evidence rather than strategy-loss samples. See `references/session-v1.43-closed-order-analysis.md`.
 29. **Skipping independent review or timezone labels.** This repo requires independent agent review before push, and every time-related output must label UTC or 北京时间（UTC+8）.
+30. **Confusing major-trend `hold_long` with add permission.** The current long-only model can output `hold_long` while the visible 1h chart is declining if price remains above EMA200 and EMA50 remains above EMA200. New adds are separately gated: closed-candle signals set `add_allowed=false` when price is below EMA50 or recent 6/12-candle slope is negative, and position reconciliation blocks positive deltas while still allowing existing longs, reductions, and protection repair. Before calling it a cron/execution error, compare signal metadata, current vs desired exposure, EMA50/EMA200, `add_allowed`, `add_blockers`, recent 6/12-candle slope, and whether evidence came from closed candles. See `references/session-v1.45-long-only-pullback-add-diagnosis.md`.
 
 ## References
 
@@ -391,6 +395,8 @@ Canonical current references:
 - `references/session-v1.40-external-crypto-quant-skills-review.md` — comparison of external crypto/quant agent skills and frameworks; keep VectorBT/Hummingbot/AiCoin/Senpi ideas as references while excluding external trading skills from the deterministic testnet hot path.
 - `references/session-v1.41-testnet-delta-rebalance-and-entry-budget.md` — read-only audit pattern for explaining a specific hourly testnet decision: distinguish hold_long risk-resized reductions from trend exits, fixed hourly group scope from full-universe scans, and skipped entries caused by atomic entry/protection order-budget limits.
 - `references/session-v1.42-tp-replan-and-cron-runtime-template.md` — regression pattern for splitting SL vs TP protection targets during reductions and treating live `cron/jobs.json` as ignored scheduler runtime state with a sanitized tracked template.
+- `references/session-v1.44-daily-analyzer-cron-wiring.md` — pattern for wiring the daily read-only agent cron to prioritize `--daily-analyze-runtime`, keep replay as candidate comparison, sanitize `cron/jobs.template.json`, and validate the nested `daily_runtime_analysis.v1` output contract.
+- `references/session-v1.45-long-only-pullback-add-diagnosis.md` — diagnostic pattern for explaining why recent BUY/add signals can remain long during visible 1h pullbacks: current `hold_long` is a major-trend EMA200/EMA50 condition, not short-term momentum; check incomplete candles and split hold-vs-add semantics before changing strategy.
 - `references/session-v1.22-account-risk-sizing-cap-diagnosis.md` — diagnosing account-risk sizing that is dominated by fixed max-order/max-symbol exposure caps.
 - `references/session-v1.24-testnet-order-budget-and-postrun-reconstruction.md` — order-count budget lesson for entry + stop + TP tranches and safe post-run reconstruction.
 - `references/session-v1.25-testnet-cron-endpoint-and-order-budget-audit.md` — strict testnet endpoint arguments and order-budget enforcement.

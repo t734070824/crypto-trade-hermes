@@ -186,6 +186,34 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(instruction.metadata["desired_exposure"], 1.0)
         self.assertEqual(instruction.metadata["reference_price"], 75.0)
 
+    def test_position_reconciliation_execution_engine_respects_signal_add_blocker(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        intent = types.StrategyIntent(
+            symbol="SOLUSDT",
+            desired_exposure=1.0,
+            action="hold_long",
+            reason="major trend still valid but pullback blocks new adds",
+            metadata={
+                "signal": {
+                    "entry_reference": 75.0,
+                    "add_allowed": False,
+                    "add_blockers": ["below_ema50", "recent_12_candle_downtrend"],
+                }
+            },
+        )
+
+        plan = engine.plan_orders(intent, {"approved": True}, {"positions": {"SOLUSDT": {"size": 0.7}}})
+
+        self.assertEqual(plan.instructions, [])
+        self.assertTrue(plan.metadata["skipped"])
+        self.assertEqual(plan.metadata["reason"], "add_blocked_by_signal")
+        self.assertEqual(plan.metadata["desired_exposure"], 1.0)
+        self.assertEqual(plan.metadata["effective_desired_exposure"], 0.7)
+        self.assertEqual(plan.metadata["add_blockers"], ["below_ema50", "recent_12_candle_downtrend"])
+
     def test_position_reconciliation_execution_engine_skips_when_target_reached(self):
         execution = importlib.import_module("scripts.binance_trend_core.execution")
         types = importlib.import_module("scripts.binance_trend_core.types")
@@ -2865,6 +2893,18 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             with self.subTest(interval=interval):
                 self.assertEqual(trend.validate_interval(interval), interval)
 
+    def test_fetch_klines_drops_unclosed_latest_candle(self):
+        raw_rows = []
+        for idx in range(200):
+            raw_rows.append([idx, "100", "102", "99", str(100 + idx), "1", idx + 1])
+        raw_rows.append([200, "9999", "9999", "9999", "9999", "1", 9999999999999])
+
+        with mock.patch.object(trend, "_get_json", return_value=raw_rows):
+            candles = trend.fetch_klines("BTCUSDT", "1h", limit=200)
+
+        self.assertEqual(len(candles), 200)
+        self.assertEqual(candles[-1]["close"], 299.0)
+
     def test_generates_hold_long_decision_in_strong_uptrend(self):
         candles = []
         price = 100.0
@@ -2881,10 +2921,34 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(decision["symbol"], "BTCUSDT")
         self.assertEqual(decision["interval"], "1h")
         self.assertEqual(decision["action"], "hold_long")
+        self.assertTrue(decision["add_allowed"])
         self.assertGreater(decision["position_size"], 0)
         self.assertGreater(decision["take_profit_1"], decision["entry_reference"])
         self.assertGreater(decision["take_profit_2"], decision["take_profit_1"])
         self.assertLess(decision["trailing_stop"], decision["entry_reference"])
+
+    def test_hold_long_pullback_blocks_new_adds_but_keeps_existing_trend(self):
+        candles = []
+        price = 100.0
+        for _ in range(200):
+            open_price = price
+            close_price = price + 1.0
+            candles.append({"open": open_price, "high": close_price + 0.7, "low": open_price - 0.5, "close": close_price})
+            price = close_price
+        for _ in range(40):
+            open_price = price
+            close_price = price - 1.0
+            candles.append({"open": open_price, "high": open_price + 0.5, "low": close_price - 0.7, "close": close_price})
+            price = close_price
+
+        decision = trend.decide(candles, symbol="BTCUSDT", interval="1h")
+
+        self.assertEqual(decision["action"], "hold_long")
+        self.assertGreater(decision["position_size"], 0)
+        self.assertFalse(decision["add_allowed"])
+        self.assertTrue(decision["hold_existing_allowed"])
+        self.assertIn("below_ema50", decision["add_blockers"])
+        self.assertIn("recent_12_candle_downtrend", decision["add_blockers"])
 
     def test_generates_flat_decision_when_price_below_major_trend(self):
         candles = []

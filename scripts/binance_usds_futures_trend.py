@@ -115,15 +115,34 @@ def _get_json(path: str, params: dict[str, Any], base_url: str = BINANCE_FAPI_BA
         return json.loads(response.read().decode("utf-8"))
 
 
+def closed_candles_only(candles: list[dict[str, float]], *, now_ms: float | None = None) -> list[dict[str, float]]:
+    """Return only candles whose Binance close_time is not in the future.
+
+    Binance kline endpoints include the currently forming candle. Trading decisions
+    must use closed >=1h candles only; otherwise a first-minute partial candle can
+    trigger an add that disappears before the hour closes.
+    """
+    if now_ms is None:
+        now_ms = datetime.now(UTC).timestamp() * 1000.0
+    closed: list[dict[str, float]] = []
+    for candle in candles:
+        close_time = candle.get("close_time")
+        if close_time is None or float(close_time) <= now_ms:
+            closed.append(candle)
+    return closed
+
+
 def fetch_klines(symbol: str, interval: str, limit: int = 240, base_url: str = BINANCE_FAPI_BASE) -> list[dict[str, float]]:
     symbol = validate_symbol(symbol)
     interval = validate_interval(interval)
     if not 200 <= limit <= 1500:
         raise ValueError("limit must be between 200 and 1500 to support EMA200")
-    payload = _get_json("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit}, base_url)
+    request_limit = min(1500, limit + 1)
+    payload = _get_json("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": request_limit}, base_url)
     if not isinstance(payload, list):
         raise RuntimeError(f"unexpected Binance response: {payload!r}")
-    return parse_klines(payload)
+    candles = closed_candles_only(parse_klines(payload))
+    return candles[-limit:]
 
 
 def _last_float(rows: list[dict[str, Any]], key: str) -> float | None:
@@ -284,7 +303,18 @@ def decide(
     ema200 = ema(closes, 200)
     current_atr = atr(candles, 14)
     confidence_score, factor_flags = score_market_context(market_context)
+    recent_change_6 = _pct_change(closes[-7] if len(closes) >= 7 else None, last_close)
+    recent_change_12 = _pct_change(closes[-13] if len(closes) >= 13 else None, last_close)
     stamps = now_stamps()
+
+    add_blockers: list[str] = []
+    if last_close < ema50:
+        add_blockers.append("below_ema50")
+    if recent_change_6 is not None and recent_change_6 < 0.0:
+        add_blockers.append("recent_6_candle_downtrend")
+    if recent_change_12 is not None and recent_change_12 < 0.0:
+        add_blockers.append("recent_12_candle_downtrend")
+    add_allowed = len(add_blockers) == 0
 
     base: dict[str, Any] = {
         "symbol": symbol,
@@ -295,6 +325,12 @@ def decide(
         "ema50": round(ema50, 8),
         "ema200": round(ema200, 8),
         "atr14": round(current_atr, 8),
+        "recent_change_6_pct": None if recent_change_6 is None else round(recent_change_6, 8),
+        "recent_change_12_pct": None if recent_change_12 is None else round(recent_change_12, 8),
+        "add_allowed": add_allowed,
+        "add_blockers": add_blockers,
+        "hold_existing_allowed": False,
+        "market_regime": "unknown",
         "confidence_score": confidence_score,
         "factor_flags": factor_flags,
         "market_context": market_context or {},
@@ -308,6 +344,9 @@ def decide(
             "trailing_stop": None,
             "take_profit_1": None,
             "take_profit_2": None,
+            "add_allowed": False,
+            "hold_existing_allowed": False,
+            "market_regime": "flat",
             "reason": "major trend filter failed: require close > EMA200 and EMA50 > EMA200",
         }
 
@@ -323,7 +362,9 @@ def decide(
         "trailing_stop": round(last_close - 3.0 * current_atr, 8),
         "take_profit_1": round(last_close + 2.0 * current_atr, 8),
         "take_profit_2": round(last_close + 4.0 * current_atr, 8),
-        "reason": "major trend filter passed: participate in trend, harvest by ATR tranches, trail stop by ATR; v0.2 factors adjust confidence only",
+        "hold_existing_allowed": True,
+        "market_regime": "major_long_add_allowed" if add_allowed else "major_long_pullback_hold_only",
+        "reason": "major trend filter passed: participate in trend, harvest by ATR tranches, trail stop by ATR; new adds require price above EMA50 and non-negative recent 6/12-candle slope; v0.2 factors adjust confidence only",
     }
 
 

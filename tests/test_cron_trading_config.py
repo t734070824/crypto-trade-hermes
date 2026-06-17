@@ -45,8 +45,10 @@ class TestnetAgentHourlyCronConfigTests(unittest.TestCase):
 
         self.assertIs(job["no_agent"], True)
         self.assertEqual(job["script"], "binance_usds_futures_testnet_hourly.sh")
-        self.assertEqual(job["schedule"]["display"], "5 * * * *")
-        self.assertEqual(job["schedule"]["expr"], "5 * * * *")
+        self.assertEqual(job["schedule"]["display"], "1 * * * *")
+        self.assertEqual(job["schedule"]["expr"], "1 * * * *")
+        self.assertIs(job["enabled"], False)
+        self.assertEqual(job["state"], "paused")
 
     def test_hourly_testnet_script_uses_account_proportional_exposure_not_micro_probe_cap(self):
         captured_argv = []
