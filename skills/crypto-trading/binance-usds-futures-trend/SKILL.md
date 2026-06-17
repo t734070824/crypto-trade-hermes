@@ -287,6 +287,7 @@ Current priority is documentation and architecture alignment, then implementatio
 8. Add live adapter only after testnet validation, explicit risk caps, kill switch, audit logs, runtime evidence review, and user approval.
 9. Keep Telegram output as observability around the real trading loop, not as the source of trading state.
 10. Use recorded runtime data to evaluate and evolve future strategy variants before promotion.
+11. For daily read-only runtime diagnosis, load both runtime JSONL and raw order journal evidence; do not rely on closed-order attribution alone. See `references/daily-runtime-analysis.md`.
 
 Do not add more report-only paper features unless they directly support the shared realtime engine, runtime data collection, strategy evolution, or diagnostics around it.
 
