@@ -146,6 +146,12 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(len(state["fills"]), 1)
         self.assertNotRegex(json.dumps(state).lower(), r"(api_key|secret|signature|signed|live_order)")
 
+        short_fill = broker.submit_order(execution.OrderInstruction(symbol="ETHUSDT", side="SELL", quantity=0.25, metadata={"reference_price": 200.0}))
+        self.assertEqual(short_fill["side"], "SELL")
+        short_state = broker.get_account_state()
+        self.assertEqual(short_state["positions"]["ETHUSDT"]["size"], -0.25)
+        self.assertGreater(short_state["positions"]["ETHUSDT"]["entry_price"], 0.0)
+
     def test_paper_execution_engine_turns_intents_into_broker_instructions(self):
         execution = importlib.import_module("scripts.binance_trend_core.execution")
         types = importlib.import_module("scripts.binance_trend_core.types")
@@ -161,6 +167,12 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(instruction.side, "BUY")
         self.assertEqual(instruction.quantity, 1.25)
         self.assertTrue(instruction.metadata["paper_intent"])
+
+        short_intent = types.StrategyIntent(symbol="ETHUSDT", desired_exposure=-0.75, action="hold_short", reason="short trend")
+        short_plan = engine.plan_orders(short_intent, {"approved": True}, {"positions_by_symbol": {}})
+        self.assertEqual(len(short_plan.instructions), 1)
+        self.assertEqual(short_plan.instructions[0].side, "SELL")
+        self.assertEqual(short_plan.instructions[0].quantity, 0.75)
 
     def test_position_reconciliation_execution_engine_plans_only_delta(self):
         execution = importlib.import_module("scripts.binance_trend_core.execution")
@@ -213,6 +225,92 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(plan.metadata["desired_exposure"], 1.0)
         self.assertEqual(plan.metadata["effective_desired_exposure"], 0.7)
         self.assertEqual(plan.metadata["add_blockers"], ["below_ema50", "recent_12_candle_downtrend"])
+
+    def test_position_reconciliation_execution_engine_plans_short_delta_and_buy_protection(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        intent = types.StrategyIntent(
+            symbol="ETHUSDT",
+            desired_exposure=-0.6,
+            action="hold_short",
+            reason="major short trend",
+            metadata={
+                "signal": {
+                    "entry_reference": 100.0,
+                    "trailing_stop": 110.0,
+                    "take_profit_1": 90.0,
+                    "take_profit_2": 80.0,
+                    "add_allowed": True,
+                }
+            },
+        )
+
+        plan = engine.plan_orders(intent, {"approved": True}, {"positions": {"ETHUSDT": {"size": -0.2}}, "open_algo_orders": []})
+
+        self.assertEqual([item.side for item in plan.instructions], ["SELL", "BUY", "BUY", "BUY"])
+        self.assertEqual([item.order_type for item in plan.instructions], ["MARKET", "STOP_MARKET", "TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET"])
+        self.assertAlmostEqual(plan.instructions[0].quantity, 0.4)
+        self.assertEqual(plan.instructions[1].metadata["action"], "protect_short")
+        self.assertEqual(plan.instructions[1].metadata["stop_price"], 110.0)
+        self.assertTrue(plan.instructions[1].metadata["close_position"])
+        self.assertEqual(plan.instructions[2].metadata["stop_price"], 90.0)
+        self.assertEqual(plan.instructions[3].metadata["stop_price"], 80.0)
+        self.assertTrue(plan.instructions[2].metadata["reduce_only"])
+        self.assertTrue(plan.instructions[3].metadata["reduce_only"])
+
+    def test_position_reconciliation_blocks_new_short_adds_when_signal_disallows_add(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        intent = types.StrategyIntent(
+            symbol="ETHUSDT",
+            desired_exposure=-1.0,
+            action="hold_short",
+            reason="major short trend but bounce blocks new shorts",
+            metadata={"signal": {"entry_reference": 100.0, "add_allowed": False, "add_blockers": ["above_ema50"]}},
+        )
+
+        plan = engine.plan_orders(intent, {"approved": True}, {"positions": {"ETHUSDT": {"size": -0.4}}})
+
+        self.assertEqual(plan.instructions, [])
+        self.assertTrue(plan.metadata["skipped"])
+        self.assertEqual(plan.metadata["reason"], "add_blocked_by_signal")
+        self.assertEqual(plan.metadata["effective_desired_exposure"], -0.4)
+        self.assertEqual(plan.metadata["add_blockers"], ["above_ema50"])
+
+    def test_position_reconciliation_add_blocker_never_crosses_through_flat(self):
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        types = importlib.import_module("scripts.binance_trend_core.types")
+
+        engine = execution.PositionReconciliationExecutionEngine()
+        long_to_short = types.StrategyIntent(
+            symbol="ETHUSDT",
+            desired_exposure=-1.0,
+            action="hold_short",
+            reason="major short trend but bounce blocks new shorts",
+            metadata={"signal": {"entry_reference": 100.0, "trailing_stop": 110.0, "take_profit_1": 90.0, "take_profit_2": 80.0, "add_allowed": False, "add_blockers": ["above_ema50"]}},
+        )
+        plan = engine.plan_orders(long_to_short, {"approved": True}, {"positions": {"ETHUSDT": {"size": 0.4}}})
+        self.assertEqual(len(plan.instructions), 1)
+        self.assertEqual(plan.instructions[0].side, "SELL")
+        self.assertAlmostEqual(plan.instructions[0].quantity, 0.4)
+        self.assertEqual(plan.metadata["effective_desired_exposure"], 0.0)
+
+        short_to_long = types.StrategyIntent(
+            symbol="ETHUSDT",
+            desired_exposure=1.0,
+            action="hold_long",
+            reason="major long trend but pullback blocks new longs",
+            metadata={"signal": {"entry_reference": 100.0, "trailing_stop": 90.0, "take_profit_1": 110.0, "take_profit_2": 120.0, "add_allowed": False, "add_blockers": ["below_ema50"]}},
+        )
+        plan = engine.plan_orders(short_to_long, {"approved": True}, {"positions": {"ETHUSDT": {"size": -0.3}}})
+        self.assertEqual(len(plan.instructions), 1)
+        self.assertEqual(plan.instructions[0].side, "BUY")
+        self.assertAlmostEqual(plan.instructions[0].quantity, 0.3)
+        self.assertEqual(plan.metadata["effective_desired_exposure"], 0.0)
 
     def test_position_reconciliation_execution_engine_skips_when_target_reached(self):
         execution = importlib.import_module("scripts.binance_trend_core.execution")
@@ -565,6 +663,28 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertFalse(event["real_order_submitted"])
         self.assertFalse(event["signed"])
         self.assertEqual(broker.submitted_order_count, 0)
+
+    def test_testnet_broker_dry_run_tracks_short_entry_price(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials(api_key="k", api_secret="s"),
+            dry_run=True,
+        )
+        event = broker.submit_order(
+            execution.OrderInstruction(
+                symbol="ETHUSDT",
+                side="SELL",
+                quantity=0.25,
+                metadata={"reference_price": 200.0},
+            )
+        )
+
+        self.assertFalse(event["real_order_submitted"])
+        state = broker.get_account_state()
+        self.assertEqual(state["positions"]["ETHUSDT"]["size"], -0.25)
+        self.assertEqual(state["positions"]["ETHUSDT"]["entry_price"], 200.0)
 
     def test_testnet_broker_rejects_invalid_algo_cancel_before_signing(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
@@ -1161,7 +1281,6 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             {
                 "positions": [
                     {"symbol": "BTCUSDT", "positionAmt": "0.02"},
-                    {"symbol": "ETHUSDT", "positionAmt": "-0.5"},
                 ],
                 "open_algo_orders": [
                     {"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "triggerPrice": "90"},
@@ -1171,7 +1290,6 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         )
         self.assertFalse(unsafe["all_positions_protected"])
         self.assertEqual(unsafe["unprotected_symbols"], ["BTCUSDT"])
-        self.assertEqual(unsafe["ignored_short_symbols"], ["ETHUSDT"])
         self.assertIn("missing_stop_loss", unsafe["symbols"]["BTCUSDT"]["issues"])
         self.assertIn("missing_take_profit", unsafe["symbols"]["BTCUSDT"]["issues"])
 
@@ -1210,6 +1328,34 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             }
         )
         self.assertTrue(safe["all_positions_protected"])
+
+    def test_verify_position_protection_supports_safe_short_buy_protection(self):
+        safe = trend.verify_position_protection(
+            {
+                "positions": [{"symbol": "ETHUSDT", "positionAmt": "-0.5"}],
+                "open_algo_orders": [
+                    {"symbol": "ETHUSDT", "orderType": "STOP_MARKET", "side": "BUY", "closePosition": "true", "triggerPrice": "110"},
+                    {"symbol": "ETHUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "BUY", "reduceOnly": "true", "origQty": "0.5", "triggerPrice": "90"},
+                ],
+            }
+        )
+
+        self.assertTrue(safe["all_positions_protected"])
+        self.assertEqual(safe["unprotected_symbols"], [])
+        self.assertEqual(safe["symbols"]["ETHUSDT"]["position_amt"], -0.5)
+
+        wrong_side = trend.verify_position_protection(
+            {
+                "positions": [{"symbol": "ETHUSDT", "positionAmt": "-0.5"}],
+                "open_algo_orders": [
+                    {"symbol": "ETHUSDT", "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true", "triggerPrice": "110"},
+                    {"symbol": "ETHUSDT", "orderType": "TAKE_PROFIT_MARKET", "side": "SELL", "reduceOnly": "true", "origQty": "0.5", "triggerPrice": "90"},
+                ],
+            }
+        )
+
+        self.assertFalse(wrong_side["all_positions_protected"])
+        self.assertEqual(wrong_side["unprotected_symbols"], ["ETHUSDT"])
 
     def test_verify_position_protection_can_scope_to_cycle_symbols(self):
         scoped = trend.verify_position_protection(
@@ -2138,7 +2284,50 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             self.assertIn("triggerPrice", rows[3]["request"]["params"])
             self.assertIn("client_order_id", rows[0])
             self.assertIn("exchange_rule_adjustments", rows[0])
+            self.assertEqual(rows[1]["request"]["params"]["closePosition"], "true")
             self.assertNotIn("signature", json.dumps(rows))
+
+    def test_run_testnet_trading_cycle_blocks_signed_short_by_default(self):
+        class FakeHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append((method, url))
+                if "/fapi/v1/exchangeInfo" in url:
+                    return {"symbols": [{"symbol": "BTCUSDT", "filters": [{"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"}, {"filterType": "PRICE_FILTER", "tickSize": "0.10"}, {"filterType": "MIN_NOTIONAL", "notional": "5"}]}]}
+                if "/fapi/v2/account" in url:
+                    return {"assets": [{"asset": "USDT", "walletBalance": "1000", "availableBalance": "1000"}]}
+                if "/fapi/v2/positionRisk" in url:
+                    return [{"symbol": "BTCUSDT", "positionAmt": "0.0"}]
+                if "/fapi/v1/openOrders" in url or "/fapi/v1/openAlgoOrders" in url:
+                    return []
+                if method == "POST":
+                    raise AssertionError("signed short must be blocked before POST")
+                raise AssertionError(url)
+
+        def fake_fetch_klines(symbol, interval, limit, base_url):
+            return [
+                {"open": 300.0 - idx, "high": 301.0 - idx, "low": 299.0 - idx, "close": 299.5 - idx}
+                for idx in range(240)
+            ]
+
+        client = FakeHttpClient()
+        with mock.patch.dict(os.environ, {"LALA_KEY": "k", "LALA_SECRET": "s"}), mock.patch.object(trend, "fetch_klines", fake_fetch_klines):
+            cycle = trend.run_testnet_trading_cycle(
+                ["BTCUSDT"],
+                interval="1h",
+                limit=240,
+                save_runtime_record=False,
+                dry_run=False,
+                testnet_http_client=client,
+            )
+
+        self.assertEqual(cycle["errors"], [])
+        self.assertFalse(any(call[0] == "POST" for call in client.calls))
+        self.assertEqual(cycle["signals"][0]["action"], "flat")
+        self.assertTrue(cycle["signals"][0]["short_signal_blocked"])
+        self.assertEqual(cycle["desired_orders"], [])
 
     def test_run_testnet_trading_cycle_uses_remote_position_to_avoid_repeated_full_target_order(self):
         class FakeHttpClient:
@@ -2927,6 +3116,53 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertGreater(decision["take_profit_2"], decision["take_profit_1"])
         self.assertLess(decision["trailing_stop"], decision["entry_reference"])
 
+    def test_generates_hold_short_decision_in_strong_downtrend(self):
+        candles = []
+        price = 300.0
+        for _ in range(240):
+            open_price = price
+            close_price = price - 1.0
+            candles.append({"open": open_price, "high": open_price + 0.5, "low": close_price - 0.7, "close": close_price})
+            price = close_price
+
+        decision = trend.decide(candles, symbol="ETHUSDT", interval="1h")
+
+        self.assertEqual(decision["action"], "hold_short")
+        self.assertEqual(decision["exposure_direction"], "short")
+        self.assertGreater(decision["position_size"], 0)
+        self.assertTrue(decision["add_allowed"])
+        self.assertTrue(decision["hold_existing_allowed"])
+        self.assertGreater(decision["trailing_stop"], decision["entry_reference"])
+        self.assertLess(decision["take_profit_1"], decision["entry_reference"])
+        self.assertLess(decision["take_profit_2"], decision["take_profit_1"])
+
+    def test_trend_participation_strategy_maps_hold_short_to_negative_exposure(self):
+        strategy_module = importlib.import_module("scripts.binance_trend_core.strategy")
+
+        intent = strategy_module.TrendParticipationStrategy().generate_intent(
+            {"symbol": "ETHUSDT", "action": "hold_short", "position_size": 0.75, "reason": "short trend"}
+        )
+
+        self.assertEqual(intent.action, "hold_short")
+        self.assertEqual(intent.desired_exposure, -0.75)
+
+    def test_account_risk_sizing_supports_short_stop_above_entry(self):
+        signal = {
+            "symbol": "ETHUSDT",
+            "action": "hold_short",
+            "position_size": 1.0,
+            "entry_reference": 100.0,
+            "trailing_stop": 112.0,
+        }
+        snapshot = {"account": {"availableBalance": "1000", "totalMarginBalance": "1000"}}
+
+        sized = trend.apply_account_risk_sizing_to_signal(signal, snapshot, account_risk_fraction=0.012, target_leverage=2.0)
+
+        self.assertEqual(sized["action"], "hold_short")
+        self.assertGreater(sized["position_size"], 0)
+        self.assertEqual(sized["account_risk_sizing"]["direction"], "short")
+        self.assertEqual(sized["account_risk_sizing"]["stop_distance"], 12.0)
+
     def test_hold_long_pullback_blocks_new_adds_but_keeps_existing_trend(self):
         candles = []
         price = 100.0
@@ -2952,14 +3188,13 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
 
     def test_generates_flat_decision_when_price_below_major_trend(self):
         candles = []
-        price = 300.0
-        for i in range(240):
+        price = 100.0
+        for _ in range(240):
             open_price = price
-            close_price = price - 1.0
-            high = open_price + 0.5
-            low = close_price - 0.7
+            close_price = price
+            high = close_price + 0.5
+            low = close_price - 0.5
             candles.append({"open": open_price, "high": high, "low": low, "close": close_price})
-            price = close_price
 
         decision = trend.decide(candles, symbol="ETHUSDT", interval="4h")
 
@@ -3059,7 +3294,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         candle_map = {
             "BTCUSDT": make_candles(100, 1.0),
             "SOLUSDT": make_candles(50, 0.6),
-            "ETHUSDT": make_candles(300, -1.0),
+            "ETHUSDT": make_candles(100, 0.0),
         }
         context_map = {
             "BTCUSDT": {
@@ -3125,7 +3360,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
             ("SOLUSDT", "1h"): make_candles(50, 0.8),
             ("SOLUSDT", "4h"): make_candles(200, -0.4),
             ("SOLUSDT", "1d"): make_candles(200, -0.5),
-            ("ETHUSDT", "1h"): make_candles(300, -0.7),
+            ("ETHUSDT", "1h"): make_candles(100, 0.0),
             ("ETHUSDT", "4h"): make_candles(100, 0.7),
             ("ETHUSDT", "1d"): make_candles(100, 0.8),
         }
@@ -3199,7 +3434,7 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertIn("rank_score=100.0", allocation["allocations"][0]["allocation_explanation"])
         self.assertEqual(allocation["skipped_symbols"], ["ETHUSDT", "DOGEUSDT"])
         skip_reasons = {item["symbol"]: item["skip_reason"] for item in allocation["skipped_details"]}
-        self.assertEqual(skip_reasons["ETHUSDT"], "not_hold_long")
+        self.assertEqual(skip_reasons["ETHUSDT"], "not_trend_hold")
         self.assertEqual(skip_reasons["DOGEUSDT"], "no_remaining_budget")
 
     def test_scan_symbols_can_include_portfolio_risk_allocation(self):

@@ -36,12 +36,13 @@ class PaperIntentExecutionEngine:
     def plan_orders(self, intent: StrategyIntent, risk_result: dict[str, Any], portfolio_state: dict[str, Any]) -> ExecutionPlan:
         if not risk_result.get("approved", False):
             return ExecutionPlan(instructions=[], metadata={"skipped": True, "risk_result": risk_result})
-        if intent.desired_exposure <= 0:
-            side = "SELL" if intent.action == "flat" else "NONE"
-        else:
+        desired_exposure = float(intent.desired_exposure or 0.0)
+        if desired_exposure > 0:
             side = "BUY"
-        if side == "NONE":
-            return ExecutionPlan(instructions=[], metadata={"intent": intent, "portfolio_state": portfolio_state})
+        elif desired_exposure < 0:
+            side = "SELL"
+        else:
+            return ExecutionPlan(instructions=[], metadata={"intent": intent, "portfolio_state": portfolio_state, "skipped": True, "reason": "zero_desired_exposure"})
         signal = intent.metadata.get("signal") if isinstance(intent.metadata, dict) else None
         reference_price = _reference_price_from_signal(signal)
         return ExecutionPlan(
@@ -49,7 +50,7 @@ class PaperIntentExecutionEngine:
                 OrderInstruction(
                     symbol=intent.symbol,
                     side=side,
-                    quantity=abs(intent.desired_exposure),
+                    quantity=abs(desired_exposure),
                     metadata={
                         "paper_intent": True,
                         "action": intent.action,
@@ -78,8 +79,8 @@ class PositionReconciliationExecutionEngine:
         current_exposure = _current_symbol_exposure(portfolio_state, intent.symbol)
         desired_exposure = float(intent.desired_exposure or 0.0)
         signal = intent.metadata.get("signal") if isinstance(intent.metadata, dict) else None
-        add_blocked = _signal_blocks_new_add(signal) and desired_exposure > current_exposure
-        effective_desired_exposure = current_exposure if add_blocked else desired_exposure
+        add_blocked = _signal_blocks_new_add(signal) and _requires_new_exposure(current_exposure, desired_exposure)
+        effective_desired_exposure = _add_gate_effective_desired_exposure(current_exposure, desired_exposure) if add_blocked else desired_exposure
         delta = effective_desired_exposure - current_exposure
         metadata = {
             "intent": intent,
@@ -110,7 +111,8 @@ class PositionReconciliationExecutionEngine:
                     },
                 )
             )
-        instructions.extend(_protective_orders(intent.symbol, effective_desired_exposure, current_exposure, signal, portfolio_state))
+        protective_signal = None if _blocked_cross_direction_to_flat(add_blocked, current_exposure, desired_exposure, effective_desired_exposure) else signal
+        instructions.extend(_protective_orders(intent.symbol, effective_desired_exposure, current_exposure, protective_signal, portfolio_state))
         if not instructions:
             reason = "add_blocked_by_signal" if add_blocked else "target_exposure_already_reached"
             return ExecutionPlan(instructions=[], metadata={**metadata, "skipped": True, "reason": reason})
@@ -119,6 +121,40 @@ class PositionReconciliationExecutionEngine:
 
 def _signal_blocks_new_add(signal: Any) -> bool:
     return isinstance(signal, dict) and signal.get("add_allowed") is False
+
+
+def _requires_new_exposure(current_exposure: float, desired_exposure: float) -> bool:
+    current = float(current_exposure or 0.0)
+    desired = float(desired_exposure or 0.0)
+    if abs(desired) <= 1e-12:
+        return False
+    if abs(current) <= 1e-12:
+        return True
+    if current * desired < 0:
+        return True
+    return abs(desired) > abs(current) + 1e-12
+
+
+def _add_gate_effective_desired_exposure(current_exposure: float, desired_exposure: float) -> float:
+    """When add gate is closed, allow reductions but never create/increase exposure."""
+    current = float(current_exposure or 0.0)
+    desired = float(desired_exposure or 0.0)
+    if current * desired < 0:
+        return 0.0
+    if abs(current) <= 1e-12:
+        return 0.0
+    if abs(desired) > abs(current):
+        return current
+    return desired
+
+
+def _blocked_cross_direction_to_flat(add_blocked: bool, current_exposure: float, desired_exposure: float, effective_desired_exposure: float) -> bool:
+    if not add_blocked:
+        return False
+    current = float(current_exposure or 0.0)
+    desired = float(desired_exposure or 0.0)
+    effective = float(effective_desired_exposure or 0.0)
+    return current * desired < 0 and abs(effective) <= 1e-12
 
 
 def _signal_add_blockers(signal: Any) -> list[str]:
@@ -166,6 +202,8 @@ def _protective_orders(
 ) -> list[OrderInstruction]:
     if not isinstance(signal, dict):
         return []
+    if float(desired_exposure or 0.0) < 0 or float(current_exposure or 0.0) < 0:
+        return _short_protective_orders(symbol, desired_exposure, current_exposure, signal, portfolio_state)
     stop_target_exposure = max(float(desired_exposure or 0.0), float(current_exposure or 0.0))
     take_profit_target_exposure = max(0.0, float(desired_exposure or 0.0))
     if stop_target_exposure <= 0 and take_profit_target_exposure <= 0:
@@ -211,6 +249,61 @@ def _protective_orders(
                 qty = min(max(0.0, per_layer_qty - coverage), remaining_tp_exposure)
                 if qty > 0:
                     orders.append(_take_profit_instruction(symbol, qty, reference_price, price, role))
+                    remaining_tp_exposure = max(0.0, remaining_tp_exposure - qty)
+                if remaining_tp_exposure <= 0:
+                    break
+    return orders
+
+
+def _short_protective_orders(
+    symbol: str,
+    desired_exposure: float,
+    current_exposure: float,
+    signal: dict[str, Any],
+    portfolio_state: dict[str, Any],
+) -> list[OrderInstruction]:
+    stop_target_exposure = max(abs(float(desired_exposure or 0.0)), abs(float(current_exposure or 0.0)))
+    take_profit_target_exposure = max(0.0, abs(float(desired_exposure or 0.0)))
+    if stop_target_exposure <= 0 and take_profit_target_exposure <= 0:
+        return []
+    reference_price = _reference_price_from_signal(signal)
+    stop_price = _positive_signal_price(signal.get("trailing_stop"))
+    take_profit_1 = _positive_signal_price(signal.get("take_profit_1"))
+    take_profit_2 = _positive_signal_price(signal.get("take_profit_2"))
+    orders: list[OrderInstruction] = []
+    existing_stops = _open_short_protections(portfolio_state, symbol, "stop_loss", target_exposure=stop_target_exposure)
+    existing_stop = _tightest_short_stop(existing_stops)
+    for stale_stop in existing_stops:
+        if stale_stop is not existing_stop:
+            orders.append(_cancel_algo_instruction(symbol, stale_stop, "stale_short_stop_loss_replacement"))
+    if stop_price is not None and stop_target_exposure > 0:
+        existing_stop_price = _positive_signal_price((existing_stop or {}).get("triggerPrice") or (existing_stop or {}).get("stopPrice"))
+        if existing_stop is None:
+            orders.append(_short_stop_loss_instruction(symbol, stop_target_exposure, reference_price, stop_price, trailing_replacement=False))
+        elif existing_stop_price is not None and stop_price < existing_stop_price:
+            orders.append(_short_stop_loss_instruction(symbol, stop_target_exposure, reference_price, stop_price, trailing_replacement=True))
+    configured_layers = _configured_take_profit_layers(take_profit_1, take_profit_2)
+    stale_take_profits = _stale_short_take_profit_protections(portfolio_state, symbol, configured_layers, take_profit_target_exposure)
+    stale_take_profit_keys = {_protection_key(item) for item in stale_take_profits}
+    for stale_tp in stale_take_profits:
+        orders.append(_cancel_algo_instruction(symbol, stale_tp, "stale_short_take_profit_replacement"))
+    if take_profit_target_exposure <= 0:
+        return orders
+    existing_tp_coverage = _existing_short_take_profit_coverage(portfolio_state, symbol, take_profit_target_exposure, excluded_keys=stale_take_profit_keys)
+    remaining_tp_exposure = max(0.0, take_profit_target_exposure - existing_tp_coverage)
+    if remaining_tp_exposure > 0:
+        if take_profit_1 is None and take_profit_2 is not None:
+            coverage = _short_take_profit_coverage_at_price(portfolio_state, symbol, take_profit_2, take_profit_target_exposure, excluded_keys=stale_take_profit_keys)
+            qty = min(max(0.0, take_profit_target_exposure - coverage), remaining_tp_exposure)
+            if qty > 0:
+                orders.append(_short_take_profit_instruction(symbol, qty, reference_price, take_profit_2, "take_profit_2"))
+        else:
+            per_layer_qty = take_profit_target_exposure / max(1, len(configured_layers))
+            for role, price in configured_layers:
+                coverage = _short_take_profit_coverage_at_price(portfolio_state, symbol, price, per_layer_qty, excluded_keys=stale_take_profit_keys)
+                qty = min(max(0.0, per_layer_qty - coverage), remaining_tp_exposure)
+                if qty > 0:
+                    orders.append(_short_take_profit_instruction(symbol, qty, reference_price, price, role))
                     remaining_tp_exposure = max(0.0, remaining_tp_exposure - qty)
                 if remaining_tp_exposure <= 0:
                     break
@@ -274,6 +367,43 @@ def _take_profit_instruction(symbol: str, quantity: float, reference_price: floa
     )
 
 
+def _short_stop_loss_instruction(symbol: str, target_exposure: float, reference_price: float, stop_price: float, *, trailing_replacement: bool) -> OrderInstruction:
+    return OrderInstruction(
+        symbol=symbol,
+        side="BUY",
+        quantity=abs(target_exposure),
+        order_type="STOP_MARKET",
+        metadata={
+            "protective_order": True,
+            "protection_role": "stop_loss",
+            "close_position": True,
+            "working_type": "MARK_PRICE",
+            "stop_price": stop_price,
+            "reference_price": reference_price,
+            "action": "protect_short",
+            "trailing_stop_replacement": trailing_replacement,
+        },
+    )
+
+
+def _short_take_profit_instruction(symbol: str, quantity: float, reference_price: float, take_profit_price: float, role: str) -> OrderInstruction:
+    return OrderInstruction(
+        symbol=symbol,
+        side="BUY",
+        quantity=abs(quantity),
+        order_type="TAKE_PROFIT_MARKET",
+        metadata={
+            "protective_order": True,
+            "protection_role": role,
+            "reduce_only": True,
+            "working_type": "MARK_PRICE",
+            "stop_price": take_profit_price,
+            "reference_price": reference_price,
+            "action": "protect_short",
+        },
+    )
+
+
 def _positive_signal_price(value: Any) -> float | None:
     try:
         price = float(value)
@@ -317,12 +447,38 @@ def _open_protections(portfolio_state: dict[str, Any], symbol: str, role: str, *
     return rows
 
 
+def _open_short_protections(portfolio_state: dict[str, Any], symbol: str, role: str, *, target_exposure: float | None = None) -> list[dict[str, Any]]:
+    symbol = symbol.upper()
+    wanted_types = {"stop_loss": {"STOP", "STOP_MARKET"}, "take_profit": {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}}.get(role, set())
+    rows: list[dict[str, Any]] = []
+    for item in _protection_rows(portfolio_state, symbol):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("symbol", "")).upper() != symbol:
+            continue
+        order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
+        effective_target = target_exposure
+        if role == "take_profit" and effective_target is None:
+            effective_target = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
+        if order_type in wanted_types and _is_safe_short_protection(item, role, target_exposure=effective_target):
+            rows.append(item)
+    return rows
+
+
 def _tightest_long_stop(stops: list[dict[str, Any]]) -> dict[str, Any] | None:
     priced = [(item, _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))) for item in stops]
     priced = [(item, price) for item, price in priced if price is not None]
     if not priced:
         return stops[0] if stops else None
     return max(priced, key=lambda pair: pair[1])[0]
+
+
+def _tightest_short_stop(stops: list[dict[str, Any]]) -> dict[str, Any] | None:
+    priced = [(item, _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))) for item in stops]
+    priced = [(item, price) for item, price in priced if price is not None]
+    if not priced:
+        return stops[0] if stops else None
+    return min(priced, key=lambda pair: pair[1])[0]
 
 
 def _has_open_protection(portfolio_state: dict[str, Any], symbol: str, role: str, *, target_exposure: float | None = None) -> bool:
@@ -368,6 +524,31 @@ def _existing_take_profit_coverage(
     return min(coverage, target_exposure)
 
 
+def _existing_short_take_profit_coverage(
+    portfolio_state: dict[str, Any],
+    symbol: str,
+    target_exposure: float,
+    *,
+    excluded_keys: set[tuple[str, str]] | None = None,
+) -> float:
+    symbol = symbol.upper()
+    excluded_keys = excluded_keys or set()
+    coverage = 0.0
+    for item in _protection_rows(portfolio_state, symbol):
+        if not isinstance(item, dict) or str(item.get("symbol", "")).upper() != symbol:
+            continue
+        if _protection_key(item) in excluded_keys:
+            continue
+        order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
+        quantity = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
+        if order_type not in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"} or quantity is None:
+            continue
+        if not _is_safe_short_protection(item, "take_profit", target_exposure=quantity):
+            continue
+        coverage += min(quantity, target_exposure)
+    return min(coverage, target_exposure)
+
+
 def _take_profit_coverage_at_price(
     portfolio_state: dict[str, Any],
     symbol: str,
@@ -389,6 +570,35 @@ def _take_profit_coverage_at_price(
         if order_type not in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"} or quantity is None:
             continue
         if not _is_safe_long_protection(item, "take_profit", target_exposure=quantity):
+            continue
+        existing_price = _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))
+        if existing_price is None or abs(existing_price - trigger_price) > max(1e-8, abs(trigger_price) * 0.0001):
+            continue
+        coverage += min(quantity, layer_target_exposure)
+    return min(coverage, layer_target_exposure)
+
+
+def _short_take_profit_coverage_at_price(
+    portfolio_state: dict[str, Any],
+    symbol: str,
+    trigger_price: float,
+    layer_target_exposure: float,
+    *,
+    excluded_keys: set[tuple[str, str]] | None = None,
+) -> float:
+    symbol = symbol.upper()
+    excluded_keys = excluded_keys or set()
+    coverage = 0.0
+    for item in _protection_rows(portfolio_state, symbol):
+        if not isinstance(item, dict) or str(item.get("symbol", "")).upper() != symbol:
+            continue
+        if _protection_key(item) in excluded_keys:
+            continue
+        order_type = str(item.get("type") or item.get("origType") or item.get("orderType") or "").upper()
+        quantity = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
+        if order_type not in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"} or quantity is None:
+            continue
+        if not _is_safe_short_protection(item, "take_profit", target_exposure=quantity):
             continue
         existing_price = _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))
         if existing_price is None or abs(existing_price - trigger_price) > max(1e-8, abs(trigger_price) * 0.0001):
@@ -425,6 +635,34 @@ def _stale_take_profit_protections(
     return stale
 
 
+def _stale_short_take_profit_protections(
+    portfolio_state: dict[str, Any],
+    symbol: str,
+    configured_layers: list[tuple[str, float]],
+    target_exposure: float,
+) -> list[dict[str, Any]]:
+    if not configured_layers:
+        return _open_short_protections(portfolio_state, symbol, "take_profit", target_exposure=None)
+    if target_exposure <= 0:
+        return _open_short_protections(portfolio_state, symbol, "take_profit", target_exposure=None)
+    layer_target = target_exposure / max(1, len(configured_layers))
+    stale: list[dict[str, Any]] = []
+    for item in _open_short_protections(portfolio_state, symbol, "take_profit", target_exposure=None):
+        existing_price = _positive_signal_price(item.get("triggerPrice") or item.get("stopPrice"))
+        matching_layers = [
+            role
+            for role, configured_price in configured_layers
+            if existing_price is not None and abs(existing_price - configured_price) <= max(1e-8, abs(configured_price) * 0.0001)
+        ]
+        if not matching_layers:
+            stale.append(item)
+            continue
+        quantity = _positive_signal_price(item.get("origQty") or item.get("quantity") or item.get("executedQty"))
+        if layer_target > 0 and quantity is not None and quantity > layer_target * 1.001:
+            stale.append(item)
+    return stale
+
+
 def _protection_key(item: dict[str, Any]) -> tuple[str, str]:
     for key in ("algoId", "clientAlgoId", "orderId", "clientOrderId"):
         value = item.get(key)
@@ -435,6 +673,18 @@ def _protection_key(item: dict[str, Any]) -> tuple[str, str]:
 
 def _is_safe_long_protection(item: dict[str, Any], role: str, *, target_exposure: float | None = None) -> bool:
     if str(item.get("side", "")).upper() != "SELL":
+        return False
+    close_position = _truthy(item.get("closePosition") or item.get("close_position"))
+    reduce_only = _truthy(item.get("reduceOnly") or item.get("reduce_only"))
+    if role == "stop_loss":
+        return close_position or (reduce_only and _quantity_covers(item, target_exposure))
+    if role == "take_profit":
+        return reduce_only and _quantity_covers(item, target_exposure)
+    return False
+
+
+def _is_safe_short_protection(item: dict[str, Any], role: str, *, target_exposure: float | None = None) -> bool:
+    if str(item.get("side", "")).upper() != "BUY":
         return False
     close_position = _truthy(item.get("closePosition") or item.get("close_position"))
     reduce_only = _truthy(item.get("reduceOnly") or item.get("reduce_only"))

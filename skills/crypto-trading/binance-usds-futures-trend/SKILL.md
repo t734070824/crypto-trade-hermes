@@ -153,7 +153,7 @@ Shared testnet trading cycle dry-run (builds testnet events, signs nothing, subm
 scripts/binance_usds_futures_trend.py --run-testnet-cycle --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1h --limit 240 --runtime-record-file state/binance-usds-futures-trend-testnet-runtime.jsonl --no-save-runtime-record --testnet-dry-run
 ```
 
-Signed testnet submission exists only behind explicit `--testnet-submit-signed`; do not run it unless the user specifically asks for real Binance futures testnet orders in the current turn and risk limits are set. When signed testnet is explicitly authorized, add `--testnet-track-order-lifecycle` only if the user also wants order/userTrades polling for lifecycle, PnL, fee, and slippage evidence.
+Signed testnet submission exists only behind explicit `--testnet-submit-signed`; do not run it unless the user specifically asks for real Binance futures testnet orders in the current turn and risk limits are set. Signed short entries are additionally blocked by default and require explicit `--allow-testnet-signed-short`; do not use that flag without current-turn authorization plus prior dry-run/runtime evidence review. When signed testnet is explicitly authorized, add `--testnet-track-order-lifecycle` only if the user also wants order/userTrades polling for lifecycle, PnL, fee, and slippage evidence.
 
 Historical paper backtest:
 
@@ -209,24 +209,29 @@ Current signal model:
    - `/futures/data/takerlongshortRatio`.
 5. Require enough candles for EMA200 and ATR14.
 6. Compute EMA50, EMA200, ATR14, trend strength, extension, and context flags.
-7. Main long-trend filter:
-   - use only **closed** Binance K-lines; drop the currently forming latest candle from `/fapi/v1/klines` before signal generation;
-   - `close > EMA200`;
-   - `EMA50 > EMA200`.
-8. If the major trend is valid:
+7. Main trend filters use only **closed** Binance K-lines; drop the currently forming latest candle from `/fapi/v1/klines` before signal generation:
+   - long trend: `close > EMA200` and `EMA50 > EMA200`;
+   - short trend: `close < EMA200` and `EMA50 < EMA200`.
+8. If the major long trend is valid:
    - action is `hold_long`;
-   - ATR references define take-profit tranches and trailing stop;
+   - ATR references define take-profit tranches above entry and trailing stop below entry;
    - excessive extension reduces paper size rather than forcing a full exit;
    - context factors adjust confidence/size, not the core trend participation decision;
    - `add_allowed` is true only when price is not below EMA50 and recent 6/12-candle slope is non-negative.
-9. If the major trend is invalid:
+9. If the major short trend is valid:
+   - action is `hold_short` and strategy desired exposure is negative while displayed `position_size` remains an absolute target size;
+   - ATR references define take-profit tranches below entry and trailing stop above entry;
+   - context factors adjust confidence/size, not the core trend participation decision;
+   - `add_allowed` is true only when price is not above EMA50 and recent 6/12-candle slope is non-positive.
+10. If no major trend is valid:
    - action is `flat`;
    - existing open paper lifecycle state may emit `exit` intent.
-10. Important semantics: `hold_long` means “major trend remains valid”, not “new add is allowed”. During a visible 1h pullback, the signal can remain `hold_long` but set `hold_existing_allowed=true`, `add_allowed=false`, `add_blockers=[...]`, and `market_regime=major_long_pullback_hold_only`. Position reconciliation must clip positive deltas to current exposure when `add_allowed=false`, while still allowing reductions and protective-order repair.
-11. In portfolio mode, allocate paper risk units by rank under total-budget and per-symbol caps.
-12. In lifecycle mode, persist paper entry/add/reduce/hold/exit intent, monotonic long trailing stops, and take-profit tranche records.
+11. Important semantics: `hold_long` / `hold_short` means “major trend remains valid”, not “new add is allowed”. During a visible 1h pullback/bounce, the signal can remain in trend hold but set `hold_existing_allowed=true`, `add_allowed=false`, `add_blockers=[...]`, and a hold-only `market_regime`. Position reconciliation must clip exposure-expanding deltas to current exposure when `add_allowed=false`, while still allowing reductions and protective-order repair.
+12. Position reconciliation is signed-direction aware: long entries/adds are BUY with SELL SL/TP protection; short entries/adds are SELL with BUY SL/TP protection. Stop-loss protection remains fail-closed against current/desired exposure; take-profit coverage tracks desired exposure.
+13. In portfolio mode, allocate paper risk units by rank under total-budget and per-symbol caps for both `hold_long` and `hold_short`.
+14. In lifecycle mode, current persisted paper lifecycle remains primarily long-oriented; verify lifecycle semantics before relying on short lifecycle analytics.
 
-Do not overfit this logic into a separate paper-only product. During the realtime-engine refactor, preserve the strategy rules as `Strategy`/`SignalEngine`, and move sizing/state/reconciliation into shared `RiskManager`, `PortfolioState`, and `ExecutionEngine` components.
+Do not overfit this logic into a separate paper-only product. During the realtime-engine refactor, preserve the strategy rules as `Strategy`/`SignalEngine`, and move sizing/state/reconciliation into shared `RiskManager`, `PortfolioState`, and `ExecutionEngine` components. Signed short execution must remain behind explicit testnet authorization (`--allow-testnet-signed-short`) and evidence review.
 
 ## Output Contracts
 
@@ -349,7 +354,7 @@ Confirm:
 
 1. **Leaving cron ownership ambiguous.** Script-owned hourly jobs should be explicit: `no_agent=true`, `skills: []`, and a script path resolved relative to the profile `scripts/` directory, e.g. `"binance_usds_futures_testnet_hourly.sh"`, not `"scripts/..."`. Agent-owned jobs should be read-only analyzer/reasoning jobs with `script: null` unless a pre-run data collection script is deliberately needed.
 2. **Treating prompt prose as execution logic.** Fixed CLI commands and engine code are the real per-run contract. Prompt text is only effective when an agent executes it; it cannot override hard-coded command flags or missing code paths. See `references/session-v1.32-prompt-vs-cli-boundary.md`.
-3. **Running signed testnet unintentionally.** `--run-testnet-cycle` defaults to dry-run. Only use `--testnet-submit-signed` after an explicit current-turn user request and after checking risk limits, kill switch, exact testnet hostname, credential presence, and secret redaction.
+3. **Running signed testnet unintentionally.** `--run-testnet-cycle` defaults to dry-run. Only use `--testnet-submit-signed` after an explicit current-turn user request and after checking risk limits, kill switch, exact testnet hostname, credential presence, and secret redaction. Even with signed testnet authorized, short entries remain blocked unless `--allow-testnet-signed-short` is also explicitly authorized.
 4. **Confusing testnet adapter with live permission.** Testnet code may exist, but live/mainnet signed execution remains unimplemented and unauthorized.
 5. **Weak endpoint or signed-path safety.** Parse the hostname exactly as `testnet.binancefuture.com`; never rely on substring checks. If signed HTTP raises, do not store raw exception strings that may include signed URLs, signatures, or headers.
 6. **Fail-open order numbers.** Reject missing/non-finite reference prices, quantities, notional caps, exposure caps, daily-loss caps, or exchangeInfo-adapted values before signing. Never allow `nan`, zero, or negative order parameters into signed requests.
@@ -397,6 +402,7 @@ Canonical current references:
 - `references/session-v1.42-tp-replan-and-cron-runtime-template.md` — regression pattern for splitting SL vs TP protection targets during reductions and treating live `cron/jobs.json` as ignored scheduler runtime state with a sanitized tracked template.
 - `references/session-v1.44-daily-analyzer-cron-wiring.md` — pattern for wiring the daily read-only agent cron to prioritize `--daily-analyze-runtime`, keep replay as candidate comparison, sanitize `cron/jobs.template.json`, and validate the nested `daily_runtime_analysis.v1` output contract.
 - `references/session-v1.45-long-only-pullback-add-diagnosis.md` — diagnostic pattern for explaining why recent BUY/add signals can remain long during visible 1h pullbacks: current `hold_long` is a major-trend EMA200/EMA50 condition, not short-term momentum; check incomplete candles and split hold-vs-add semantics before changing strategy.
+- `references/session-v1.46-pullback-add-gate-and-short-safety.md` — implementation and explanation pattern for closed-candle pullback add gating, paused hourly cron reporting, and why short-side trading needs separate validation.
 - `references/session-v1.22-account-risk-sizing-cap-diagnosis.md` — diagnosing account-risk sizing that is dominated by fixed max-order/max-symbol exposure caps.
 - `references/session-v1.24-testnet-order-budget-and-postrun-reconstruction.md` — order-count budget lesson for entry + stop + TP tranches and safe post-run reconstruction.
 - `references/session-v1.25-testnet-cron-endpoint-and-order-budget-audit.md` — strict testnet endpoint arguments and order-budget enforcement.

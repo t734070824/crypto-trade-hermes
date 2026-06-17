@@ -287,10 +287,16 @@ class PaperBroker:
         new_size = position.size + signed_quantity
         if abs(new_size) < 1e-12:
             new_size = 0.0
-        if signed_quantity > 0:
-            current_notional = position.size * (position.entry_price or fill_price)
-            added_notional = signed_quantity * fill_price
-            position.entry_price = (current_notional + added_notional) / max(position.size + signed_quantity, 1e-12)
+        same_direction_increase = (
+            (new_size > 0 and signed_quantity > 0 and position.size >= 0)
+            or (new_size < 0 and signed_quantity < 0 and position.size <= 0)
+        )
+        if same_direction_increase:
+            current_notional = abs(position.size) * (position.entry_price or fill_price)
+            added_notional = abs(signed_quantity) * fill_price
+            position.entry_price = (current_notional + added_notional) / max(abs(position.size) + abs(signed_quantity), 1e-12)
+        elif new_size == 0.0:
+            position.entry_price = 0.0
         position.size = round(new_size, 8)
         position.metadata.update({"last_fill_price": round(fill_price, 8), "last_side": side})
         self.positions[symbol] = position
@@ -845,10 +851,16 @@ class BinanceTestnetBroker:
         new_size = position.size + signed_quantity
         if abs(new_size) < 1e-12:
             new_size = 0.0
-        if signed_quantity > 0:
-            current_notional = position.size * (position.entry_price or reference_price)
-            added_notional = signed_quantity * reference_price
-            position.entry_price = (current_notional + added_notional) / max(position.size + signed_quantity, 1e-12)
+        same_direction_increase = (
+            (new_size > 0 and signed_quantity > 0 and position.size >= 0)
+            or (new_size < 0 and signed_quantity < 0 and position.size <= 0)
+        )
+        if same_direction_increase:
+            current_notional = abs(position.size) * (position.entry_price or reference_price)
+            added_notional = abs(signed_quantity) * reference_price
+            position.entry_price = (current_notional + added_notional) / max(abs(position.size) + abs(signed_quantity), 1e-12)
+        elif new_size == 0.0:
+            position.entry_price = 0.0
         position.size = round(new_size, 8)
         position.metadata.update({"last_reference_price": round(reference_price, 8), "last_side": side, "environment": "testnet"})
         self.positions[symbol] = position

@@ -20,8 +20,12 @@ class TrendParticipationStrategy:
 
     def generate_intent(self, signal: dict[str, Any]) -> StrategyIntent:
         action = str(signal.get("action", "flat"))
-        desired_exposure = float(signal.get("position_size", 0.0) or 0.0)
-        if action == "flat":
+        position_size = abs(float(signal.get("position_size", 0.0) or 0.0))
+        if action == "hold_short":
+            desired_exposure = -position_size
+        elif action == "hold_long":
+            desired_exposure = position_size
+        else:
             desired_exposure = 0.0
         return StrategyIntent(
             symbol=str(signal.get("symbol", "")),

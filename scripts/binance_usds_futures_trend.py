@@ -307,14 +307,21 @@ def decide(
     recent_change_12 = _pct_change(closes[-13] if len(closes) >= 13 else None, last_close)
     stamps = now_stamps()
 
-    add_blockers: list[str] = []
+    long_add_blockers: list[str] = []
     if last_close < ema50:
-        add_blockers.append("below_ema50")
+        long_add_blockers.append("below_ema50")
     if recent_change_6 is not None and recent_change_6 < 0.0:
-        add_blockers.append("recent_6_candle_downtrend")
+        long_add_blockers.append("recent_6_candle_downtrend")
     if recent_change_12 is not None and recent_change_12 < 0.0:
-        add_blockers.append("recent_12_candle_downtrend")
-    add_allowed = len(add_blockers) == 0
+        long_add_blockers.append("recent_12_candle_downtrend")
+
+    short_add_blockers: list[str] = []
+    if last_close > ema50:
+        short_add_blockers.append("above_ema50")
+    if recent_change_6 is not None and recent_change_6 > 0.0:
+        short_add_blockers.append("recent_6_candle_uptrend")
+    if recent_change_12 is not None and recent_change_12 > 0.0:
+        short_add_blockers.append("recent_12_candle_uptrend")
 
     base: dict[str, Any] = {
         "symbol": symbol,
@@ -327,44 +334,71 @@ def decide(
         "atr14": round(current_atr, 8),
         "recent_change_6_pct": None if recent_change_6 is None else round(recent_change_6, 8),
         "recent_change_12_pct": None if recent_change_12 is None else round(recent_change_12, 8),
-        "add_allowed": add_allowed,
-        "add_blockers": add_blockers,
+        "add_allowed": False,
+        "add_blockers": [],
         "hold_existing_allowed": False,
         "market_regime": "unknown",
         "confidence_score": confidence_score,
         "factor_flags": factor_flags,
         "market_context": market_context or {},
+        "exposure_direction": "flat",
     }
 
-    if not (last_close > ema200 and ema50 > ema200):
+    trend_epsilon = max(abs(last_close), abs(ema50), abs(ema200), 1.0) * 1e-12
+
+    if last_close > ema200 + trend_epsilon and ema50 > ema200 + trend_epsilon:
+        add_allowed = len(long_add_blockers) == 0
+        # Smaller size when price is extended far above the fast trend; this keeps participation
+        # but avoids over-adding after vertical moves. v0.2 public factors further scale size.
+        extension = max(0.0, (last_close - ema50) / max(current_atr, 1e-12))
+        size_multiplier = 0.5 if extension > 4.0 else 1.0
+        position_size = round(max(0.0, risk_unit * size_multiplier * confidence_score), 4)
         return {
             **base,
-            "action": "flat",
-            "position_size": 0,
-            "trailing_stop": None,
-            "take_profit_1": None,
-            "take_profit_2": None,
-            "add_allowed": False,
-            "hold_existing_allowed": False,
-            "market_regime": "flat",
-            "reason": "major trend filter failed: require close > EMA200 and EMA50 > EMA200",
+            "action": "hold_long",
+            "position_size": position_size,
+            "trailing_stop": round(last_close - 3.0 * current_atr, 8),
+            "take_profit_1": round(last_close + 2.0 * current_atr, 8),
+            "take_profit_2": round(last_close + 4.0 * current_atr, 8),
+            "add_allowed": add_allowed,
+            "add_blockers": long_add_blockers,
+            "hold_existing_allowed": True,
+            "market_regime": "major_long_add_allowed" if add_allowed else "major_long_pullback_hold_only",
+            "exposure_direction": "long",
+            "reason": "major long trend filter passed: participate in trend, harvest by ATR tranches, trail stop by ATR; new long adds require price above EMA50 and non-negative recent 6/12-candle slope; v0.2 factors adjust confidence only",
         }
 
-    # Smaller size when price is extended far above the fast trend; this keeps participation
-    # but avoids over-adding after vertical moves. v0.2 public factors further scale size.
-    extension = max(0.0, (last_close - ema50) / max(current_atr, 1e-12))
-    size_multiplier = 0.5 if extension > 4.0 else 1.0
-    position_size = round(max(0.0, risk_unit * size_multiplier * confidence_score), 4)
+    if last_close < ema200 - trend_epsilon and ema50 < ema200 - trend_epsilon:
+        add_allowed = len(short_add_blockers) == 0
+        extension = max(0.0, (ema50 - last_close) / max(current_atr, 1e-12))
+        size_multiplier = 0.5 if extension > 4.0 else 1.0
+        position_size = round(max(0.0, risk_unit * size_multiplier * confidence_score), 4)
+        return {
+            **base,
+            "action": "hold_short",
+            "position_size": position_size,
+            "trailing_stop": round(last_close + 3.0 * current_atr, 8),
+            "take_profit_1": round(last_close - 2.0 * current_atr, 8),
+            "take_profit_2": round(last_close - 4.0 * current_atr, 8),
+            "add_allowed": add_allowed,
+            "add_blockers": short_add_blockers,
+            "hold_existing_allowed": True,
+            "market_regime": "major_short_add_allowed" if add_allowed else "major_short_bounce_hold_only",
+            "exposure_direction": "short",
+            "reason": "major short trend filter passed: participate in downside trend, harvest by ATR tranches, trail stop above entry by ATR; new short adds require price below EMA50 and non-positive recent 6/12-candle slope; v0.2 factors adjust confidence only",
+        }
+
     return {
         **base,
-        "action": "hold_long",
-        "position_size": position_size,
-        "trailing_stop": round(last_close - 3.0 * current_atr, 8),
-        "take_profit_1": round(last_close + 2.0 * current_atr, 8),
-        "take_profit_2": round(last_close + 4.0 * current_atr, 8),
-        "hold_existing_allowed": True,
-        "market_regime": "major_long_add_allowed" if add_allowed else "major_long_pullback_hold_only",
-        "reason": "major trend filter passed: participate in trend, harvest by ATR tranches, trail stop by ATR; new adds require price above EMA50 and non-negative recent 6/12-candle slope; v0.2 factors adjust confidence only",
+        "action": "flat",
+        "position_size": 0,
+        "trailing_stop": None,
+        "take_profit_1": None,
+        "take_profit_2": None,
+        "add_allowed": False,
+        "hold_existing_allowed": False,
+        "market_regime": "flat",
+        "reason": "major trend filter failed: require long close > EMA200 and EMA50 > EMA200, or short close < EMA200 and EMA50 < EMA200",
     }
 
 
@@ -386,15 +420,23 @@ def apply_account_risk_sizing_to_signal(
     the current broker position.
     """
     sized = dict(signal)
-    if sized.get("action") != "hold_long":
+    action = sized.get("action")
+    if action not in {"hold_long", "hold_short"}:
         return sized
     if account_risk_fraction <= 0 or target_leverage <= 0:
         raise ValueError("account_risk_fraction and target_leverage must be positive")
     entry_price = _positive_number(sized.get("entry_reference"), "entry_reference")
     stop_price = _positive_number(sized.get("trailing_stop"), "trailing_stop")
-    stop_distance = entry_price - stop_price
-    if stop_distance <= 0:
-        raise ValueError("trailing_stop must be below entry_reference for long risk sizing")
+    if action == "hold_short":
+        stop_distance = stop_price - entry_price
+        if stop_distance <= 0:
+            raise ValueError("trailing_stop must be above entry_reference for short risk sizing")
+        direction = "short"
+    else:
+        stop_distance = entry_price - stop_price
+        if stop_distance <= 0:
+            raise ValueError("trailing_stop must be below entry_reference for long risk sizing")
+        direction = "long"
     available_balance, account_equity = _account_balances_from_snapshot(account_snapshot)
     risk_budget = account_equity * account_risk_fraction
     qty_by_stop_risk = risk_budget / stop_distance
@@ -420,6 +462,7 @@ def apply_account_risk_sizing_to_signal(
     sized["position_size"] = round(desired_qty, 8)
     sized["account_risk_sizing"] = {
         "method": "available_balance_stop_distance_leverage_cap",
+        "direction": direction,
         "available_balance": round(available_balance, 8),
         "account_equity": round(account_equity, 8),
         "account_risk_fraction": round(float(account_risk_fraction), 8),
@@ -496,13 +539,18 @@ def enrich_for_ranking(decision: dict[str, Any], timeframe_agreement_score: floa
     agreement = max(0.0, min(1.0, timeframe_agreement_score))
     enriched["timeframe_agreement_score"] = agreement
 
-    if action != "hold_long" or atr14 <= 0:
+    if action not in {"hold_long", "hold_short"} or atr14 <= 0:
         enriched.update({"trend_strength": 0.0, "rank_score": 0.0, "ranking_bucket": "watchlist"})
         return enriched
 
-    price_gap_atr = max(0.0, (entry - ema200_value) / atr14)
-    ema_gap_atr = max(0.0, (ema50_value - ema200_value) / atr14)
-    extension_atr = max(0.0, (entry - ema50_value) / atr14)
+    if action == "hold_short":
+        price_gap_atr = max(0.0, (ema200_value - entry) / atr14)
+        ema_gap_atr = max(0.0, (ema200_value - ema50_value) / atr14)
+        extension_atr = max(0.0, (ema50_value - entry) / atr14)
+    else:
+        price_gap_atr = max(0.0, (entry - ema200_value) / atr14)
+        ema_gap_atr = max(0.0, (ema50_value - ema200_value) / atr14)
+        extension_atr = max(0.0, (entry - ema50_value) / atr14)
     trend_strength = round(price_gap_atr + ema_gap_atr, 4)
     rank_score = round(trend_strength * confidence * max(position_size, 0.01) * agreement, 4)
     flags = set(enriched.get("factor_flags") or [])
@@ -550,9 +598,9 @@ def enrich_with_timeframes(primary: dict[str, Any], timeframe_decisions: dict[st
     agreement = matching / total
     higher_intervals = [item for item in timeframe_decisions if item != primary_interval]
     higher_confirmed = bool(
-        primary_action == "hold_long"
+        primary_action in {"hold_long", "hold_short"}
         and higher_intervals
-        and all(timeframe_decisions[item].get("action") == "hold_long" for item in higher_intervals)
+        and all(timeframe_decisions[item].get("action") == primary_action for item in higher_intervals)
     )
     enriched = enrich_for_ranking(primary, agreement)
     enriched.update(
@@ -564,12 +612,12 @@ def enrich_with_timeframes(primary: dict[str, Any], timeframe_decisions: dict[st
             "timeframe_agreement_score": agreement,
         }
     )
-    if primary_action == "hold_long":
+    if primary_action in {"hold_long", "hold_short"}:
         if higher_confirmed:
             enriched["ranking_bucket"] = "strong_confirmed_trend"
         else:
             enriched["ranking_bucket"] = "early_trend"
-    elif any(timeframe_decisions[item].get("action") == "hold_long" for item in higher_intervals):
+    elif any(timeframe_decisions[item].get("action") in {"hold_long", "hold_short"} for item in higher_intervals):
         enriched["ranking_bucket"] = "conflicting_trend"
     return enriched
 
@@ -579,7 +627,7 @@ def allocate_portfolio_risk(
     total_risk_budget: float,
     max_symbol_risk: float,
 ) -> dict[str, Any]:
-    """Allocate paper risk units across ranked hold-long decisions with portfolio caps."""
+    """Allocate paper risk units across ranked hold-long/hold-short decisions with portfolio caps."""
     if total_risk_budget <= 0:
         raise ValueError("total_risk_budget must be positive")
     if max_symbol_risk <= 0:
@@ -593,11 +641,11 @@ def allocate_portfolio_risk(
         rank_score = float(decision.get("rank_score") or 0.0)
         position_size = float(decision.get("position_size") or 0.0)
         action = decision.get("action")
-        if action == "hold_long" and rank_score > 0 and position_size > 0:
+        if action in {"hold_long", "hold_short"} and rank_score > 0 and position_size > 0:
             eligible.append(decision)
         elif symbol:
-            if action != "hold_long":
-                skip_reason = "not_hold_long"
+            if action not in {"hold_long", "hold_short"}:
+                skip_reason = "not_trend_hold"
             elif rank_score <= 0:
                 skip_reason = "non_positive_rank_score"
             else:
@@ -2341,7 +2389,7 @@ def scan_symbols(
             )
 
     ranked = sorted(results, key=lambda item: (float(item.get("rank_score", -1.0)), item.get("symbol", "")), reverse=True)
-    top_trends = [item for item in ranked if item.get("action") == "hold_long"][:top]
+    top_trends = [item for item in ranked if item.get("action") in {"hold_long", "hold_short"}][:top]
     risk_high = [item for item in ranked if item.get("ranking_bucket") == "risk_high_trend"]
     strong_confirmed = [item for item in ranked if item.get("ranking_bucket") == "strong_confirmed_trend"]
     early_trends = [item for item in ranked if item.get("ranking_bucket") == "early_trend"]
@@ -2442,7 +2490,7 @@ def run_paper_trading_cycle(
 
 
 def verify_position_protection(account_snapshot: dict[str, Any], symbols: Iterable[str] | None = None) -> dict[str, Any]:
-    """Verify non-zero long testnet positions have safe SL and TP protection.
+    """Verify non-zero testnet positions have safe directional SL and TP protection.
 
     When symbols is provided, scope the result to that cycle's symbol group so a
     BTC-only cycle does not report unrelated ETH/SOL protection gaps from the
@@ -2458,7 +2506,6 @@ def verify_position_protection(account_snapshot: dict[str, Any], symbols: Iterab
     if isinstance(open_algo_orders, list):
         order_rows.extend(open_algo_orders)
     by_symbol: dict[str, dict[str, Any]] = {}
-    ignored_short_symbols: list[str] = []
     for item in positions if isinstance(positions, list) else []:
         if not isinstance(item, dict):
             continue
@@ -2473,19 +2520,17 @@ def verify_position_protection(account_snapshot: dict[str, Any], symbols: Iterab
             continue
         if abs(amount) <= 1e-12:
             continue
-        if amount < 0:
-            ignored_short_symbols.append(symbol)
-            continue
         has_stop = False
         take_profit_coverage = 0.0
         target_exposure = abs(amount)
+        position_direction = "short" if amount < 0 else "long"
         for order in order_rows:
             if not isinstance(order, dict) or str(order.get("symbol") or "").upper() != symbol:
                 continue
             order_type = str(order.get("type") or order.get("origType") or order.get("orderType") or "").upper()
-            if order_type in {"STOP", "STOP_MARKET"} and _is_safe_long_snapshot_protection(order, "stop_loss", target_exposure):
+            if order_type in {"STOP", "STOP_MARKET"} and _is_safe_snapshot_protection(order, "stop_loss", target_exposure, position_direction):
                 has_stop = True
-            if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"} and _is_safe_long_snapshot_take_profit(order):
+            if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"} and _is_safe_snapshot_take_profit(order, position_direction):
                 quantity = _optional_positive_number(order.get("origQty") or order.get("quantity") or order.get("executedQty"))
                 if quantity is not None:
                     take_profit_coverage += min(quantity, target_exposure)
@@ -2506,13 +2551,13 @@ def verify_position_protection(account_snapshot: dict[str, Any], symbols: Iterab
     return {
         "all_positions_protected": not unprotected,
         "unprotected_symbols": unprotected,
-        "ignored_short_symbols": ignored_short_symbols,
         "symbols": by_symbol,
     }
 
 
-def _is_safe_long_snapshot_protection(order: dict[str, Any], role: str, target_exposure: float) -> bool:
-    if str(order.get("side") or "").upper() != "SELL":
+def _is_safe_snapshot_protection(order: dict[str, Any], role: str, target_exposure: float, position_direction: str = "long") -> bool:
+    expected_side = "BUY" if position_direction == "short" else "SELL"
+    if str(order.get("side") or "").upper() != expected_side:
         return False
     close_position = _boolish(order.get("closePosition") or order.get("close_position"))
     reduce_only = _boolish(order.get("reduceOnly") or order.get("reduce_only"))
@@ -2521,16 +2566,25 @@ def _is_safe_long_snapshot_protection(order: dict[str, Any], role: str, target_e
     if role == "stop_loss":
         return close_position or (reduce_only and covers_position)
     if role == "take_profit":
-        return _is_safe_long_snapshot_take_profit(order) and covers_position
+        return _is_safe_snapshot_take_profit(order, position_direction) and covers_position
     return False
 
 
-def _is_safe_long_snapshot_take_profit(order: dict[str, Any]) -> bool:
-    if str(order.get("side") or "").upper() != "SELL":
+def _is_safe_long_snapshot_protection(order: dict[str, Any], role: str, target_exposure: float) -> bool:
+    return _is_safe_snapshot_protection(order, role, target_exposure, "long")
+
+
+def _is_safe_snapshot_take_profit(order: dict[str, Any], position_direction: str = "long") -> bool:
+    expected_side = "BUY" if position_direction == "short" else "SELL"
+    if str(order.get("side") or "").upper() != expected_side:
         return False
     if not _boolish(order.get("reduceOnly") or order.get("reduce_only")):
         return False
     return _optional_positive_number(order.get("origQty") or order.get("quantity") or order.get("executedQty")) is not None
+
+
+def _is_safe_long_snapshot_take_profit(order: dict[str, Any]) -> bool:
+    return _is_safe_snapshot_take_profit(order, "long")
 
 
 def _boolish(value: Any) -> bool:
@@ -2545,6 +2599,32 @@ def _optional_positive_number(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _block_signed_short_signal(signal: dict[str, Any]) -> dict[str, Any]:
+    """Convert hold_short to flat unless signed-short execution was explicitly enabled."""
+    blocked = dict(signal)
+    blocked.update(
+        {
+            "action": "flat",
+            "position_size": 0,
+            "trailing_stop": None,
+            "take_profit_1": None,
+            "take_profit_2": None,
+            "add_allowed": False,
+            "hold_existing_allowed": False,
+            "market_regime": "signed_short_disabled",
+            "exposure_direction": "flat",
+            "short_signal_blocked": True,
+            "blocked_action": signal.get("action"),
+            "blocked_exposure_direction": signal.get("exposure_direction", "short"),
+            "reason": "signed testnet short execution is disabled by default; explicit allow_signed_short is required before opening short exposure",
+        }
+    )
+    blockers = list(signal.get("add_blockers") or [])
+    blockers.append("signed_short_disabled")
+    blocked["add_blockers"] = blockers
+    return blocked
 
 
 def run_testnet_trading_cycle(
@@ -2572,6 +2652,7 @@ def run_testnet_trading_cycle(
     refresh_exchange_rules: bool = True,
     sync_account_state: bool = False,
     track_order_lifecycle: bool = False,
+    allow_signed_short: bool = False,
 ) -> dict[str, Any]:
     """Run one shared trading cycle with Binance USDS-M futures testnet adapter.
 
@@ -2624,6 +2705,29 @@ def run_testnet_trading_cycle(
     account_sync_before = broker.fetch_signed_account_snapshot() if (sync_account_state or not dry_run) and selected_symbols else None
     if account_sync_before is not None:
         broker.load_positions_from_account_snapshot(account_sync_before)
+
+    def sized_testnet_signal(candles: list[dict[str, Any]], *, symbol: str, interval: str) -> dict[str, Any]:
+        raw_signal = decide(
+            candles,
+            symbol=symbol,
+            interval=interval,
+            risk_unit=risk_unit,
+            market_context=None,
+        )
+        if not dry_run and not allow_signed_short and raw_signal.get("action") == "hold_short":
+            raw_signal = _block_signed_short_signal(raw_signal)
+        if account_sync_before is not None:
+            return apply_account_risk_sizing_to_signal(
+                raw_signal,
+                account_sync_before,
+                account_risk_fraction=account_risk_fraction,
+                target_leverage=target_leverage,
+                max_order_notional=max_order_notional,
+                max_symbol_exposure=max_symbol_exposure,
+                max_symbol_exposure_fraction=max_symbol_exposure_fraction,
+            )
+        return raw_signal
+
     cycle = run_trading_cycle(
         TradingCycleConfig(
             symbols=selected_symbols,
@@ -2634,29 +2738,7 @@ def run_testnet_trading_cycle(
             config_version=config_version,
         ),
         broker=broker,
-        signal_engine=FunctionSignalEngine(
-            decide_fn=lambda candles, symbol, interval, **kwargs: apply_account_risk_sizing_to_signal(
-                decide(
-                    candles,
-                    symbol=symbol,
-                    interval=interval,
-                    risk_unit=risk_unit,
-                    market_context=None,
-                ),
-                account_sync_before,
-                account_risk_fraction=account_risk_fraction,
-                target_leverage=target_leverage,
-                max_order_notional=max_order_notional,
-                max_symbol_exposure=max_symbol_exposure,
-                max_symbol_exposure_fraction=max_symbol_exposure_fraction,
-            ) if account_sync_before is not None else decide(
-                candles,
-                symbol=symbol,
-                interval=interval,
-                risk_unit=risk_unit,
-                market_context=None,
-            )
-        ),
+        signal_engine=FunctionSignalEngine(decide_fn=sized_testnet_signal),
         strategy=TrendParticipationStrategy(),
         risk_manager=FunctionRiskManager(),
         execution_engine=PositionReconciliationExecutionEngine(min_delta=0.001),
@@ -2796,6 +2878,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--testnet-base-url", help="Override Binance Futures testnet base URL for tests; must stay on testnet host")
     parser.add_argument("--testnet-dry-run", action="store_true", help="For --run-testnet-cycle, build testnet events without signing/submitting; default safe behavior")
     parser.add_argument("--testnet-submit-signed", action="store_true", help="For --run-testnet-cycle, submit signed testnet orders; never mainnet/live")
+    parser.add_argument("--allow-testnet-signed-short", action="store_true", help="Allow signed testnet short entries; default blocks hold_short before order planning")
     parser.add_argument("--testnet-max-order-notional", type=float, default=1_000.0, help="Max testnet order notional before rejection")
     parser.add_argument("--testnet-max-symbol-exposure", type=float, default=2_000.0, help="Max testnet symbol exposure before rejection")
     parser.add_argument("--testnet-max-symbol-exposure-fraction", type=float, help="Account-equity fraction cap for desired testnet symbol exposure, e.g. 0.10")
@@ -3021,6 +3104,7 @@ def main(argv: list[str] | None = None) -> int:
                 order_journal_path=args.testnet_order_journal_file,
                 sync_account_state=args.testnet_sync_account_state,
                 track_order_lifecycle=args.testnet_track_order_lifecycle,
+                allow_signed_short=args.allow_testnet_signed_short,
             )
             print(json.dumps({"ok": not bool(cycle["errors"]), "testnet_risk_limits": risk_limits.sanitized_summary(), "testnet_cycle": cycle}, ensure_ascii=False, indent=2))
             return 0 if not cycle["errors"] else 1

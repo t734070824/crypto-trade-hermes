@@ -97,7 +97,7 @@ def run_trading_cycle(
             plan_instructions = list(plan.instructions)
             if not plan_instructions:
                 continue
-            if delta_exposure > 1e-12 and abs(current_exposure) <= 1e-12:
+            if abs(delta_exposure) > 1e-12 and abs(current_exposure) <= 1e-12:
                 priority_key = (2, symbol_index, 0, instruction_index)
                 planned_groups.append(_PlannedInstructionGroup(priority_key, plan_instructions, True, intent))
                 instruction_index += len(plan_instructions)
@@ -105,7 +105,7 @@ def run_trading_cycle(
             for local_index, instruction in enumerate(plan_instructions):
                 priority_key = _order_submission_priority_key(instruction, current_exposure, delta_exposure, symbol_index, local_index, instruction_index)
                 metadata = dict(getattr(instruction, "metadata", {}) or {})
-                atomic_budget_group = delta_exposure > 1e-12 and not bool(metadata.get("protective_order"))
+                atomic_budget_group = _is_exposure_expansion_delta_instruction(instruction, current_exposure, delta_exposure)
                 planned_groups.append(
                     _PlannedInstructionGroup(
                         priority_key,
@@ -135,7 +135,7 @@ def run_trading_cycle(
                 replanned_instructions = [
                     instruction
                     for instruction in replanned_instructions
-                    if _is_positive_exposure_delta_instruction(instruction)
+                    if _is_plain_exposure_delta_instruction(instruction)
                 ]
             if not replanned_instructions:
                 for instruction in instructions:
@@ -229,7 +229,11 @@ def _order_submission_priority_key(
     protective_order = bool(metadata.get("protective_order"))
     has_position = abs(float(current_exposure or 0.0)) > 1e-12
     instruction_delta = float(metadata.get("delta_exposure") or delta_exposure or 0.0)
-    reduces_existing_position = has_position and not protective_order and instruction_delta < -1e-12
+    reduces_existing_position = (
+        has_position
+        and not protective_order
+        and ((current_exposure > 0 and instruction_delta < -1e-12) or (current_exposure < 0 and instruction_delta > 1e-12))
+    )
     if reduces_existing_position:
         return (0, symbol_index, local_index, global_index)
     if protective_order and has_position:
@@ -251,17 +255,29 @@ def _remaining_broker_order_budget(broker: Any) -> int | None:
     return max(0, limit - max(accepted, submitted))
 
 
-def _is_positive_exposure_delta_instruction(instruction: OrderInstruction | Any) -> bool:
-    metadata = dict(getattr(instruction, "metadata", {}) or {})
-    if metadata.get("protective_order"):
+def _is_exposure_expansion_delta_instruction(instruction: OrderInstruction | Any, current_exposure: float, delta_exposure: float) -> bool:
+    if not _is_plain_exposure_delta_instruction(instruction):
         return False
+    metadata = dict(getattr(instruction, "metadata", {}) or {})
+    delta = _metadata_delta(metadata, delta_exposure)
+    if abs(float(current_exposure or 0.0)) <= 1e-12:
+        return abs(delta) > 1e-12
+    return (current_exposure > 0 and delta > 1e-12) or (current_exposure < 0 and delta < -1e-12)
+
+
+def _is_plain_exposure_delta_instruction(instruction: OrderInstruction | Any) -> bool:
+    metadata = dict(getattr(instruction, "metadata", {}) or {})
+    return not bool(metadata.get("protective_order"))
+
+
+def _metadata_delta(metadata: dict[str, Any], fallback: float) -> float:
     delta = metadata.get("delta_exposure")
     if delta is None:
-        return True
+        return float(fallback or 0.0)
     try:
-        return float(delta) > 1e-12
+        return float(delta)
     except (TypeError, ValueError):
-        return False
+        return 0.0
 
 
 def _skipped_order_record(instruction: OrderInstruction | Any, environment: str, reason: str) -> dict[str, Any]:
