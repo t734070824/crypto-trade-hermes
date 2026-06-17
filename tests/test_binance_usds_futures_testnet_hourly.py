@@ -153,6 +153,73 @@ def test_dry_run_wrapper_points_to_harness_and_forces_dry_run():
     assert "python3 scripts/binance_usds_futures_testnet_hourly.py --dry-run" in text
 
 
+def test_run_cycle_counts_testnet_simulated_fills_from_runtime_events(capsys):
+    payload = {
+        "ok": True,
+        "testnet_cycle": {
+            "generated_at_utc": "2026-06-16T00:00:00+00:00",
+            "generated_at_beijing": "2026-06-16T08:00:00+08:00",
+            "desired_orders": [{"symbol": "BTCUSDT"}, {"symbol": "BTCUSDT"}],
+            "simulated_fills": [
+                {"status": "submitted", "signed": True, "real_order_submitted": True},
+                {"status": "submitted_unknown", "signed": True, "attempted_real_order_submitted": True},
+            ],
+            "runtime_record_saved": True,
+            "runtime_record_change": {"records_written": 1},
+            "runtime_record": {
+                "execution_events": {
+                    "testnet_account_sync": {"all_positions_protected": False, "unprotected_symbols": ["BTCUSDT"]},
+                    "testnet_order_lifecycle": {"tracked_order_count": 1, "filled_order_count": 1, "net_pnl": 0.12},
+                }
+            },
+            "testnet_account_sync": {"after": {"positions": [], "open_orders": [], "open_algo_orders": []}},
+            "errors": [],
+        },
+    }
+
+    with mock.patch.object(hourly.trend, "main", side_effect=lambda argv: print(json.dumps(payload)) or 0):
+        cycle = hourly.run_cycle(hourly.GROUPS[0], dry_run=False, no_save_runtime_record=False)
+
+    assert cycle["ok"] is True
+    assert cycle["fills_count"] == 2
+    assert cycle["fill_status_counts"] == {"submitted": 1, "submitted_unknown": 1}
+    assert cycle["signed_count"] == 2
+    assert cycle["real_submitted_count"] == 1
+    assert cycle["attempted_real_order_count"] == 2
+    assert cycle["lifecycle"]["tracked_order_count"] == 1
+    assert cycle["lifecycle"]["filled_order_count"] == 1
+
+
+def test_hourly_harness_waits_for_postflight_after_real_submissions(capsys, monkeypatch):
+    monkeypatch.setenv("LALA_KEY", "dummy-key")
+    monkeypatch.setenv("LALA_SECRET", "dummy-secret")
+    postflight_calls = []
+
+    def fake_postflight(symbols):
+        postflight_calls.append(list(symbols))
+        return {"ok": True, "open_algo_orders_count": len(postflight_calls), "nonzero_positions": []}
+
+    with (
+        mock.patch.object(hourly, "signed_preflight", return_value={"ok": True}),
+        mock.patch.object(hourly, "run_cycle", side_effect=[
+            {"name": "BTC组", "ok": True, "real_submitted_count": 0, "attempted_real_order_count": 0},
+            {"name": "Alt组", "ok": True, "real_submitted_count": 2, "attempted_real_order_count": 2},
+        ]),
+        mock.patch.object(hourly, "postflight_account", side_effect=fake_postflight),
+        mock.patch.object(hourly.time, "sleep") as sleep_mock,
+    ):
+        rc = hourly.main(["--skip-dotenv"])
+
+    assert rc == 0
+    assert len(postflight_calls) == 3
+    assert sleep_mock.call_count == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["postflight_attempts"] == 3
+    assert payload["postflight_stabilization_seconds"] >= 0
+    assert "Alt组" in payload["summary_zh"]
+    assert "attempted=2" in payload["summary_zh"]
+
+
 def test_run_cycle_propagates_exception_as_sanitized_error(monkeypatch):
     monkeypatch.setenv("LALA_KEY", "dummy-key")
     monkeypatch.setenv("LALA_SECRET", "dummy-secret")

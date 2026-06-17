@@ -38,6 +38,8 @@ BEIJING = timezone(timedelta(hours=8), name="UTC+8")
 TESTNET_BASE_URL = "https://testnet.binancefuture.com"
 RUNTIME_FILE = Path("state/binance-usds-futures-trend-testnet-runtime.jsonl")
 ORDER_JOURNAL_FILE = Path("state/binance-usds-futures-trend-testnet-orders.jsonl")
+POST_SUBMISSION_POSTFLIGHT_ATTEMPTS = 3
+POST_SUBMISSION_POSTFLIGHT_DELAY_SECONDS = 5
 SENSITIVE_KEYS = r"signature|apiSecret|api_secret|secret|LALA_KEY|LALA_SECRET"
 SENSITIVE_PARAM_RE = re.compile(rf"(?i)({SENSITIVE_KEYS})\s*=\s*[^&\s,;]+")
 SENSITIVE_QUOTED_RE = re.compile(rf"(?i)([\"\'](?:{SENSITIVE_KEYS})[\"\']\s*[:=]\s*)([\"\'][^\"\']*[\"\']|[^,}}\s]+)")
@@ -205,23 +207,27 @@ def run_cycle(group: dict[str, Any], *, dry_run: bool, no_save_runtime_record: b
 
 def summarize_cycle_payload(group: dict[str, Any], rc: int, payload: dict[str, Any], elapsed: float) -> dict[str, Any]:
     cycle = payload.get("testnet_cycle", {}) if isinstance(payload, dict) else {}
-    fills = cycle.get("fills", []) if isinstance(cycle, dict) else []
-    desired_orders = cycle.get("desired_orders", []) if isinstance(cycle, dict) else []
+    runtime_events = cycle.get("runtime_record", {}).get("execution_events", {}) if isinstance(cycle, dict) else {}
+    fills = _first_list(cycle.get("fills"), cycle.get("simulated_fills"), runtime_events.get("simulated_fills")) if isinstance(cycle, dict) else []
+    desired_orders = _first_list(cycle.get("desired_orders"), runtime_events.get("desired_orders")) if isinstance(cycle, dict) else []
     sync = cycle.get("testnet_account_sync", {}) if isinstance(cycle, dict) else {}
     after = sync.get("after", {}) if isinstance(sync, dict) else {}
-    lifecycle = cycle.get("testnet_order_lifecycle", []) if isinstance(cycle, dict) else []
+    lifecycle = cycle.get("testnet_order_lifecycle") if isinstance(cycle, dict) else None
+    lifecycle_summary = _summarize_lifecycle(lifecycle, runtime_events.get("testnet_order_lifecycle"))
     statuses: dict[str, int] = {}
     signed_count = 0
     real_submitted_count = 0
-    for fill in fills if isinstance(fills, list) else []:
+    attempted_real_order_count = 0
+    for fill in fills:
         if not isinstance(fill, dict):
             continue
         status = str(fill.get("status") or "unknown")
         statuses[status] = statuses.get(status, 0) + 1
         signed_count += int(bool(fill.get("signed")))
         real_submitted_count += int(bool(fill.get("real_order_submitted")))
+        attempted_real_order_count += int(bool(fill.get("real_order_submitted") or fill.get("attempted_real_order_submitted") or status in {"submitted", "submitted_confirmed", "submitted_unknown"}))
     change = cycle.get("runtime_record_change", {}) if isinstance(cycle, dict) else {}
-    execution_sync = cycle.get("runtime_record", {}).get("execution_events", {}).get("testnet_account_sync", {}) if isinstance(cycle, dict) else {}
+    execution_sync = runtime_events.get("testnet_account_sync", {}) if isinstance(runtime_events, dict) else {}
     return {
         "name": group["name"],
         "symbols": group["symbols"],
@@ -229,12 +235,14 @@ def summarize_cycle_payload(group: dict[str, Any], rc: int, payload: dict[str, A
         **{k: cycle.get(k) for k in ("generated_at_utc", "generated_at_beijing") if isinstance(cycle, dict) and k in cycle},
         "duration_seconds": elapsed,
         "errors_count": cycle.get("errors_count") if isinstance(cycle, dict) else None,
-        "desired_orders_count": len(desired_orders) if isinstance(desired_orders, list) else 0,
-        "fills_count": len(fills) if isinstance(fills, list) else 0,
+        "desired_orders_count": len(desired_orders),
+        "fills_count": len(fills),
         "fill_status_counts": statuses,
         "signed_count": signed_count,
         "real_submitted_count": real_submitted_count,
-        "lifecycle_count": len(lifecycle) if isinstance(lifecycle, list) else 0,
+        "attempted_real_order_count": attempted_real_order_count,
+        "lifecycle": lifecycle_summary,
+        "lifecycle_count": lifecycle_summary.get("tracked_order_count", 0),
         "nonzero_positions_after": summarize_positions(after, group["symbols"]),
         "protection": {
             "all_positions_protected": execution_sync.get("all_positions_protected"),
@@ -248,6 +256,30 @@ def summarize_cycle_payload(group: dict[str, Any], rc: int, payload: dict[str, A
         },
         "error_types": summarize_errors(cycle.get("errors", [])) if isinstance(cycle, dict) else [],
     }
+
+
+def _first_list(*values: Any) -> list[Any]:
+    for value in values:
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _summarize_lifecycle(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, dict):
+            return {
+                "tracked_order_count": int(value.get("tracked_order_count") or 0),
+                "filled_order_count": int(value.get("filled_order_count") or 0),
+                "net_pnl": value.get("net_pnl", 0),
+            }
+        if isinstance(value, list):
+            return {
+                "tracked_order_count": len(value),
+                "filled_order_count": sum(1 for item in value if isinstance(item, dict) and item.get("lifecycle_state") == "filled"),
+                "net_pnl": round(sum(float(item.get("fills_summary", {}).get("net_pnl", 0.0)) for item in value if isinstance(item, dict)), 8),
+            }
+    return {"tracked_order_count": 0, "filled_order_count": 0, "net_pnl": 0}
 
 
 def summarize_errors(errors: Any) -> list[dict[str, str]]:
@@ -297,6 +329,17 @@ def postflight_account(symbols: list[str]) -> dict[str, Any]:
         }
 
 
+def stabilized_postflight_account(symbols: list[str], *, require_stabilization: bool) -> tuple[dict[str, Any], int, float]:
+    started = time.monotonic()
+    attempts = POST_SUBMISSION_POSTFLIGHT_ATTEMPTS if require_stabilization else 1
+    latest: dict[str, Any] = {}
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            time.sleep(POST_SUBMISSION_POSTFLIGHT_DELAY_SECONDS)
+        latest = postflight_account(symbols)
+    return latest, attempts, round(time.monotonic() - started, 3)
+
+
 def summarize_positions(snapshot: dict[str, Any], symbols: list[str]) -> list[dict[str, Any]]:
     wanted = set(symbols)
     rows = snapshot.get("positions", []) if isinstance(snapshot, dict) else []
@@ -337,14 +380,18 @@ def build_summary(payload: dict[str, Any]) -> str:
         f"北京时间（UTC+8）: {payload.get('generated_at_beijing')}",
         f"ok={payload.get('ok')} dry_run={payload.get('dry_run')} total_duration_seconds={payload.get('duration_seconds')}",
         f"credentials: LALA_KEY={payload.get('credential_presence', {}).get('LALA_KEY')} LALA_SECRET={payload.get('credential_presence', {}).get('LALA_SECRET')}",
-        f"preflight_ok={payload.get('preflight', {}).get('ok')} postflight_ok={payload.get('postflight', {}).get('ok')}",
+        f"preflight_ok={payload.get('preflight', {}).get('ok')} postflight_ok={payload.get('postflight', {}).get('ok')} postflight_attempts={payload.get('postflight_attempts')} postflight_stabilization_seconds={payload.get('postflight_stabilization_seconds')}",
     ]
     for cycle in payload.get("cycles", []):
+        lifecycle = cycle.get("lifecycle", {}) if isinstance(cycle.get("lifecycle"), dict) else {}
+        protection = cycle.get("protection", {}) if isinstance(cycle.get("protection"), dict) else {}
         lines.append(
             f"{cycle.get('name')}: ok={cycle.get('ok')} symbols={','.join(cycle.get('symbols', []))} "
             f"desired={cycle.get('desired_orders_count')} fills={cycle.get('fills_count')} "
-            f"signed={cycle.get('signed_count')} real_submitted={cycle.get('real_submitted_count')} "
-            f"statuses={cycle.get('fill_status_counts')} duration={cycle.get('duration_seconds')}s"
+            f"signed={cycle.get('signed_count')} attempted={cycle.get('attempted_real_order_count')} real_submitted={cycle.get('real_submitted_count')} "
+            f"statuses={cycle.get('fill_status_counts')} lifecycle_tracked={lifecycle.get('tracked_order_count')} lifecycle_filled={lifecycle.get('filled_order_count')} "
+            f"all_positions_protected={protection.get('all_positions_protected')} unprotected={protection.get('unprotected_symbols')} "
+            f"duration={cycle.get('duration_seconds')}s"
         )
     lines.append(f"runtime_record={RUNTIME_FILE}")
     lines.append(f"order_journal={ORDER_JOURNAL_FILE}")
@@ -396,12 +443,20 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     cycle_ok = True
+    require_postflight_stabilization = False
     for group in GROUPS:
         cycle = run_cycle(group, dry_run=args.dry_run, no_save_runtime_record=args.no_save_runtime_record)
         payload["cycles"].append(cycle)
         cycle_ok = cycle_ok and bool(cycle.get("ok"))
+        require_postflight_stabilization = require_postflight_stabilization or bool(cycle.get("real_submitted_count") or cycle.get("attempted_real_order_count"))
 
-    payload["postflight"] = postflight_account(all_symbols)
+    postflight, postflight_attempts, stabilization_seconds = stabilized_postflight_account(
+        all_symbols,
+        require_stabilization=bool(require_postflight_stabilization and not args.dry_run),
+    )
+    payload["postflight"] = postflight
+    payload["postflight_attempts"] = postflight_attempts
+    payload["postflight_stabilization_seconds"] = stabilization_seconds
     payload["duration_seconds"] = round(time.monotonic() - started, 3)
     payload["ok"] = bool(preflight.get("ok")) and cycle_ok and bool(payload["postflight"].get("ok"))
     payload["summary_zh"] = build_summary(payload)
