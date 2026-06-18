@@ -149,8 +149,6 @@ def run_cycle(group: dict[str, Any], *, dry_run: bool, no_save_runtime_record: b
         str(group["risk_unit"]),
         "--runtime-record-file",
         str(RUNTIME_FILE),
-        "--testnet-sync-account-state",
-        "--testnet-track-order-lifecycle",
         "--testnet-max-order-notional",
         "1000",
         "--testnet-max-symbol-exposure",
@@ -168,6 +166,8 @@ def run_cycle(group: dict[str, Any], *, dry_run: bool, no_save_runtime_record: b
         "--testnet-order-journal-file",
         str(ORDER_JOURNAL_FILE),
     ]
+    if not dry_run:
+        argv.extend(["--testnet-sync-account-state", "--testnet-track-order-lifecycle"])
     argv.append("--testnet-dry-run" if dry_run else "--testnet-submit-signed")
     if no_save_runtime_record:
         argv.append("--no-save-runtime-record")
@@ -434,7 +434,17 @@ def main(argv: list[str] | None = None) -> int:
         },
         "cycles": [],
     }
-    preflight = signed_preflight(all_symbols)
+    preflight = (
+        {
+            "ok": True,
+            **now_stamps(),
+            "skipped": True,
+            "reason": "dry_run_skips_signed_preflight",
+            "duration_seconds": 0,
+        }
+        if args.dry_run
+        else signed_preflight(all_symbols)
+    )
     payload["preflight"] = preflight
     if not preflight.get("ok"):
         payload["duration_seconds"] = round(time.monotonic() - started, 3)
@@ -450,10 +460,23 @@ def main(argv: list[str] | None = None) -> int:
         cycle_ok = cycle_ok and bool(cycle.get("ok"))
         require_postflight_stabilization = require_postflight_stabilization or bool(cycle.get("real_submitted_count") or cycle.get("attempted_real_order_count"))
 
-    postflight, postflight_attempts, stabilization_seconds = stabilized_postflight_account(
-        all_symbols,
-        require_stabilization=bool(require_postflight_stabilization and not args.dry_run),
-    )
+    if args.dry_run:
+        postflight, postflight_attempts, stabilization_seconds = (
+            {
+                "ok": True,
+                **now_stamps(),
+                "skipped": True,
+                "reason": "dry_run_skips_signed_postflight",
+                "duration_seconds": 0,
+            },
+            0,
+            0,
+        )
+    else:
+        postflight, postflight_attempts, stabilization_seconds = stabilized_postflight_account(
+            all_symbols,
+            require_stabilization=bool(require_postflight_stabilization),
+        )
     payload["postflight"] = postflight
     payload["postflight_attempts"] = postflight_attempts
     payload["postflight_stabilization_seconds"] = stabilization_seconds

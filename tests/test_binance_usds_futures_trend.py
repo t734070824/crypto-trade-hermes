@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "binance_usds_futures_trend.py"
+HOURLY_MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "binance_usds_futures_testnet_hourly.py"
 REPO_ROOT = MODULE_PATH.parents[1]
 CRON_BRIEF_SCRIPT = REPO_ROOT / "scripts" / "binance_usds_futures_trend_brief.sh"
 spec = importlib.util.spec_from_file_location("binance_usds_futures_trend", MODULE_PATH)
@@ -18,9 +19,49 @@ assert spec is not None
 assert spec.loader is not None
 trend = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(trend)
+hourly_spec = importlib.util.spec_from_file_location("binance_usds_futures_testnet_hourly", HOURLY_MODULE_PATH)
+assert hourly_spec is not None
+assert hourly_spec.loader is not None
+hourly = importlib.util.module_from_spec(hourly_spec)
+hourly_spec.loader.exec_module(hourly)
 
 
 class BinanceUsdsFuturesTrendTests(unittest.TestCase):
+    def test_hourly_dry_run_skips_signed_account_snapshots(self):
+        def forbidden_signed_call(*args, **kwargs):
+            raise AssertionError("dry-run cron must not call signed account snapshots")
+
+        fake_cycle = {
+            "name": "BTC组",
+            "symbols": ["BTCUSDT"],
+            "ok": True,
+            "desired_orders_count": 0,
+            "fills_count": 0,
+            "fill_status_counts": {},
+            "signed_count": 0,
+            "attempted_real_order_count": 0,
+            "real_submitted_count": 0,
+            "runtime_record": {"saved": False},
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(hourly, "signed_preflight", forbidden_signed_call),
+            mock.patch.object(hourly, "stabilized_postflight_account", forbidden_signed_call),
+            mock.patch.object(hourly, "run_cycle", return_value=fake_cycle) as run_cycle_mock,
+            contextlib.redirect_stdout(stdout),
+        ):
+            rc = hourly.main(["--dry-run", "--no-save-runtime-record", "--skip-dotenv"])
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(payload["preflight"]["reason"], "dry_run_skips_signed_preflight")
+        self.assertEqual(payload["postflight"]["reason"], "dry_run_skips_signed_postflight")
+        self.assertEqual(run_cycle_mock.call_count, len(hourly.GROUPS))
+        for call in run_cycle_mock.call_args_list:
+            self.assertTrue(call.kwargs["dry_run"])
+
     def test_cli_top_level_error_redacts_signed_query_and_sensitive_fields(self):
         def leaky_fetch_klines(*args, **kwargs):
             raise RuntimeError('boom https://testnet.binancefuture.com/fapi/v2/account?timestamp=1&signature=abc123 X-MBX-APIKEY=my-key secret=my-secret')
