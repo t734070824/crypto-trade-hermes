@@ -214,6 +214,13 @@ def summarize_cycle_payload(group: dict[str, Any], rc: int, payload: dict[str, A
     after = sync.get("after", {}) if isinstance(sync, dict) else {}
     lifecycle = cycle.get("testnet_order_lifecycle") if isinstance(cycle, dict) else None
     lifecycle_summary = _summarize_lifecycle(lifecycle, runtime_events.get("testnet_order_lifecycle"))
+    execution_summary = runtime_events.get("execution_summary", {}) if isinstance(runtime_events, dict) and isinstance(runtime_events.get("execution_summary"), dict) else {}
+    execution_plan_summaries = runtime_events.get("execution_plan_summaries", []) if isinstance(runtime_events, dict) and isinstance(runtime_events.get("execution_plan_summaries"), list) else []
+    no_order_plan_summaries = [
+        _compact_plan_summary(item)
+        for item in execution_plan_summaries
+        if isinstance(item, dict) and item.get("skip_reason") and int(item.get("instructions_count") or 0) == 0
+    ]
     statuses: dict[str, int] = {}
     signed_count = 0
     real_submitted_count = 0
@@ -236,6 +243,8 @@ def summarize_cycle_payload(group: dict[str, Any], rc: int, payload: dict[str, A
         "duration_seconds": elapsed,
         "errors_count": cycle.get("errors_count") if isinstance(cycle, dict) else None,
         "desired_orders_count": len(desired_orders),
+        "execution_summary": execution_summary,
+        "no_order_plan_summaries": no_order_plan_summaries,
         "fills_count": len(fills),
         "fill_status_counts": statuses,
         "signed_count": signed_count,
@@ -280,6 +289,20 @@ def _summarize_lifecycle(*values: Any) -> dict[str, Any]:
                 "net_pnl": round(sum(float(item.get("fills_summary", {}).get("net_pnl", 0.0)) for item in value if isinstance(item, dict)), 8),
             }
     return {"tracked_order_count": 0, "filled_order_count": 0, "net_pnl": 0}
+
+
+def _compact_plan_summary(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": str(item.get("symbol", "")),
+        "action": str(item.get("action", "")),
+        "skip_reason": str(item.get("skip_reason", "")),
+        "add_allowed": item.get("add_allowed"),
+        "add_blockers": [str(value) for value in item.get("add_blockers", [])] if isinstance(item.get("add_blockers"), list) else [],
+        "current_exposure": item.get("current_exposure"),
+        "desired_exposure": item.get("desired_exposure"),
+        "effective_desired_exposure": item.get("effective_desired_exposure"),
+        "delta_exposure": item.get("delta_exposure"),
+    }
 
 
 def summarize_errors(errors: Any) -> list[dict[str, str]]:
@@ -385,9 +408,13 @@ def build_summary(payload: dict[str, Any]) -> str:
     for cycle in payload.get("cycles", []):
         lifecycle = cycle.get("lifecycle", {}) if isinstance(cycle.get("lifecycle"), dict) else {}
         protection = cycle.get("protection", {}) if isinstance(cycle.get("protection"), dict) else {}
+        execution_summary = cycle.get("execution_summary", {}) if isinstance(cycle.get("execution_summary"), dict) else {}
+        no_order_reasons = execution_summary.get("no_order_reasons", {}) if isinstance(execution_summary.get("no_order_reasons"), dict) else {}
         lines.append(
             f"{cycle.get('name')}: ok={cycle.get('ok')} symbols={','.join(cycle.get('symbols', []))} "
             f"desired={cycle.get('desired_orders_count')} fills={cycle.get('fills_count')} "
+            f"signals={execution_summary.get('signals_count')} trend={execution_summary.get('trend_signal_count')} hold_only={execution_summary.get('hold_only_count')} "
+            f"add_allowed={execution_summary.get('add_allowed_count')} add_blocked={execution_summary.get('add_blocked_count')} no_order_reasons={no_order_reasons} "
             f"signed={cycle.get('signed_count')} attempted={cycle.get('attempted_real_order_count')} real_submitted={cycle.get('real_submitted_count')} "
             f"statuses={cycle.get('fill_status_counts')} lifecycle_tracked={lifecycle.get('tracked_order_count')} lifecycle_filled={lifecycle.get('filled_order_count')} "
             f"all_positions_protected={protection.get('all_positions_protected')} unprotected={protection.get('unprotected_symbols')} "

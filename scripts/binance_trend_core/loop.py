@@ -74,6 +74,7 @@ def run_trading_cycle(
     signals: list[dict[str, Any]] = []
     intents: list[Any] = []
     risk_results: list[dict[str, Any]] = []
+    execution_plan_summaries: list[dict[str, Any]] = []
     desired_orders: list[dict[str, Any]] = []
     fills: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -95,6 +96,7 @@ def run_trading_cycle(
             current_exposure = float(plan_metadata.get("current_exposure") or 0.0)
             delta_exposure = float(plan_metadata.get("delta_exposure") or 0.0)
             plan_instructions = list(plan.instructions)
+            execution_plan_summaries.append(_execution_plan_summary(symbol, signal, intent, risk_result, plan_metadata, plan_instructions))
             if not plan_instructions:
                 continue
             if abs(delta_exposure) > 1e-12 and abs(current_exposure) <= 1e-12:
@@ -159,6 +161,7 @@ def run_trading_cycle(
 
     account_state = broker.get_account_state()
     real_orders_submitted = any(bool(fill.get("real_order_submitted")) for fill in fills)
+    execution_summary = _execution_summary(signals, intents, execution_plan_summaries, desired_orders, fills)
     runtime_record = {
         "schema_version": "runtime.v1",
         "environment": environment,
@@ -180,6 +183,8 @@ def run_trading_cycle(
         "execution_events": {
             "environment": environment,
             "desired_orders": desired_orders,
+            "execution_plan_summaries": execution_plan_summaries,
+            "execution_summary": execution_summary,
             "simulated_fills": list(fills),
             "simulated_fills_count": len(fills),
             "real_orders_submitted": real_orders_submitted,
@@ -199,6 +204,8 @@ def run_trading_cycle(
         "intents": [_intent_record(intent) for intent in intents],
         "risk_results": risk_results,
         "desired_orders": desired_orders,
+        "execution_plan_summaries": execution_plan_summaries,
+        "execution_summary": execution_summary,
         "fills": fills,
         "simulated_fills": fills,
         "simulated_fills_count": len(fills),
@@ -208,6 +215,77 @@ def run_trading_cycle(
         "errors": errors,
         "errors_count": len(errors),
     }
+
+
+def _execution_plan_summary(
+    symbol: str,
+    signal: dict[str, Any],
+    intent: Any,
+    risk_result: dict[str, Any],
+    plan_metadata: dict[str, Any],
+    instructions: list[OrderInstruction],
+) -> dict[str, Any]:
+    signal_action = signal.get("action", "") if isinstance(signal, dict) else ""
+    action = str(getattr(intent, "action", signal_action))
+    desired_exposure = float(getattr(intent, "desired_exposure", 0.0) or 0.0)
+    current_exposure = _safe_float(plan_metadata.get("current_exposure"), 0.0)
+    effective_desired_exposure = _safe_float(plan_metadata.get("effective_desired_exposure"), desired_exposure)
+    delta_exposure = _safe_float(plan_metadata.get("delta_exposure"), effective_desired_exposure - current_exposure)
+    skip_reason = None
+    if not instructions:
+        skip_reason = str(plan_metadata.get("reason") or risk_result.get("reason") or "no_instructions")
+    add_allowed = signal.get("add_allowed") if isinstance(signal, dict) else None
+    return {
+        "symbol": str(symbol),
+        "action": action,
+        "desired_exposure": round(desired_exposure, 8),
+        "current_exposure": round(current_exposure, 8),
+        "effective_desired_exposure": round(effective_desired_exposure, 8),
+        "delta_exposure": round(delta_exposure, 8),
+        "instructions_count": len(instructions),
+        "skip_reason": skip_reason,
+        "risk_approved": bool(risk_result.get("approved", False)),
+        "add_allowed": add_allowed,
+        "add_blockers": [str(item) for item in signal.get("add_blockers", [])] if isinstance(signal, dict) and isinstance(signal.get("add_blockers"), list) else [],
+    }
+
+
+def _execution_summary(
+    signals: list[dict[str, Any]],
+    intents: list[Any],
+    execution_plan_summaries: list[dict[str, Any]],
+    desired_orders: list[dict[str, Any]],
+    fills: list[dict[str, Any]],
+) -> dict[str, Any]:
+    actions = [str(signal.get("action", "")) for signal in signals if isinstance(signal, dict)]
+    no_order_reasons: dict[str, int] = {}
+    hold_only_count = 0
+    for item in execution_plan_summaries:
+        reason = item.get("skip_reason")
+        if reason:
+            no_order_reasons[str(reason)] = no_order_reasons.get(str(reason), 0) + 1
+        action = str(item.get("action", ""))
+        if action in {"hold_long", "hold_short"} and int(item.get("instructions_count") or 0) == 0:
+            hold_only_count += 1
+    return {
+        "signals_count": len(signals),
+        "trend_signal_count": sum(1 for action in actions if action in {"hold_long", "hold_short"}),
+        "flat_signal_count": sum(1 for action in actions if action == "flat"),
+        "hold_only_count": hold_only_count,
+        "add_allowed_count": sum(1 for signal in signals if isinstance(signal, dict) and signal.get("add_allowed") is True),
+        "add_blocked_count": sum(1 for signal in signals if isinstance(signal, dict) and signal.get("add_allowed") is False),
+        "desired_exposure_nonzero_count": sum(1 for intent in intents if abs(float(getattr(intent, "desired_exposure", 0.0) or 0.0)) > 1e-12),
+        "desired_orders_count": len(desired_orders),
+        "fills_count": len(fills),
+        "no_order_reasons": no_order_reasons,
+    }
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _order_submission_priority_key(

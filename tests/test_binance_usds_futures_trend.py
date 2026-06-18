@@ -62,6 +62,47 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         for call in run_cycle_mock.call_args_list:
             self.assertTrue(call.kwargs["dry_run"])
 
+    def test_hourly_summary_surfaces_no_order_reasons_from_runtime_events(self):
+        payload = {
+            "ok": True,
+            "testnet_cycle": {
+                "generated_at_utc": "2026-06-18T08:00:00+00:00",
+                "generated_at_beijing": "2026-06-18T16:00:00+08:00",
+                "desired_orders": [],
+                "fills": [],
+                "errors_count": 0,
+                "runtime_record_saved": False,
+                "runtime_record_change": {"records_written": 0},
+                "runtime_record": {
+                    "execution_events": {
+                        "desired_orders": [],
+                        "execution_summary": {
+                            "signals_count": 3,
+                            "trend_signal_count": 3,
+                            "hold_only_count": 3,
+                            "add_allowed_count": 0,
+                            "desired_exposure_nonzero_count": 3,
+                            "desired_orders_count": 0,
+                            "no_order_reasons": {"add_blocked_by_signal": 3},
+                        },
+                        "execution_plan_summaries": [
+                            {"symbol": "BTCUSDT", "action": "hold_long", "skip_reason": "add_blocked_by_signal", "add_blockers": ["below_ema50"]},
+                            {"symbol": "ETHUSDT", "action": "hold_long", "skip_reason": "add_blocked_by_signal", "add_blockers": ["recent_6_candle_downtrend"]},
+                            {"symbol": "SOLUSDT", "action": "hold_long", "skip_reason": "add_blocked_by_signal", "add_blockers": ["recent_12_candle_downtrend"]},
+                        ],
+                    }
+                },
+            },
+        }
+
+        summary = hourly.summarize_cycle_payload({"name": "Alt组", "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"]}, 0, payload, 0.2)
+
+        self.assertEqual(summary["desired_orders_count"], 0)
+        self.assertEqual(summary["execution_summary"]["trend_signal_count"], 3)
+        self.assertEqual(summary["execution_summary"]["no_order_reasons"], {"add_blocked_by_signal": 3})
+        self.assertEqual([item["symbol"] for item in summary["no_order_plan_summaries"]], ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+        self.assertEqual(summary["no_order_plan_summaries"][0]["add_blockers"], ["below_ema50"])
+
     def test_cli_top_level_error_redacts_signed_query_and_sensitive_fields(self):
         def leaky_fetch_klines(*args, **kwargs):
             raise RuntimeError('boom https://testnet.binancefuture.com/fapi/v2/account?timestamp=1&signature=abc123 X-MBX-APIKEY=my-key secret=my-secret')
@@ -2776,6 +2817,63 @@ class BinanceUsdsFuturesTrendTests(unittest.TestCase):
         self.assertEqual(event["status"], "rejected")
         self.assertEqual(event["reason"], "kill_switch_enabled")
         self.assertFalse(event["real_order_submitted"])
+
+    def test_shared_trading_cycle_records_no_order_reason_for_hold_only_add_blocked_signal(self):
+        brokers = importlib.import_module("scripts.binance_trend_core.brokers")
+        execution = importlib.import_module("scripts.binance_trend_core.execution")
+        loop = importlib.import_module("scripts.binance_trend_core.loop")
+        signals = importlib.import_module("scripts.binance_trend_core.signals")
+        strategy = importlib.import_module("scripts.binance_trend_core.strategy")
+        risk = importlib.import_module("scripts.binance_trend_core.risk")
+
+        signal = {
+            "symbol": "SOLUSDT",
+            "interval": "1h",
+            "action": "hold_long",
+            "position_size": 1.0,
+            "entry_reference": 75.0,
+            "reason": "major trend remains valid but pullback blocks new adds",
+            "add_allowed": False,
+            "add_blockers": ["below_ema50", "recent_6_candle_downtrend", "recent_12_candle_downtrend"],
+        }
+        broker = brokers.BinanceTestnetBroker(
+            credentials=brokers.BinanceTestnetCredentials("key", "secret"),
+            dry_run=True,
+            risk_limits=brokers.TestnetRiskLimits(max_order_notional=10_000, max_symbol_exposure=10_000, max_daily_loss=100, max_order_count=4),
+        )
+
+        cycle = loop.run_trading_cycle(
+            loop.TradingCycleConfig(symbols=["SOLUSDT"], interval="1h", candles_by_symbol={"SOLUSDT": [{}]}),
+            broker=broker,
+            signal_engine=signals.FunctionSignalEngine(decide_fn=lambda candles, symbol, interval, **kwargs: signal),
+            strategy=strategy.TrendParticipationStrategy(),
+            risk_manager=risk.FunctionRiskManager(),
+            execution_engine=execution.PositionReconciliationExecutionEngine(),
+        )
+
+        self.assertEqual(cycle["desired_orders"], [])
+        summary = cycle["execution_summary"]
+        self.assertEqual(summary["signals_count"], 1)
+        self.assertEqual(summary["trend_signal_count"], 1)
+        self.assertEqual(summary["hold_only_count"], 1)
+        self.assertEqual(summary["add_allowed_count"], 0)
+        self.assertEqual(summary["desired_exposure_nonzero_count"], 1)
+        self.assertEqual(summary["desired_orders_count"], 0)
+        self.assertEqual(summary["no_order_reasons"], {"add_blocked_by_signal": 1})
+        plan_summary = cycle["execution_plan_summaries"][0]
+        self.assertEqual(plan_summary["symbol"], "SOLUSDT")
+        self.assertEqual(plan_summary["action"], "hold_long")
+        self.assertEqual(plan_summary["skip_reason"], "add_blocked_by_signal")
+        self.assertFalse(plan_summary["add_allowed"])
+        self.assertEqual(plan_summary["add_blockers"], ["below_ema50", "recent_6_candle_downtrend", "recent_12_candle_downtrend"])
+        self.assertEqual(plan_summary["current_exposure"], 0.0)
+        self.assertEqual(plan_summary["desired_exposure"], 1.0)
+        self.assertEqual(plan_summary["effective_desired_exposure"], 0.0)
+        self.assertEqual(plan_summary["delta_exposure"], 0.0)
+        self.assertEqual(plan_summary["instructions_count"], 0)
+        runtime_events = cycle["runtime_record"]["execution_events"]
+        self.assertEqual(runtime_events["execution_summary"], summary)
+        self.assertEqual(runtime_events["execution_plan_summaries"], cycle["execution_plan_summaries"])
 
     def test_shared_trading_cycle_records_portfolio_state_and_runtime_evidence(self):
         brokers = importlib.import_module("scripts.binance_trend_core.brokers")
