@@ -222,15 +222,47 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 - Signed submission requires explicit `--testnet-submit-signed` and still only targets Binance futures testnet host.
 - Mainnet/live adapter remains unimplemented and unauthorized.
 
-### v1.8 — Live Readiness Gates and Audit 🔒
+### v1.8 — Testnet Readiness Hardening ✅
 
-**Status:** planned as readiness/audit only; no live order implementation.
+**Status:** implemented as exchangeInfo/risk validation, order journal, unknown-order confirmation, account sync, and safer testnet evidence handling.
 
-**Goal:** 建立 live 前置审计、kill switch、证据窗口、风险阈值和人工授权门槛。
+**Goal:** 让 testnet adapter 在签名前具备交易所规则、风险参数、订单 journal、unknown-order 归因和账户同步能力。
 
-### v2.0 — Future Live Adapter (Not Authorized) 🔒
+### v1.9 — Signed Testnet Order Lifecycle Evidence ✅
 
-**Goal:** 仅在 v1.8 全部 gate 通过且用户单独授权后，另起版本设计 live adapter。
+**Status:** implemented as signed testnet lifecycle polling and trade/PnL/slippage evidence; live/mainnet remains unimplemented and unauthorized.
+
+**Goal:** signed testnet 提交后不能把 acknowledgement 当 fill，必须记录 exchange-confirmed lifecycle、fills、fees、realized/net PnL 和 slippage。
+
+### v2.0 — Audit-Driven Recovery and Trading-Engine Hardening 🔒
+
+**Status:** planned in `plans/binance-usds-futures-trend-v2.0.md` from the v1.49 independent audit.
+
+**Goal:** 先把当前状态从 “dry-run evidence healthy, signed testnet protection degraded” 恢复到可审计、可解释、可安全恢复 signed testnet 的状态，再继续做 CAGR 导向的风险/生命周期/复利优化。
+
+**Priority phases:**
+
+1. 文档/config drift cleanup：同步 `testnet-dry-run-hourly` template，修正旧 docstring 和时间措辞。
+2. hourly harness 默认 dry-run，signed 必须显式 gate。
+3. 增加 signed read-only protection snapshot 路径；运行它仍需用户当前回合显式授权。
+4. `submitted_unknown` reconciliation 与 dry-run repair plan；实际 repair 仍需显式授权。
+5. daily analyzer recency/incident gates，避免用过期 analyzer 覆盖后续 signed failure。
+6. portfolio-level risk manager。
+7. lifecycle/compounding policy：entry/add/hold/trim/harvest/exit。
+8. 降低 paper scanner 产品感，强化 shared trading loop observability。
+9. live readiness checklist only；不实现 live。
+
+**Guardrails:**
+
+- 不自动恢复 signed hourly cron；
+- 不在 planning/docs cleanup 中运行 signed snapshot、下单或撤单；
+- 不把 dry-run health 当 signed protection health；
+- 未确认 protection 前不恢复 signed cycle；
+- live/mainnet 仍未实现且未授权。
+
+### Future live adapter — Not Authorized 🔒
+
+**Goal:** 仅在 v2.0 的 signed testnet recovery、risk manager、incident gates、live readiness checklist 全部完成，并且用户单独授权后，另起版本设计 live adapter。
 
 **Guardrails:**
 - live 默认不可用；
@@ -240,9 +272,9 @@ Created: UTC 2026-06-15 12:30:18 / 北京时间(UTC+8) 2026-06-15 20:30:18
 
 ## Default Next Step
 
-当前默认下一步：**v1.7 Binance Futures Testnet Adapter 仍为锁定状态；只有在用户明确授权 testnet signed execution 后，才开始设计/实现 testnet adapter。未授权前继续收集 paper runtime evidence，并用 v1.6 replay 评估策略候选。**
+当前默认下一步：**按 `plans/binance-usds-futures-trend-v2.0.md` 执行 Phase 1 文档/config drift cleanup，然后 Phase 2 将 hourly harness 改成 dry-run default。任何 signed read-only snapshot、signed repair、signed cron resume、signed short 或 live/mainnet 都需要用户当前回合显式授权。**
 
-除非用户明确改变优先级，否则后续继续按本文件顺序推进；v1.7 testnet 与 v2.0 live 均需单独授权。
+除非用户明确改变优先级，否则后续先恢复 signed testnet protection 可审计性，再继续 CAGR 导向优化。
 
 ## Stop Conditions
 
