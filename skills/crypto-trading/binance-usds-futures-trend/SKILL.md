@@ -405,6 +405,7 @@ Canonical current references:
 - `references/session-v1.46-pullback-add-gate-and-short-safety.md` — implementation and explanation pattern for closed-candle pullback add gating, paused hourly cron reporting, and why short-side trading needs separate validation.
 - `references/session-v1.47-short-dry-run-review-loop.md` — bidirectional dry-run enablement lessons: signed short gate, cross-direction add-block clipping, no opposite-side protection when clipped to flat, and review-driven probes.
 - `references/session-v1.48-dry-run-short-evidence-cron.md` — safe evidence-collection pattern after short dry-run enablement: keep signed hourly paused, add a separate dry-run-only no-agent cron, and verify zero signed/attempted/real submissions before scheduling.
+- `references/session-v1.49-current-trading-flow-independent-audit.md` — integrated independent audit of the current trading flow: dry-run evidence collection is healthy, while latest signed testnet protection evidence remains degraded with submitted_unknown stop-losses and unprotected symbols.
 - `references/session-v1.22-account-risk-sizing-cap-diagnosis.md` — diagnosing account-risk sizing that is dominated by fixed max-order/max-symbol exposure caps.
 - `references/session-v1.24-testnet-order-budget-and-postrun-reconstruction.md` — order-count budget lesson for entry + stop + TP tranches and safe post-run reconstruction.
 - `references/session-v1.25-testnet-cron-endpoint-and-order-budget-audit.md` — strict testnet endpoint arguments and order-budget enforcement.
